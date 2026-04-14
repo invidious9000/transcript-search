@@ -404,7 +404,19 @@ fn main() -> Result<()> {
 
     let mut idx = TranscriptIndex::open_or_create(&index_path, roots, codex_root)?;
 
-    tracing::info!("blackbox MCP server ready");
+    // Spawn background reindex thread (every 2 minutes)
+    let reindex_interval = std::env::var("BLACKBOX_REINDEX_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+    index::spawn_reindex_thread(
+        idx.index_handle(),
+        idx.reindex_config(),
+        idx.field_handles(),
+        std::time::Duration::from_secs(reindex_interval),
+    );
+
+    tracing::info!("blackbox MCP server ready (auto-reindex every {}s)", reindex_interval);
 
     let stdin = io::stdin();
     let stdout = io::stdout();
