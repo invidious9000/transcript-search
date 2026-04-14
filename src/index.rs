@@ -120,7 +120,7 @@ impl TranscriptIndex {
         let include_subagents = args["include_subagents"].as_bool().unwrap_or(true);
 
         if self.is_empty() {
-            return Ok("Index is empty. Run transcript_reindex first.".to_string());
+            return Ok("Index is empty. Run blackbox_reindex first.".to_string());
         }
 
         let searcher = self.reader.searcher();
@@ -640,7 +640,7 @@ impl TranscriptIndex {
         } else if let Some(sid) = session_id {
             // Use index to find all docs for this session
             if self.is_empty() {
-                return Ok("Index is empty. Run transcript_reindex first.".to_string());
+                return Ok("Index is empty. Run blackbox_reindex first.".to_string());
             }
             let searcher = self.reader.searcher();
             let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
@@ -923,139 +923,160 @@ impl TranscriptIndex {
     }
 
     pub fn build_index(&mut self, full: bool) -> Result<String> {
-        let mut meta: HashMap<String, FileMeta> = if !full {
-            load_meta(&self.meta_path).unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
+        // Use AssertUnwindSafe because we are catching panics to ensure the writer lock is released
+        // though Tantivy's IndexWriter drop handler usually handles this.
+        let mut index = std::panic::AssertUnwindSafe(self);
+        let result = std::panic::catch_unwind(move || -> Result<String> {
+            let mut writer: IndexWriter = index.index.writer(100_000_000)?;
 
-        let mut writer: IndexWriter = self.index.writer(100_000_000)?;
+            // Reload meta AFTER acquiring the lock to avoid races with other writers
+            let mut meta: HashMap<String, FileMeta> = if !full {
+                load_meta(&index.meta_path).unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
 
-        if full {
-            tracing::info!("Full reindex — clearing existing index");
-            writer.delete_all_documents()?;
-            writer.commit()?;
-        }
-
-        let mut indexed_files = 0u64;
-        let mut indexed_docs = 0u64;
-        let mut skipped = 0u64;
-
-        let roots: Vec<(String, PathBuf)> = self.roots.clone();
-        for (account_name, root) in &roots {
-            // Index project transcripts
-            let projects_dir = root.join("projects");
-            if projects_dir.exists() {
-                self.index_directory(
-                    &projects_dir,
-                    account_name,
-                    &mut writer,
-                    &mut meta,
-                    &mut indexed_files,
-                    &mut indexed_docs,
-                    &mut skipped,
-                )?;
+            if full {
+                tracing::info!("Full reindex — clearing existing index");
+                writer.delete_all_documents()?;
+                writer.commit()?;
             }
 
-            // Index history.jsonl
-            let history = root.join("history.jsonl");
-            if history.exists() {
-                let path_str = history.to_string_lossy().to_string();
-                let file_meta = fs::metadata(&history)?;
-                let mtime = file_meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+            let mut indexed_files = 0u64;
+            let mut indexed_docs = 0u64;
+            let mut skipped = 0u64;
 
-                if let Some(prev) = meta.get(&path_str) {
-                    if prev.mtime == mtime && prev.size == file_meta.len() {
-                        skipped += 1;
-                        continue;
-                    }
-                    writer.delete_term(Term::from_field_text(self.f_file_path, &path_str));
+            let roots: Vec<(String, PathBuf)> = index.roots.clone();
+            for (account_name, root) in &roots {
+                // Index project transcripts
+                let projects_dir = root.join("projects");
+                if projects_dir.exists() {
+                    index.index_directory(
+                        &projects_dir,
+                        account_name,
+                        &mut writer,
+                        &mut meta,
+                        &mut indexed_files,
+                        &mut indexed_docs,
+                        &mut skipped,
+                    )?;
                 }
 
-                let file = fs::File::open(&history)?;
-                let reader = BufReader::new(file);
-                let mut offset = 0u64;
+                // Index history.jsonl
+                let history = root.join("history.jsonl");
+                if history.exists() {
+                    let path_str = history.to_string_lossy().to_string();
+                    let file_meta = fs::metadata(&history)?;
+                    let mtime = file_meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
 
-                for line in reader.lines() {
-                    let line = match line {
-                        Ok(l) => l,
-                        Err(_) => continue,
-                    };
-                    let line_offset = offset;
-                    offset += line.len() as u64 + 1;
-
-                    for event in parser::parse_history_line(&line) {
-                        let doc = self.event_to_doc(
-                            &event,
-                            account_name,
-                            &path_str,
-                            line_offset,
-                            false,
-                        );
-                        writer.add_document(doc)?;
-                        indexed_docs += 1;
+                    if let Some(prev) = meta.get(&path_str) {
+                        if prev.mtime == mtime && prev.size == file_meta.len() {
+                            skipped += 1;
+                            continue;
+                        }
+                        writer.delete_term(Term::from_field_text(index.f_file_path, &path_str));
                     }
-                }
 
-                meta.insert(
-                    path_str,
-                    FileMeta {
-                        mtime,
-                        size: file_meta.len(),
-                    },
-                );
-                indexed_files += 1;
-            }
-        }
+                    let file = fs::File::open(&history)?;
+                    let reader = BufReader::new(file);
+                    let mut offset = 0u64;
 
-        // Index Codex CLI sessions
-        if let Some(ref codex_root) = self.codex_root.clone() {
-            let sessions_dir = codex_root.join("sessions");
-            if sessions_dir.exists() {
-                self.index_codex_directory(
-                    &sessions_dir,
-                    &mut writer,
-                    &mut meta,
-                    &mut indexed_files,
-                    &mut indexed_docs,
-                    &mut skipped,
-                )?;
-            }
+                    for line in reader.lines() {
+                        let line = match line {
+                            Ok(l) => l,
+                            Err(_) => continue,
+                        };
+                        let line_offset = offset;
+                        offset += line.len() as u64 + 1;
 
-            // Index Codex history.jsonl
-            let history = codex_root.join("history.jsonl");
-            if history.exists() {
-                let path_str = history.to_string_lossy().to_string();
-                let file_meta = fs::metadata(&history)?;
-                let mtime = file_meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
-
-                if let Some(prev) = meta.get(&path_str) {
-                    if prev.mtime == mtime && prev.size == file_meta.len() {
-                        skipped += 1;
-                    } else {
-                        writer.delete_term(Term::from_field_text(self.f_file_path, &path_str));
-                        self.index_codex_history(&history, &path_str, &mut writer, &mut indexed_docs)?;
-                        meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
-                        indexed_files += 1;
+                        for event in parser::parse_history_line(&line) {
+                            let doc = index.event_to_doc(
+                                &event,
+                                account_name,
+                                &path_str,
+                                line_offset,
+                                false,
+                            );
+                            writer.add_document(doc)?;
+                            indexed_docs += 1;
+                        }
                     }
-                } else {
-                    self.index_codex_history(&history, &path_str, &mut writer, &mut indexed_docs)?;
-                    meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
+
+                    meta.insert(
+                        path_str,
+                        FileMeta {
+                            mtime,
+                            size: file_meta.len(),
+                        },
+                    );
                     indexed_files += 1;
                 }
             }
+
+            // Index Codex CLI sessions
+            if let Some(ref codex_root) = index.codex_root.clone() {
+                let sessions_dir = codex_root.join("sessions");
+                if sessions_dir.exists() {
+                    index.index_codex_directory(
+                        &sessions_dir,
+                        &mut writer,
+                        &mut meta,
+                        &mut indexed_files,
+                        &mut indexed_docs,
+                        &mut skipped,
+                    )?;
+                }
+
+                // Index Codex history.jsonl
+                let history = codex_root.join("history.jsonl");
+                if history.exists() {
+                    let path_str = history.to_string_lossy().to_string();
+                    let file_meta = fs::metadata(&history)?;
+                    let mtime = file_meta.modified()?.duration_since(UNIX_EPOCH)?.as_secs();
+
+                    if let Some(prev) = meta.get(&path_str) {
+                        if prev.mtime == mtime && prev.size == file_meta.len() {
+                            skipped += 1;
+                        } else {
+                            writer.delete_term(Term::from_field_text(index.f_file_path, &path_str));
+                            index.index_codex_history(&history, &path_str, &mut writer, &mut indexed_docs)?;
+                            meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
+                            indexed_files += 1;
+                        }
+                    } else {
+                        index.index_codex_history(&history, &path_str, &mut writer, &mut indexed_docs)?;
+                        meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
+                        indexed_files += 1;
+                    }
+                }
+            }
+
+            writer.commit()?;
+            index.reader.reload()?;
+            save_meta(&index.meta_path, &meta)?;
+
+            let msg = format!(
+                "Indexed {} files ({} docs), skipped {} unchanged",
+                indexed_files, indexed_docs, skipped
+            );
+            tracing::info!("{}", msg);
+            Ok(msg)
+        });
+
+        match result {
+            Ok(inner) => inner,
+            Err(e) => {
+                // Panic occurred - Tantivy lock is released when writer goes out of scope
+                let panic_msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                Err(anyhow::anyhow!("Reindex thread panicked: {}", panic_msg))
+            }
         }
-
-        writer.commit()?;
-        self.reader.reload()?;
-        save_meta(&self.meta_path, &meta)?;
-
-        let msg = format!(
-            "Indexed {} files ({} docs), skipped {} unchanged",
-            indexed_files, indexed_docs, skipped
-        );
-        tracing::info!("{}", msg);
-        Ok(msg)
     }
 
     fn index_codex_history(
@@ -1479,7 +1500,9 @@ fn load_meta(path: &Path) -> Result<HashMap<String, FileMeta>> {
 
 fn save_meta(path: &Path, meta: &HashMap<String, FileMeta>) -> Result<()> {
     let raw = serde_json::to_string(meta)?;
-    fs::write(path, raw)?;
+    let tmp_path = path.with_extension("json.tmp");
+    fs::write(&tmp_path, raw)?;
+    fs::rename(&tmp_path, path)?;
     Ok(())
 }
 

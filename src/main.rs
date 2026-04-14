@@ -67,7 +67,7 @@ fn tool_definitions() -> Value {
     json!({
         "tools": [
             {
-                "name": "transcript_search",
+                "name": "blackbox_search",
                 "description": "Full-text search across Claude Code conversation transcripts from all accounts. Returns ranked results with file paths, session IDs, timestamps, and highlighted excerpts. Supports AND (default), OR, phrase queries (\"exact phrase\"), and field filtering.",
                 "inputSchema": {
                     "type": "object",
@@ -102,8 +102,8 @@ fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "transcript_context",
-                "description": "Get conversation context around a specific point in a transcript file. Use after transcript_search to see surrounding messages.",
+                "name": "blackbox_context",
+                "description": "Get conversation context around a specific point in a transcript file. Use after blackbox_search to see surrounding messages.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -124,7 +124,7 @@ fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "transcript_session",
+                "name": "blackbox_session",
                 "description": "Get summary info for a session: first prompt, project, duration, tool usage, message counts.",
                 "inputSchema": {
                     "type": "object",
@@ -138,7 +138,7 @@ fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "transcript_messages",
+                "name": "blackbox_messages",
                 "description": "List messages from a session in chronological order. Returns the conversation flow with role labels and timestamps. Use session_id to find by UUID, or file_path for a known transcript. Large sessions are paginated via offset/limit.",
                 "inputSchema": {
                     "type": "object",
@@ -180,7 +180,7 @@ fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "transcript_reindex",
+                "name": "blackbox_reindex",
                 "description": "Build or incrementally update the transcript search index. First run indexes all transcripts; subsequent runs only process new/modified files.",
                 "inputSchema": {
                     "type": "object",
@@ -193,7 +193,7 @@ fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "transcript_topics",
+                "name": "blackbox_topics",
                 "description": "Extract top terms from a session by frequency analysis. No LLM — pure term counting with stop-word filtering. Shows what a session was about at a glance.",
                 "inputSchema": {
                     "type": "object",
@@ -219,7 +219,7 @@ fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "transcript_sessions_list",
+                "name": "blackbox_sessions_list",
                 "description": "Browse sessions across all accounts, sorted by most recent. Shows date, duration, account, project, session ID, and first prompt. Use to find sessions without knowing keywords.",
                 "inputSchema": {
                     "type": "object",
@@ -244,7 +244,7 @@ fn tool_definitions() -> Value {
                 }
             },
             {
-                "name": "transcript_stats",
+                "name": "blackbox_stats",
                 "description": "Corpus statistics: indexed document count, index size on disk, source file counts per account.",
                 "inputSchema": {
                     "type": "object",
@@ -266,7 +266,7 @@ fn handle_initialize(id: Option<Value>) -> JsonRpcResponse {
                 "tools": {}
             },
             "serverInfo": {
-                "name": "transcript-search",
+                "name": "blackbox",
                 "version": "0.1.0"
             }
         }),
@@ -282,7 +282,7 @@ fn handle_tools_call(id: Option<Value>, params: &Value, idx: &mut TranscriptInde
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let result = match tool_name {
-        "transcript_search" => {
+        "blackbox_search" => {
             // Auto-index on first search if empty
             if idx.is_empty() {
                 tracing::info!("Index is empty — building before first search");
@@ -292,13 +292,13 @@ fn handle_tools_call(id: Option<Value>, params: &Value, idx: &mut TranscriptInde
             }
             idx.search(&arguments)
         }
-        "transcript_context" => idx.context(&arguments),
-        "transcript_messages" => idx.messages(&arguments),
-        "transcript_session" => idx.session(&arguments),
-        "transcript_topics" => idx.topics(&arguments),
-        "transcript_sessions_list" => idx.sessions_list(&arguments),
-        "transcript_reindex" => idx.reindex(&arguments),
-        "transcript_stats" => idx.stats(),
+        "blackbox_context" => idx.context(&arguments),
+        "blackbox_messages" => idx.messages(&arguments),
+        "blackbox_session" => idx.session(&arguments),
+        "blackbox_topics" => idx.topics(&arguments),
+        "blackbox_sessions_list" => idx.sessions_list(&arguments),
+        "blackbox_reindex" => idx.reindex(&arguments),
+        "blackbox_stats" => idx.stats(),
         _ => {
             return tool_response(id, &format!("Unknown tool: {}", tool_name), true);
         }
@@ -404,7 +404,7 @@ fn main() -> Result<()> {
 
     let mut idx = TranscriptIndex::open_or_create(&index_path, roots, codex_root)?;
 
-    tracing::info!("transcript-search MCP server ready");
+    tracing::info!("blackbox MCP server ready");
 
     let stdin = io::stdin();
     let stdout = io::stdout();
