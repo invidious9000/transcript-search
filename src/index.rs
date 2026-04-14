@@ -1194,7 +1194,7 @@ fn dir_size(path: &Path) -> u64 {
 // ── Background auto-reindex ────────────────────────────────────────
 
 /// Collect (path, mtime, size) for all JSONL files in a directory tree.
-fn scan_jsonl_dir(dir: &Path, now_secs: u64, out: &mut Vec<(String, u64, u64)>) {
+fn scan_jsonl_dir(dir: &Path, out: &mut Vec<(String, u64, u64)>) {
     for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().map(|e| e != "jsonl").unwrap_or(true) {
@@ -1208,55 +1208,44 @@ fn scan_jsonl_dir(dir: &Path, now_secs: u64, out: &mut Vec<(String, u64, u64)>) 
             Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             Err(_) => continue,
         };
-        // Skip files modified in the last 30 seconds (still being written to)
-        if now_secs.saturating_sub(mtime) < 30 {
-            continue;
-        }
         out.push((path.to_string_lossy().to_string(), mtime, meta.len()));
     }
 }
 
 /// Stat a single file and push if not too recent.
-fn scan_single_file(path: &Path, now_secs: u64, out: &mut Vec<(String, u64, u64)>) {
+fn scan_single_file(path: &Path, out: &mut Vec<(String, u64, u64)>) {
     if let Ok(meta) = fs::metadata(path) {
         let mtime = meta.modified()
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        if now_secs.saturating_sub(mtime) >= 30 {
-            out.push((path.to_string_lossy().to_string(), mtime, meta.len()));
-        }
+        out.push((path.to_string_lossy().to_string(), mtime, meta.len()));
     }
 }
 
 /// Collect (path, mtime, size) for all JSONL files across all roots.
 fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
     let mut files = Vec::new();
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
     for (_name, root) in &config.roots {
         let projects_dir = root.join("projects");
         if projects_dir.exists() {
-            scan_jsonl_dir(&projects_dir, now_secs, &mut files);
+            scan_jsonl_dir(&projects_dir, &mut files);
         }
         let history = root.join("history.jsonl");
         if history.exists() {
-            scan_single_file(&history, now_secs, &mut files);
+            scan_single_file(&history, &mut files);
         }
     }
 
     if let Some(ref codex_root) = config.codex_root {
         let sessions_dir = codex_root.join("sessions");
         if sessions_dir.exists() {
-            scan_jsonl_dir(&sessions_dir, now_secs, &mut files);
+            scan_jsonl_dir(&sessions_dir, &mut files);
         }
         let history = codex_root.join("history.jsonl");
         if history.exists() {
-            scan_single_file(&history, now_secs, &mut files);
+            scan_single_file(&history, &mut files);
         }
     }
 
@@ -1370,11 +1359,13 @@ pub fn spawn_reindex_thread(
         .name("blackbox-reindex".into())
         .spawn(move || {
             tracing::info!("background reindex thread started (interval: {:?})", interval);
+            // First tick fires after a short delay to let the MCP handshake complete
+            std::thread::sleep(Duration::from_secs(5));
             loop {
-                std::thread::sleep(interval);
                 if let Err(e) = try_background_reindex(&index, &config, fields) {
                     tracing::error!("background reindex failed: {:#}", e);
                 }
+                std::thread::sleep(interval);
             }
         })
         .expect("failed to spawn reindex thread");
@@ -1432,9 +1423,6 @@ fn index_directory_standalone(
     indexed_docs: &mut u64,
     skipped: &mut u64,
 ) -> Result<()> {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
     for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().map(|e| e != "jsonl").unwrap_or(true) { continue; }
@@ -1445,8 +1433,6 @@ fn index_directory_standalone(
             Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             Err(_) => continue,
         };
-
-        if now_secs.saturating_sub(mtime) < 30 { continue; }
 
         if should_skip_file(&path_str, mtime, file_meta.len(), meta) {
             *skipped += 1;
@@ -1548,9 +1534,6 @@ fn index_codex_directory_standalone(
     indexed_docs: &mut u64,
     skipped: &mut u64,
 ) -> Result<()> {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
     for entry in WalkDir::new(sessions_dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().map(|e| e != "jsonl").unwrap_or(true) { continue; }
@@ -1561,8 +1544,6 @@ fn index_codex_directory_standalone(
             Ok(t) => t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             Err(_) => continue,
         };
-
-        if now_secs.saturating_sub(mtime) < 30 { continue; }
 
         if should_skip_file(&path_str, mtime, file_meta.len(), meta) {
             *skipped += 1;
