@@ -610,7 +610,9 @@ impl Knowledge {
                     render_mark,
                     decay_mark,
                     if e.content.len() > 120 {
-                        format!("{}...", &e.content[..120])
+                        let mut end = 120;
+                        while end > 0 && !e.content.is_char_boundary(end) { end -= 1; }
+                        format!("{}...", &e.content[..end])
                     } else {
                         e.content.clone()
                     }

@@ -514,14 +514,40 @@ fn tool_response(id: Option<Value>, text: &str, is_error: bool) -> JsonRpcRespon
 // ── Main loop ───────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    // Log to stderr (stdout is MCP transport)
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "transcript_search=info".into()),
+    // Log to stderr + file (stdout is MCP transport)
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".claude-shared");
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .max_log_files(3)
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("blackbox")
+        .filename_suffix("log")
+        .build(&log_dir)
+        .expect("failed to create log appender");
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "transcript_search=info".into());
+
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(io::stderr)
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(file_appender)
+                .with_ansi(false)
         )
         .init();
+
+    // Log panics to tracing before aborting
+    std::panic::set_hook(Box::new(|info| {
+        tracing::error!("PANIC: {}", info);
+    }));
 
     let home = dirs::home_dir().expect("cannot determine home directory");
 

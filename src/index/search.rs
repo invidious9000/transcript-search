@@ -187,7 +187,9 @@ impl TranscriptIndex {
             for ev in &events {
                 let marker = if i == target_idx { ">>>" } else { "   " };
                 let preview = if ev.content.len() > 400 {
-                    format!("{}...", &ev.content[..400])
+                    let mut end = 400;
+                    while end > 0 && !ev.content.is_char_boundary(end) { end -= 1; }
+                    format!("{}...", &ev.content[..end])
                 } else {
                     ev.content.clone()
                 };
