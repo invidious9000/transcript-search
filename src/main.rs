@@ -342,6 +342,24 @@ fn tool_definitions() -> Value {
                         "id": { "type": "string", "description": "Entry ID (required for approve/reject)." }
                     }
                 }
+            },
+            {
+                "name": "blackbox_remember",
+                "description": "Store a fact for on-demand recall only — NOT rendered into CLAUDE.md/AGENTS.md/GEMINI.md. Use this for observations, context, decisions, and notes that should be searchable via blackbox_knowledge but don't need to be in every session's context window.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The fact, observation, or note to remember." },
+                        "category": { "type": "string", "enum": ["profile", "convention", "steering", "build", "tool", "memory", "workflow"], "description": "Default: memory." },
+                        "title": { "type": "string", "description": "Short human-readable title." },
+                        "scope": { "type": "string", "enum": ["global", "project"], "description": "Default: global." },
+                        "project": { "type": "string", "description": "Project path for project-scoped entries." },
+                        "decay": { "type": "boolean", "description": "Set false for invariants that should never age out. Default: true." },
+                        "review_at": { "type": "string", "description": "ISO 8601 date to revisit this entry." },
+                        "expires_at": { "type": "string", "description": "ISO 8601 expiry. Null = permanent." }
+                    },
+                    "required": ["content"]
+                }
             }
         ]
     })
@@ -399,6 +417,7 @@ fn handle_tools_call(
 
         // Knowledge store tools
         "blackbox_learn" => kb.learn(&arguments, false),
+        "blackbox_remember" => kb.remember(&arguments, false),
         "blackbox_knowledge" => kb.list(&arguments),
         "blackbox_forget" => kb.forget(&arguments),
         "blackbox_render" => kb.render(&arguments),

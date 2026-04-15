@@ -93,6 +93,12 @@ pub struct KnowledgeEntry {
     pub weight: u32,
     pub status: Status,
     pub approval: Approval,
+    #[serde(default = "default_true")]
+    pub render: bool,              // false = indexed only, never rendered into markdown
+    #[serde(default = "default_true")]
+    pub decay: bool,               // false = invariant, never ages out or gets staleness-reviewed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_at: Option<String>, // soft staleness checkpoint (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -100,10 +106,18 @@ pub struct KnowledgeEntry {
     pub source: String,
     pub created_at: String,
     pub updated_at: String,
+    #[serde(default)]
+    pub recall_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_recalled: Option<String>,
 }
 
 fn default_weight() -> u32 {
     100
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -205,6 +219,11 @@ impl Knowledge {
         })
     }
 
+    /// Active entries that should be rendered into markdown (excludes indexed-only).
+    fn renderable_entries(&self) -> impl Iterator<Item = &KnowledgeEntry> {
+        self.active_entries().filter(|e| e.render)
+    }
+
     // ── CRUD ───────────────────────────────────────────────────────
 
     pub fn learn(&mut self, args: &Value, from_agent: bool) -> Result<String> {
@@ -290,6 +309,9 @@ impl Knowledge {
             })
             .unwrap_or_default();
 
+        let decay = args["decay"].as_bool().unwrap_or(true);
+        let review_at = args["review_at"].as_str().map(String::from);
+
         let entry = KnowledgeEntry {
             id: id.clone(),
             title,
@@ -301,6 +323,9 @@ impl Knowledge {
             providers,
             priority,
             weight,
+            render: true,
+            decay,
+            review_at,
             status: Status::Active,
             approval,
             supersedes,
@@ -315,6 +340,8 @@ impl Knowledge {
             },
             created_at: now.clone(),
             updated_at: now,
+            recall_count: 0,
+            last_recalled: None,
         };
 
         self.store.entries.push(entry);
@@ -367,6 +394,9 @@ impl Knowledge {
             providers: Vec::new(),
             priority: Priority::Standard,
             weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
             status: Status::Active,
             approval: Approval::Imported,
             supersedes: None,
@@ -374,10 +404,64 @@ impl Knowledge {
             source: "imported".to_string(),
             created_at: now.clone(),
             updated_at: now,
+            recall_count: 0,
+            last_recalled: None,
         });
 
         self.save()?;
         Ok(format!("Imported entry {}", id))
+    }
+
+    /// Remember — store for on-demand recall only, never rendered into markdown.
+    pub fn remember(&mut self, args: &Value, from_agent: bool) -> Result<String> {
+        let content = args["content"]
+            .as_str()
+            .context("'content' is required")?
+            .to_string();
+        let category_str = args["category"].as_str().unwrap_or("memory");
+        let category = Category::from_str(category_str).unwrap_or(Category::Memory);
+        let title = args["title"]
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| {
+                let t = content.chars().take(60).collect::<String>();
+                if content.len() > 60 { format!("{}...", t) } else { t }
+            });
+        let scope = args["scope"].as_str().unwrap_or("global").to_string();
+        let project = args["project"].as_str().map(String::from);
+        let decay = args["decay"].as_bool().unwrap_or(true);
+        let review_at = args["review_at"].as_str().map(String::from);
+
+        let now = Self::now_iso();
+        let id = Self::gen_id();
+
+        self.store.entries.push(KnowledgeEntry {
+            id: id.clone(),
+            title,
+            content,
+            variants: HashMap::new(),
+            category,
+            scope,
+            project,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            render: false,
+            decay,
+            review_at,
+            status: Status::Active,
+            approval: if from_agent { Approval::AgentInferred } else { Approval::UserConfirmed },
+            supersedes: None,
+            expires_at: args["expires_at"].as_str().map(String::from),
+            source: if from_agent { "agent".to_string() } else { "user".to_string() },
+            created_at: now.clone(),
+            updated_at: now,
+            recall_count: 0,
+            last_recalled: None,
+        });
+
+        self.save()?;
+        Ok(format!("Remembered entry {} (indexed only, not rendered)", id))
     }
 
     pub fn forget(&mut self, args: &Value) -> Result<String> {
@@ -399,7 +483,7 @@ impl Knowledge {
         }
     }
 
-    pub fn list(&self, args: &Value) -> Result<String> {
+    pub fn list(&mut self, args: &Value) -> Result<String> {
         let category_filter = args["category"].as_str();
         let scope_filter = args["scope"].as_str();
         let project_filter = args["project"].as_str();
@@ -485,6 +569,8 @@ impl Knowledge {
             return Ok("No entries found.".to_string());
         }
 
+        let returned_ids: Vec<String> = results.iter().map(|e| e.id.clone()).collect();
+
         let lines: Vec<String> = results
             .iter()
             .map(|e| {
@@ -498,14 +584,18 @@ impl Knowledge {
                     Approval::AgentInferred => " [unverified]",
                     Approval::Imported => " [imported]",
                 };
+                let render_mark = if !e.render { " [indexed-only]" } else { "" };
+                let decay_mark = if !e.decay { " [invariant]" } else { "" };
                 format!(
-                    "[{}] {:?}/{} | {} | {}{}\n  {}",
+                    "[{}] {:?}/{} | {} | {}{}{}{}\n  {}",
                     e.id,
                     e.category,
                     e.scope,
                     prov,
                     e.title,
                     approval_mark,
+                    render_mark,
+                    decay_mark,
                     if e.content.len() > 120 {
                         format!("{}...", &e.content[..120])
                     } else {
@@ -515,7 +605,20 @@ impl Knowledge {
             })
             .collect();
 
-        Ok(format!("{} entries:\n\n{}", results.len(), lines.join("\n\n")))
+        let output = format!("{} entries:\n\n{}", results.len(), lines.join("\n\n"));
+        drop(results); // release immutable borrow
+
+        // Update recall stats (best-effort, don't fail the query)
+        let now = Self::now_iso();
+        for entry in &mut self.store.entries {
+            if returned_ids.contains(&entry.id) {
+                entry.recall_count += 1;
+                entry.last_recalled = Some(now.clone());
+            }
+        }
+        let _ = self.save();
+
+        Ok(output)
     }
 
     // ── Render ─────────────────────────────────────────────────────
@@ -567,7 +670,7 @@ impl Knowledge {
         };
 
         let steerage: Vec<&KnowledgeEntry> = self
-            .active_entries()
+            .renderable_entries()
             .filter(|e| e.category == Category::Steering)
             .filter(|e| entry_visible_to(e, provider))
             .filter(|e| entry_in_scope(e, project_dir))
@@ -607,7 +710,7 @@ impl Knowledge {
         ];
 
         let mut by_category: HashMap<&str, Vec<&KnowledgeEntry>> = HashMap::new();
-        for entry in self.active_entries() {
+        for entry in self.renderable_entries() {
             if entry.category == Category::Steering {
                 continue;
             }
@@ -762,6 +865,32 @@ impl Knowledge {
         }
         if disabled > 0 {
             issues.push(format!("{} disabled entries", disabled));
+        }
+
+        // Check for entries past review_at
+        let now = Self::now_iso();
+        let mut needs_review = 0u32;
+        for entry in self.active_entries() {
+            if let Some(ref review) = entry.review_at {
+                if review.as_str() < now.as_str() && entry.decay {
+                    needs_review += 1;
+                    issues.push(format!("[{}] past review date: {}", entry.id, entry.title));
+                }
+            }
+        }
+        if needs_review > 0 {
+            issues.push(format!("{} entries past review date", needs_review));
+        }
+
+        // Check for never-recalled entries (potential dead weight)
+        let mut never_recalled = 0u32;
+        for entry in self.active_entries() {
+            if entry.recall_count == 0 && entry.decay {
+                never_recalled += 1;
+            }
+        }
+        if never_recalled > 0 {
+            issues.push(format!("{} entries never recalled (may be dead weight)", never_recalled));
         }
 
         // Check for potential duplicates (same title)
