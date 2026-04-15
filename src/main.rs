@@ -1,4 +1,5 @@
 mod index;
+mod knowledge;
 mod parser;
 
 use std::io::{self, BufRead, Write};
@@ -250,6 +251,97 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {}
                 }
+            },
+            {
+                "name": "blackbox_learn",
+                "description": "Add or update a knowledge entry. Entries are rendered into CLAUDE.md/AGENTS.md/GEMINI.md.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The instruction, fact, or preference." },
+                        "category": { "type": "string", "enum": ["profile", "convention", "steering", "build", "tool", "memory", "workflow"], "description": "Entry category." },
+                        "title": { "type": "string", "description": "Short human-readable title (auto-generated if omitted)." },
+                        "scope": { "type": "string", "enum": ["global", "project"], "description": "Global (all projects) or project-specific. Default: global." },
+                        "project": { "type": "string", "description": "Project path for project-scoped entries." },
+                        "providers": { "type": "array", "items": { "type": "string" }, "description": "Empty = all providers. Non-empty = only these (claude, codex, vibe, gemini)." },
+                        "priority": { "type": "string", "enum": ["critical", "standard", "supplementary"], "description": "Default: standard." },
+                        "weight": { "type": "integer", "description": "Ordering within priority tier. Lower = first. Default: 100." },
+                        "expires_at": { "type": "string", "description": "ISO 8601 expiry time. Null = permanent." },
+                        "id": { "type": "string", "description": "If provided, updates existing entry." }
+                    },
+                    "required": ["content", "category"]
+                }
+            },
+            {
+                "name": "blackbox_knowledge",
+                "description": "List/search knowledge entries with filters.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "category": { "type": "string", "description": "Filter by category." },
+                        "scope": { "type": "string", "description": "Filter: global or project." },
+                        "project": { "type": "string", "description": "Filter by project path substring." },
+                        "provider": { "type": "string", "description": "Show entries visible to this provider." },
+                        "status": { "type": "string", "description": "Filter by status. Default: active." },
+                        "approval": { "type": "string", "description": "Filter by approval state." },
+                        "query": { "type": "string", "description": "Full-text search within content/title." },
+                        "limit": { "type": "integer", "description": "Max results. Default: 50." }
+                    }
+                }
+            },
+            {
+                "name": "blackbox_forget",
+                "description": "Remove or supersede a knowledge entry.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "description": "Entry ID to remove." },
+                        "superseded_by": { "type": "string", "description": "If provided, marks as superseded instead of deleted." }
+                    },
+                    "required": ["id"]
+                }
+            },
+            {
+                "name": "blackbox_render",
+                "description": "Render knowledge entries into provider markdown files (CLAUDE.md, AGENTS.md, GEMINI.md).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string", "description": "Render for specific provider (claude, agents, gemini) or all." },
+                        "project": { "type": "string", "description": "Project directory path." },
+                        "dry_run": { "type": "boolean", "description": "Preview without writing files. Default: false." }
+                    }
+                }
+            },
+            {
+                "name": "blackbox_absorb",
+                "description": "Absorb external changes from rendered files back into the knowledge store. Detects unmarked additions (new entries) and missing marked blocks (deletions).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Project directory path." }
+                    },
+                    "required": ["project"]
+                }
+            },
+            {
+                "name": "blackbox_lint",
+                "description": "Health check: find contradictions, stale entries, unverified entries, duplicates.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            },
+            {
+                "name": "blackbox_review",
+                "description": "Review unverified entries (agent_inferred or imported). List, approve, or reject.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["list", "approve", "reject"], "description": "Default: list." },
+                        "id": { "type": "string", "description": "Entry ID (required for approve/reject)." }
+                    }
+                }
             }
         ]
     })
@@ -277,13 +369,18 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     JsonRpcResponse::success(id, tool_definitions())
 }
 
-fn handle_tools_call(id: Option<Value>, params: &Value, idx: &mut TranscriptIndex) -> JsonRpcResponse {
+fn handle_tools_call(
+    id: Option<Value>,
+    params: &Value,
+    idx: &mut TranscriptIndex,
+    kb: &mut knowledge::Knowledge,
+) -> JsonRpcResponse {
     let tool_name = params["name"].as_str().unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let result = match tool_name {
+        // Transcript search tools
         "blackbox_search" => {
-            // Auto-index on first search if empty
             if idx.is_empty() {
                 tracing::info!("Index is empty — building before first search");
                 if let Err(e) = idx.build_index(false) {
@@ -299,6 +396,16 @@ fn handle_tools_call(id: Option<Value>, params: &Value, idx: &mut TranscriptInde
         "blackbox_sessions_list" => idx.sessions_list(&arguments),
         "blackbox_reindex" => idx.reindex(&arguments),
         "blackbox_stats" => idx.stats(),
+
+        // Knowledge store tools
+        "blackbox_learn" => kb.learn(&arguments, false),
+        "blackbox_knowledge" => kb.list(&arguments),
+        "blackbox_forget" => kb.forget(&arguments),
+        "blackbox_render" => kb.render(&arguments),
+        "blackbox_absorb" => kb.absorb(&arguments),
+        "blackbox_lint" => kb.lint(),
+        "blackbox_review" => kb.review(&arguments),
+
         _ => {
             return tool_response(id, &format!("Unknown tool: {}", tool_name), true);
         }
@@ -404,6 +511,11 @@ fn main() -> Result<()> {
 
     let mut idx = TranscriptIndex::open_or_create(&index_path, roots, codex_root)?;
 
+    // Open knowledge store
+    let kb_path = home.join(".claude-shared").join("blackbox-knowledge.json");
+    let mut kb = knowledge::Knowledge::open(&kb_path)?;
+    tracing::info!("Knowledge store: {}", kb_path.display());
+
     // Spawn background reindex thread (every 2 minutes)
     let reindex_interval = std::env::var("BLACKBOX_REINDEX_INTERVAL_SECS")
         .ok()
@@ -459,7 +571,7 @@ fn main() -> Result<()> {
             "tools/list" => Some(handle_tools_list(msg.id)),
             "tools/call" => {
                 let params = msg.params.as_ref().cloned().unwrap_or(json!({}));
-                Some(handle_tools_call(msg.id, &params, &mut idx))
+                Some(handle_tools_call(msg.id, &params, &mut idx, &mut kb))
             }
             "ping" => Some(JsonRpcResponse::success(msg.id, json!({}))),
             _ => {
