@@ -1590,10 +1590,19 @@ fn scan_source_files(config: &ReindexConfig) -> Vec<(String, u64, u64)> {
 fn needs_reindex(config: &ReindexConfig) -> bool {
     let meta = load_meta(&config.meta_path).unwrap_or_default();
     let files = scan_source_files(config);
+    let current_paths: std::collections::HashSet<&str> =
+        files.iter().map(|(p, _, _)| p.as_str()).collect();
+    // Check for new or changed files
     for (path, mtime, size) in &files {
         match meta.get(path.as_str()) {
             Some(prev) if prev.mtime == *mtime && prev.size == *size => continue,
             _ => return true,
+        }
+    }
+    // Check for deleted files (in meta but not on disk)
+    for path in meta.keys() {
+        if !current_paths.contains(path.as_str()) {
+            return true;
         }
     }
     false
@@ -1664,9 +1673,24 @@ pub fn try_background_reindex(
         }
     }
 
-    if indexed_files == 0 {
-        tracing::debug!("auto-reindex: no new files after post-lock re-check");
-        // Writer drops here, releasing lock — no commit needed
+    // 4b. Purge documents for deleted source files
+    let current_files = scan_source_files(config);
+    let current_paths: std::collections::HashSet<String> =
+        current_files.iter().map(|(p, _, _)| p.clone()).collect();
+    let mut purged = 0u64;
+    let stale_paths: Vec<String> = meta.keys()
+        .filter(|p| !current_paths.contains(p.as_str()))
+        .cloned()
+        .collect();
+    for path in &stale_paths {
+        let term = Term::from_field_text(fields.file_path, path);
+        writer.delete_term(term);
+        meta.remove(path.as_str());
+        purged += 1;
+    }
+
+    if indexed_files == 0 && purged == 0 {
+        tracing::debug!("auto-reindex: no changes after post-lock re-check");
         return Ok(());
     }
 
@@ -1675,8 +1699,8 @@ pub fn try_background_reindex(
     save_meta(&config.meta_path, &meta)?;
 
     tracing::info!(
-        "auto-reindex: indexed {} files ({} docs), skipped {} unchanged",
-        indexed_files, indexed_docs, skipped
+        "auto-reindex: indexed {} files ({} docs), skipped {} unchanged, purged {} deleted",
+        indexed_files, indexed_docs, skipped, purged
     );
     Ok(())
 }

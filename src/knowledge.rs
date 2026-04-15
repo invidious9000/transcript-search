@@ -287,7 +287,35 @@ impl Knowledge {
                 if let Some(exp) = expires_at {
                     entry.expires_at = Some(exp);
                 }
+                // Apply optional fields when explicitly provided
+                if args.get("scope").is_some() {
+                    entry.scope = args["scope"].as_str().unwrap_or("global").to_string();
+                }
+                if args.get("project").is_some() {
+                    entry.project = args["project"].as_str().map(String::from);
+                }
+                if args.get("decay").is_some() {
+                    entry.decay = args["decay"].as_bool().unwrap_or(true);
+                }
+                if args.get("render").is_some() {
+                    entry.render = args["render"].as_bool().unwrap_or(true);
+                }
+                if args.get("review_at").is_some() {
+                    entry.review_at = args["review_at"].as_str().map(String::from);
+                }
+                if let Some(ref sup_id) = supersedes {
+                    entry.supersedes = Some(sup_id.clone());
+                }
+                let sup_target = supersedes.clone();
                 self.save()?;
+                // Supersede the old entry outside the mutable borrow
+                if let Some(sup_id) = sup_target {
+                    if let Some(old) = self.store.entries.iter_mut().find(|e| e.id == sup_id) {
+                        old.status = Status::Superseded;
+                        old.updated_at = Self::now_iso();
+                    }
+                    self.save()?;
+                }
                 return Ok(format!("Updated entry {}", id));
             }
         }
@@ -816,10 +844,11 @@ impl Knowledge {
             if !entry_in_scope(entry, Some(project_dir)) {
                 continue;
             }
-            // Only check entries we've previously rendered (they have IDs in the store)
+            // Never disable render=false entries — they are intentionally never in markdown
+            if !entry.render {
+                continue;
+            }
             if !all_found_ids.contains(&entry.id) {
-                // Entry exists in store but is missing from all rendered files
-                // This means it was intentionally removed by the user
                 entry.status = Status::Disabled;
                 entry.updated_at = Self::now_iso();
                 disabled += 1;
@@ -1019,7 +1048,8 @@ fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String)
             Approval::Imported => " *(imported)*",
             _ => "",
         };
-        if !mark.is_empty() {
+        // Always render title if non-empty — not just for unverified entries
+        if !entry.title.is_empty() {
             out.push_str(&format!("**{}**{}\n\n", entry.title, mark));
         }
         // Use provider-specific variant if available, else default content

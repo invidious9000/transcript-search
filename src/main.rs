@@ -88,7 +88,7 @@ fn tool_definitions() -> Value {
                         },
                         "role": {
                             "type": "string",
-                            "enum": ["user", "assistant", "thinking", "tool_use", "tool_result"],
+                            "enum": ["user", "assistant", "thinking", "tool_use", "tool_result", "developer"],
                             "description": "Filter by message role/type"
                         },
                         "include_subagents": {
@@ -155,7 +155,7 @@ fn tool_definitions() -> Value {
                         },
                         "role": {
                             "type": "string",
-                            "enum": ["user", "assistant", "thinking", "tool_use", "tool_result"],
+                            "enum": ["user", "assistant", "thinking", "tool_use", "tool_result", "developer"],
                             "description": "Filter to a specific role (default: all)"
                         },
                         "include_subagents": {

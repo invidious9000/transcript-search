@@ -386,7 +386,9 @@ impl Threads {
                 "no sessions".to_string()
             } else {
                 let names: Vec<String> = t.sessions.iter().map(|s| {
-                    s.name.as_deref().unwrap_or(&s.session_id[..8]).to_string()
+                    s.name.as_deref().unwrap_or_else(|| {
+                        if s.session_id.len() >= 8 { &s.session_id[..8] } else { &s.session_id }
+                    }).to_string()
                 }).collect();
                 names.join(", ")
             };
