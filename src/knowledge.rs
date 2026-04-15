@@ -80,6 +80,8 @@ pub struct KnowledgeEntry {
     pub id: String,
     pub title: String,
     pub content: String,
+    #[serde(default)]
+    pub variants: HashMap<String, String>, // provider → alternative content
     pub category: Category,
     pub scope: String, // "global" or "project"
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,10 +281,20 @@ impl Knowledge {
         }
 
         let id = Self::gen_id();
+        let variants: HashMap<String, String> = args["variants"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let entry = KnowledgeEntry {
             id: id.clone(),
             title,
             content,
+            variants,
             category,
             scope,
             project,
@@ -348,6 +360,7 @@ impl Knowledge {
             id: id.clone(),
             title,
             content,
+            variants: HashMap::new(),
             category,
             scope: args["scope"].as_str().unwrap_or("project").to_string(),
             project: args["project"].as_str().map(String::from),
@@ -564,7 +577,7 @@ impl Knowledge {
             md.push_str(steerage_heading);
             md.push('\n');
             md.push('\n');
-            render_entries(&steerage, &mut md);
+            render_entries(&steerage, provider, &mut md);
             md.push('\n');
         }
 
@@ -599,7 +612,7 @@ impl Knowledge {
                 let mut sorted = entries.clone();
                 sorted.sort_by_key(|e| e.weight);
                 md.push_str(&format!("## {}\n\n", heading));
-                render_entries(&sorted, &mut md);
+                render_entries(&sorted, provider, &mut md);
                 md.push('\n');
             }
         }
@@ -634,15 +647,12 @@ impl Knowledge {
             ("GEMINI.md", "gemini"),
         ];
 
-        let known_ids: std::collections::HashSet<String> = self
-            .store
-            .entries
-            .iter()
-            .map(|e| e.id.clone())
-            .collect();
-
         let mut absorbed = 0u32;
         let mut disabled = 0u32;
+
+        // Collect all entry IDs found across ALL rendered files
+        let mut all_found_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for (filename, _provider) in &files {
             let path = Path::new(project_dir).join(filename);
@@ -652,40 +662,9 @@ impl Knowledge {
 
             let content = fs::read_to_string(&path)?;
 
-            // Find all entry ID markers in the file
-            let mut found_ids: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
             for line in content.lines() {
                 if let Some(id) = extract_marker_id(line) {
-                    found_ids.insert(id);
-                }
-            }
-
-            // Entries that should be in this file but are missing → disabled (intentional deletion)
-            for entry in &mut self.store.entries {
-                if entry.status != Status::Active {
-                    continue;
-                }
-                if !entry_in_scope(entry, Some(project_dir)) {
-                    continue;
-                }
-                if known_ids.contains(&entry.id) && !found_ids.contains(&entry.id) {
-                    // This entry was rendered (has an ID) but is missing from the file
-                    // Check if it SHOULD be in this file
-                    let should_be_here = match *filename {
-                        "CLAUDE.md" => entry_visible_to(entry, "claude"),
-                        "AGENTS.md" => {
-                            entry_visible_to(entry, "codex")
-                                || entry_visible_to(entry, "vibe")
-                        }
-                        "GEMINI.md" => entry_visible_to(entry, "gemini"),
-                        _ => false,
-                    };
-                    if should_be_here {
-                        entry.status = Status::Disabled;
-                        entry.updated_at = Self::now_iso();
-                        disabled += 1;
-                    }
+                    all_found_ids.insert(id);
                 }
             }
 
@@ -700,7 +679,7 @@ impl Knowledge {
                     continue;
                 }
                 // Skip PROJECT.md content (it's included verbatim, not an entry)
-                if section.starts_with("## Project Details") {
+                if section.contains("## Project Details") {
                     continue;
                 }
 
@@ -712,6 +691,25 @@ impl Knowledge {
                 });
                 self.learn_internal(&entry_args)?;
                 absorbed += 1;
+            }
+        }
+
+        // Disable entries that are missing from ALL files they should appear in
+        // (only after scanning all files to avoid the per-file disability race)
+        for entry in &mut self.store.entries {
+            if entry.status != Status::Active {
+                continue;
+            }
+            if !entry_in_scope(entry, Some(project_dir)) {
+                continue;
+            }
+            // Only check entries we've previously rendered (they have IDs in the store)
+            if !all_found_ids.contains(&entry.id) {
+                // Entry exists in store but is missing from all rendered files
+                // This means it was intentionally removed by the user
+                entry.status = Status::Disabled;
+                entry.updated_at = Self::now_iso();
+                disabled += 1;
             }
         }
 
@@ -874,7 +872,7 @@ fn entry_in_scope(entry: &KnowledgeEntry, project_dir: Option<&str>) -> bool {
     }
 }
 
-fn render_entries(entries: &[&KnowledgeEntry], out: &mut String) {
+fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
     for entry in entries {
         out.push_str(&format!("<!-- bb:entry={} -->\n", entry.id));
         let mark = match entry.approval {
@@ -885,7 +883,12 @@ fn render_entries(entries: &[&KnowledgeEntry], out: &mut String) {
         if !mark.is_empty() {
             out.push_str(&format!("**{}**{}\n\n", entry.title, mark));
         }
-        out.push_str(&entry.content);
+        // Use provider-specific variant if available, else default content
+        let content = entry
+            .variants
+            .get(provider)
+            .unwrap_or(&entry.content);
+        out.push_str(content);
         out.push_str("\n\n");
         out.push_str(&format!("<!-- /bb:entry={} -->\n", entry.id));
     }
