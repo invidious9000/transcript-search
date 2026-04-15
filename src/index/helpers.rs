@@ -369,3 +369,74 @@ pub(super) fn is_stop_word(w: &str) -> bool {
         | "file" | "line" | "error" | "output" | "input" | "command"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_looks_like_uuid() {
+        assert!(looks_like_uuid("019d8319-6ffe-78b0-904b-4bfdb2a9cdb5"));
+        assert!(looks_like_uuid("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(!looks_like_uuid("not-a-uuid"));
+        assert!(!looks_like_uuid("019d8319-6ffe-78b0-904b-4bfdb2a9cdb")); // too short
+        assert!(!looks_like_uuid("019d8319-6ffe-78b0-904b-4bfdb2a9cdb55")); // too long
+        assert!(!looks_like_uuid("019d8319x6ffe-78b0-904b-4bfdb2a9cdb5")); // wrong separator
+    }
+
+    #[test]
+    fn test_shorten_project() {
+        assert_eq!(shorten_project("/home/user/repos/foo"), "foo");
+        assert_eq!(shorten_project("bar"), "bar");
+        assert_eq!(shorten_project(""), "");
+    }
+
+    #[test]
+    fn test_is_stop_word() {
+        assert!(is_stop_word("the"));
+        assert!(is_stop_word("and"));
+        assert!(is_stop_word("true"));
+        assert!(is_stop_word("null"));
+        assert!(is_stop_word("tool"));
+        assert!(is_stop_word("result"));
+        assert!(!is_stop_word("database"));
+        assert!(!is_stop_word("migration"));
+        assert!(!is_stop_word("rust"));
+    }
+
+    #[test]
+    fn test_extract_project_from_path() {
+        let root = Path::new("/home/user/.claude/projects");
+        let path = Path::new("/home/user/.claude/projects/-home-user-repos-my-cool-app/transcripts/abc.jsonl");
+        assert_eq!(extract_project_from_path(path, root), "-home-user-repos-my-cool-app");
+
+        let path2 = Path::new("some/other/path/foo.jsonl");
+        assert_eq!(extract_project_from_path(path2, root), "some");
+    }
+
+    #[test]
+    fn test_extract_codex_session_id() {
+        let p1 = Path::new("rollout-2026-04-12T13-09-35-019d8319-6ffe-78b0-904b-4bfdb2a9cdb5.jsonl");
+        assert_eq!(extract_codex_session_id(p1), "019d8319-6ffe-78b0-904b-4bfdb2a9cdb5");
+
+        let p2 = Path::new("not-matching-format.jsonl");
+        assert_eq!(extract_codex_session_id(p2), "not-matching-format");
+
+        let p3 = Path::new("rollout-2026-04-12T13-09-35.jsonl");
+        assert_eq!(extract_codex_session_id(p3), "rollout-2026-04-12T13-09-35");
+    }
+
+    #[test]
+    fn test_is_stop_word_case() {
+        assert!(is_stop_word("the"));
+        assert!(!is_stop_word("THE"));
+        assert!(!is_stop_word("The"));
+    }
+
+    #[test]
+    fn test_looks_like_uuid_casing() {
+        assert!(looks_like_uuid("019d8319-6ffe-78b0-904b-4bfdb2a9cdb5"));
+        assert!(looks_like_uuid("019D8319-6FFE-78B0-904B-4BFDB2A9CDB5"));
+    }
+}

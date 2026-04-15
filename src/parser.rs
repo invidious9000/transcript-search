@@ -351,3 +351,298 @@ fn truncate(s: &str) -> String {
         format!("{}...[truncated]", &s[..end])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_parse_user_string_message() {
+        let line = json!({
+            "type": "user",
+            "sessionId": "session-123",
+            "timestamp": "2026-04-15T12:00:00Z",
+            "message": {
+                "role": "user",
+                "content": "Hello world"
+            }
+        }).to_string();
+
+        let events = parse_transcript_line(&line);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].content, "Hello world");
+        assert_eq!(events[0].session_id, "session-123");
+    }
+
+    #[test]
+    fn test_parse_user_tool_result() {
+        let line = json!({
+            "type": "user",
+            "sessionId": "s1",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Analyzing..." },
+                    { "type": "tool_result", "tool_use_id": "call_1", "content": "Success" }
+                ]
+            }
+        }).to_string();
+
+        let events = parse_transcript_line(&line);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].content, "Analyzing...");
+        assert_eq!(events[1].role, "tool_result");
+        assert!(events[1].content.contains("result:call_1 Success"));
+    }
+
+    #[test]
+    fn test_parse_assistant_message() {
+        let line = json!({
+            "type": "assistant",
+            "sessionId": "s1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "I should say hello" },
+                    { "type": "text", "text": "Hello!" },
+                    { "type": "tool_use", "name": "read_file", "input": {"path": "foo.rs"}, "id": "t1" }
+                ]
+            }
+        }).to_string();
+
+        let events = parse_transcript_line(&line);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].role, "thinking");
+        assert_eq!(events[0].content, "I should say hello");
+        assert_eq!(events[1].role, "assistant");
+        assert_eq!(events[1].content, "Hello!");
+        assert_eq!(events[2].role, "tool_use");
+        assert!(events[2].content.contains("tool:read_file"));
+        assert!(events[2].content.contains("foo.rs"));
+    }
+
+    #[test]
+    fn test_parse_invalid_json() {
+        assert!(parse_transcript_line("not json").is_empty());
+        assert!(parse_transcript_line("{}").is_empty());
+    }
+
+    #[test]
+    fn test_parse_metadata() {
+        let line = json!({
+            "type": "user",
+            "sessionId": "s1",
+            "timestamp": "ts",
+            "gitBranch": "main",
+            "cwd": "/repo",
+            "message": { "content": "hi" }
+        }).to_string();
+
+        let events = parse_transcript_line(&line);
+        assert_eq!(events[0].session_id, "s1");
+        assert_eq!(events[0].timestamp, Some("ts".to_string()));
+        assert_eq!(events[0].git_branch, Some("main".to_string()));
+        assert_eq!(events[0].cwd, Some("/repo".to_string()));
+        assert!(!events[0].is_subagent);
+    }
+
+    #[test]
+    fn test_parse_subagent() {
+        let line = json!({
+            "type": "user",
+            "sessionId": "s1",
+            "isSidechain": true,
+            "slug": "researcher",
+            "message": { "content": "hi" }
+        }).to_string();
+
+        let events = parse_transcript_line(&line);
+        assert!(events[0].is_subagent);
+        assert_eq!(events[0].agent_slug, Some("researcher".to_string()));
+    }
+
+    #[test]
+    fn test_parse_history_line() {
+        let line = json!({
+            "display": "ls command",
+            "sessionId": "s1",
+            "project": "/p",
+            "timestamp": 1600000000000u64
+        }).to_string();
+
+        let events = parse_history_line(&line);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "ls command");
+        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].cwd, Some("/p".to_string()));
+    }
+
+    #[test]
+    fn test_parse_codex_line() {
+        let meta = json!({
+            "type": "session_meta",
+            "payload": { "cwd": "/repo", "base_instructions": "Be helpful" }
+        }).to_string();
+        let ev1 = parse_codex_line(&meta, "s1");
+        assert_eq!(ev1.len(), 1);
+        assert_eq!(ev1[0].role, "developer");
+        assert_eq!(ev1[0].content, "Be helpful");
+
+        let resp = json!({
+            "type": "response_item",
+            "payload": {
+                "role": "assistant",
+                "content": [
+                    { "type": "output_text", "text": "Done" },
+                    { "type": "function_call", "name": "ls", "arguments": "{\"path\": \".\"}" }
+                ]
+            }
+        }).to_string();
+        let ev2 = parse_codex_line(&resp, "s1");
+        assert_eq!(ev2.len(), 2);
+        assert_eq!(ev2[0].role, "assistant");
+        assert_eq!(ev2[1].role, "tool_use");
+        assert!(ev2[1].content.contains("tool:ls"));
+    }
+
+    #[test]
+    fn test_extract_tool_result_text() {
+        let b1 = json!({ "content": "direct string" });
+        assert_eq!(extract_tool_result_text(&b1), Some("direct string".to_string()));
+
+        let b2 = json!({ "content": [ { "text": "part1" }, { "text": "part2" } ] });
+        assert_eq!(extract_tool_result_text(&b2), Some("part1\npart2".to_string()));
+
+        let b3 = json!({ "content": [] });
+        assert_eq!(extract_tool_result_text(&b3), None);
+    }
+
+    #[test]
+    fn test_truncate() {
+        let short = "abc";
+        assert_eq!(truncate(short), "abc");
+
+        let long = "a".repeat(13000);
+        let tr = truncate(&long);
+        assert!(tr.ends_with("...[truncated]"));
+        assert!(tr.len() < 13000);
+
+        // UTF-8 boundary test (Emoji is 4 bytes: 🦀 = \u{1F980})
+        let emoji_repeated = "🦀".repeat(4000); 
+        let tr_emoji = truncate(&emoji_repeated);
+        assert!(tr_emoji.ends_with("...[truncated]"));
+        // Ensure it doesn't panic and result is valid string
+        assert!(!tr_emoji.is_empty());
+    }
+
+    #[test]
+    fn test_parse_codex_history_line() {
+        let line = json!({
+            "session_id": "s1",
+            "ts": 1600000000,
+            "text": "Hello Codex"
+        }).to_string();
+        let events = parse_codex_history_line(&line);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "Hello Codex");
+        assert_eq!(events[0].timestamp, Some("1600000000".to_string()));
+    }
+
+    #[test]
+    fn test_parse_codex_direct_string_content() {
+        let line = json!({
+            "type": "response_item",
+            "payload": {
+                "role": "user",
+                "content": "direct text"
+            }
+        }).to_string();
+        let events = parse_codex_line(&line, "s1");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "direct text");
+    }
+
+    #[test]
+    fn test_parse_codex_reasoning() {
+        let line = json!({
+            "type": "response_item",
+            "payload": {
+                "role": "assistant",
+                "content": [
+                    { "type": "reasoning", "text": "Thinking hard" }
+                ]
+            }
+        }).to_string();
+        let events = parse_codex_line(&line, "s1");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].role, "thinking");
+        assert_eq!(events[0].content, "Thinking hard");
+    }
+
+    #[test]
+    fn test_parse_codex_function_call_output() {
+        let line = json!({
+            "type": "response_item",
+            "payload": {
+                "role": "assistant",
+                "content": [
+                    { "type": "function_call_output", "output": "Tool result" }
+                ]
+            }
+        }).to_string();
+        let events = parse_codex_line(&line, "s1");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].role, "tool_result");
+        assert!(events[0].content.contains("result: Tool result"));
+    }
+
+    #[test]
+    fn test_parse_assistant_no_content() {
+        let line = json!({
+            "type": "assistant",
+            "sessionId": "s1",
+            "message": { "role": "assistant" }
+        }).to_string();
+        assert!(parse_transcript_line(&line).is_empty());
+    }
+
+    #[test]
+    fn test_parse_user_array_text() {
+        let line = json!({
+            "type": "user",
+            "sessionId": "s1",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "Part 1" },
+                    { "type": "text", "text": "Part 2" }
+                ]
+            }
+        }).to_string();
+        let events = parse_transcript_line(&line);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].content, "Part 1");
+        assert_eq!(events[1].content, "Part 2");
+    }
+
+    #[test]
+    fn test_parse_assistant_tool_use_truncation() {
+        let long_input = "a".repeat(15000);
+        let line = json!({
+            "type": "assistant",
+            "sessionId": "s1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "name": "foo", "input": {"data": long_input} }
+                ]
+            }
+        }).to_string();
+        let events = parse_transcript_line(&line);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].content.contains("...[truncated]"));
+    }
+}
