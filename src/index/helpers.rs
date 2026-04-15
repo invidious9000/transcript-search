@@ -1,0 +1,371 @@
+use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+use walkdir::WalkDir;
+
+use crate::parser;
+use super::ReindexConfig;
+
+/// Extract a human-readable project name from the file path.
+/// Claude Code encodes project paths as directory names: `/home/user/repos/foo` → `-home-user-repos-foo`
+pub(super) fn extract_project_from_path(file_path: &Path, projects_root: &Path) -> String {
+    let relative = file_path
+        .strip_prefix(projects_root)
+        .unwrap_or(file_path);
+
+    // First path component is the encoded project dir
+    if let Some(first) = relative.components().next() {
+        let encoded = first.as_os_str().to_string_lossy();
+        // Decode: leading `-` → `/`, internal `-` could be path sep or literal hyphen.
+        // Best-effort: replace leading `-` sequences that look like path segments.
+        // The encoded form uses `-` for `/` — we can't perfectly disambiguate, but
+        // the raw encoded string is still useful for display and filtering.
+        return encoded.to_string();
+    }
+
+    "unknown".to_string()
+}
+
+/// Extract session ID from Codex filename: rollout-YYYY-MM-DDTHH-MM-SS-UUID.jsonl
+pub(super) fn extract_codex_session_id(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    // Format: rollout-2026-04-12T13-09-35-019d8319-6ffe-78b0-904b-4bfdb2a9cdb5
+    // The UUID is the last 5 hyphen-separated groups (36 chars including hyphens)
+    // Find the UUID portion by looking for the pattern after the datetime
+    if let Some(idx) = stem.find('T') {
+        // After T we have HH-MM-SS-UUID, skip past HH-MM-SS- (9 chars)
+        let after_t = &stem[idx + 1..];
+        if after_t.len() > 9 {
+            return after_t[9..].to_string();
+        }
+    }
+    stem
+}
+
+/// Extract cwd from the session_meta line in a Codex JSONL file (first line).
+pub(super) fn extract_codex_cwd(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(5) {
+        let line = line.ok()?;
+        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+        if v["type"].as_str() == Some("session_meta") {
+            return v["payload"]["cwd"].as_str().map(String::from);
+        }
+    }
+    None
+}
+
+pub(super) struct SessionEntry {
+    pub(super) session_id: String,
+    pub(super) account: String,
+    pub(super) project: String,
+    pub(super) start_time: String,
+    pub(super) duration_minutes: u64,
+    #[allow(dead_code)]
+    pub(super) user_messages: u64,
+    pub(super) first_prompt: String,
+    pub(super) name: String,
+}
+
+/// Extract the first user prompt from a Codex session file (reads first ~30 lines).
+pub(super) fn extract_codex_first_prompt(path: &Path) -> String {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return String::new(),
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(30) {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v["type"].as_str() == Some("response_item")
+            && v["payload"]["role"].as_str() == Some("user")
+        {
+            // Extract text from content blocks
+            if let Some(blocks) = v["payload"]["content"].as_array() {
+                for block in blocks {
+                    if block["type"].as_str() == Some("input_text") {
+                        if let Some(text) = block["text"].as_str() {
+                            // Skip system/env context blocks
+                            if text.starts_with('<') || text.starts_with('#') {
+                                continue;
+                            }
+                            let t = text.trim();
+                            if t.len() > 120 {
+                                let mut end = 120;
+                                while end > 0 && !t.is_char_boundary(end) { end -= 1; }
+                                return format!("{}...", &t[..end]);
+                            }
+                            return t.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+
+
+/// Detect the caller's session by finding the most recently modified transcript
+/// whose tail contains the search query in a user message. Provider-agnostic.
+pub(super) fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<String> {
+    let query_lower = query.to_lowercase();
+    let now = std::time::SystemTime::now();
+    let max_age_secs = 300; // 5-minute window
+
+    // Collect recently-modified JSONL transcripts (max_depth=4 to bound WalkDir)
+    let mut recent: Vec<(PathBuf, u64)> = Vec::new();
+    let scan = |dir: &Path, out: &mut Vec<(PathBuf, u64)>| {
+        for entry in WalkDir::new(dir)
+            .follow_links(true)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            if !p.extension().map(|e| e == "jsonl").unwrap_or(false) { continue; }
+            if p.to_string_lossy().contains("/subagents/") { continue; }
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(age) = now.duration_since(mtime) {
+                        if age.as_secs() < max_age_secs {
+                            out.push((p.to_path_buf(), age.as_secs()));
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    for (_name, root) in &config.roots {
+        let projects_dir = root.join("projects");
+        if projects_dir.exists() { scan(&projects_dir, &mut recent); }
+    }
+    if let Some(ref codex_root) = config.codex_root {
+        let sessions_dir = codex_root.join("sessions");
+        if sessions_dir.exists() { scan(&sessions_dir, &mut recent); }
+    }
+
+    // Most recently modified first
+    recent.sort_by_key(|(_p, age)| *age);
+
+    for (path, _age) in &recent {
+        // Read tail safely — use read_to_end + lossy conversion to handle mid-char seeks
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = file.seek(SeekFrom::Start(size.saturating_sub(65536)));
+        let mut raw = Vec::new();
+        let _ = file.read_to_end(&mut raw);
+        let tail = String::from_utf8_lossy(&raw);
+
+        let is_codex = path.to_string_lossy().contains("/.codex/");
+        let lines: Vec<&str> = tail.lines().collect();
+        let start = lines.len().saturating_sub(50);
+
+        for line in &lines[start..] {
+            let v: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Extract user message text — handle both String and Array content
+            let user_text: Option<String> = if is_codex {
+                if v["type"].as_str() == Some("response_item")
+                    && v["payload"]["role"].as_str() == Some("user")
+                {
+                    parser::extract_tool_result_text(&v["payload"])
+                } else {
+                    None
+                }
+            } else {
+                if v["type"].as_str() == Some("user") {
+                    parser::extract_tool_result_text(&v["message"])
+                } else {
+                    None
+                }
+            };
+
+            if let Some(text) = user_text {
+                if text.to_lowercase().contains(&query_lower) {
+                    if is_codex {
+                        return Some(extract_codex_session_id(path));
+                    } else if let Some(stem) = path.file_stem() {
+                        let s = stem.to_string_lossy().to_string();
+                        if looks_like_uuid(&s) {
+                            return Some(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build a map of session UUID -> friendly name from Claude session files.
+/// Claude stores sessions in ~/.claude/sessions/{pid}.json with { sessionId, name? }.
+pub(super) fn load_claude_session_names(roots: &[(String, PathBuf)]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (_account, root) in roots {
+        let sessions_dir = root.join("sessions");
+        if !sessions_dir.exists() {
+            continue;
+        }
+        let entries = match fs::read_dir(&sessions_dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e != "json").unwrap_or(true) {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let v: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let (Some(sid), Some(name)) = (v["sessionId"].as_str(), v["name"].as_str()) {
+                if !name.is_empty() {
+                    map.insert(sid.to_string(), name.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Build a map of session UUID -> friendly name from Codex session_index.jsonl.
+/// Format: one JSON object per line: { "id": "UUID", "thread_name": "friendly-name" }
+/// Append-only — last entry per ID wins (supports renames).
+pub(super) fn load_codex_session_names(codex_root: Option<&PathBuf>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let root = match codex_root {
+        Some(r) => r,
+        None => return map,
+    };
+    let index_path = root.join("session_index.jsonl");
+    let file = match fs::File::open(&index_path) {
+        Ok(f) => f,
+        Err(_) => return map,
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines().flatten() {
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let (Some(id), Some(name)) = (v["id"].as_str(), v["thread_name"].as_str()) {
+            if !name.is_empty() {
+                map.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Resolve a friendly session name to a UUID. Checks both Claude and Codex sources.
+/// Returns None if the input already looks like a UUID or no match is found.
+pub(super) fn resolve_session_name(
+    name: &str,
+    roots: &[(String, PathBuf)],
+    codex_root: Option<&PathBuf>,
+) -> Option<String> {
+    // If it already looks like a UUID, don't resolve
+    if looks_like_uuid(name) {
+        return None;
+    }
+    let name_lower = name.to_lowercase();
+
+    // Check Claude sessions
+    let claude_names = load_claude_session_names(roots);
+    for (sid, n) in &claude_names {
+        if n.to_lowercase() == name_lower {
+            return Some(sid.clone());
+        }
+    }
+
+    // Check Codex sessions
+    let codex_names = load_codex_session_names(codex_root);
+    for (sid, n) in &codex_names {
+        if n.to_lowercase() == name_lower {
+            return Some(sid.clone());
+        }
+    }
+
+    None
+}
+
+/// Quick check: does this string look like a UUID (8-4-4-4-12 hex)?
+pub(super) fn looks_like_uuid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    s.chars().enumerate().all(|(i, c)| {
+        if i == 8 || i == 13 || i == 18 || i == 23 {
+            c == '-'
+        } else {
+            c.is_ascii_hexdigit()
+        }
+    })
+}
+
+/// Shorten a project path for display: /home/user/repos/foo -> foo
+pub(super) fn shorten_project(path: &str) -> String {
+    if path.is_empty() { return String::new(); }
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
+}
+
+pub(super) fn is_stop_word(w: &str) -> bool {
+    matches!(w,
+        // Determiners, pronouns, prepositions, conjunctions
+        "the" | "a" | "an" | "and" | "or" | "but" | "in" | "on" | "at" | "to" | "for"
+        | "of" | "with" | "by" | "from" | "as" | "into" | "about" | "between" | "through"
+        | "after" | "before" | "above" | "below" | "over" | "under" | "again" | "further"
+        | "then" | "once" | "than" | "that" | "this" | "these" | "those"
+        | "is" | "are" | "was" | "were" | "be" | "been" | "being"
+        | "have" | "has" | "had" | "having" | "do" | "does" | "did" | "doing"
+        | "will" | "would" | "shall" | "should" | "may" | "might" | "must" | "can" | "could"
+        | "not" | "no" | "nor" | "if" | "so" | "just" | "also" | "very" | "too"
+        | "he" | "she" | "it" | "we" | "they" | "you" | "me" | "him" | "her" | "us" | "them"
+        | "my" | "your" | "his" | "its" | "our" | "their" | "who" | "whom" | "which" | "what"
+        | "all" | "each" | "every" | "both" | "few" | "more" | "most" | "other" | "some" | "any"
+        | "such" | "only" | "own" | "same" | "here" | "there" | "when" | "where" | "how" | "why"
+        | "out" | "up" | "off" | "down" | "now"
+        // Common verbs
+        | "get" | "got" | "make" | "made" | "let" | "see" | "look" | "use" | "used" | "using"
+        | "need" | "want" | "know" | "think" | "say" | "said" | "come" | "take" | "give"
+        | "try" | "run" | "set" | "put" | "keep" | "find" | "way"
+        // Code noise
+        | "true" | "false" | "null" | "none" | "var" | "const" | "new" | "return" | "import"
+        | "export" | "default" | "void" | "string" | "class" | "type" | "self"
+        | "src" | "else" | "case" | "break" | "enum" | "struct"
+        // Transcript noise
+        | "tool" | "result" | "content" | "text" | "message" | "user" | "assistant"
+        | "file" | "line" | "error" | "output" | "input" | "command"
+    )
+}
