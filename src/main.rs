@@ -1,6 +1,7 @@
 mod index;
 mod knowledge;
 mod parser;
+mod threads;
 
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -375,6 +376,43 @@ fn tool_definitions() -> Value {
                     },
                     "required": ["content"]
                 }
+            },
+            {
+                "name": "blackbox_thread",
+                "description": "Manage work threads — lightweight continuity tracker for non-dispatchable work (debugging, QC walks, interactive investigations, sideband concerns). Threads connect sessions, handoff docs, and notes into trackable work items below the dispatch pipeline.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["open", "continue", "resolve", "promote"],
+                            "description": "open: create new thread. continue: link session/add notes to existing. resolve: mark done. promote: graduated to graph entity."
+                        },
+                        "id": { "type": "string", "description": "Thread ID (required for continue/resolve/promote)." },
+                        "topic": { "type": "string", "description": "Short description of the work (required for open)." },
+                        "project": { "type": "string", "description": "Project path or name." },
+                        "session_id": { "type": "string", "description": "Link a session to this thread." },
+                        "provider": { "type": "string", "description": "Provider of the linked session (claude, codex, etc)." },
+                        "session_name": { "type": "string", "description": "Friendly name of the linked session." },
+                        "handoff_doc": { "type": "string", "description": "Path to handoff/context document." },
+                        "note": { "type": "string", "description": "Add a note (status update, observation, decision)." },
+                        "promoted_to": { "type": "string", "description": "Graph entity reference (required for promote)." }
+                    },
+                    "required": ["action"]
+                }
+            },
+            {
+                "name": "blackbox_thread_list",
+                "description": "List and scan work threads. Shows open/active/stale threads by default. Use stale_days to find abandoned work.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "enum": ["open", "active", "stale", "resolved", "promoted"], "description": "Filter by status." },
+                        "project": { "type": "string", "description": "Filter by project name substring." },
+                        "stale_days": { "type": "integer", "description": "Only show threads with no activity in this many days." },
+                        "include_resolved": { "type": "boolean", "description": "Include resolved/promoted threads (default: false)." }
+                    }
+                }
             }
         ]
     })
@@ -407,6 +445,7 @@ fn handle_tools_call(
     params: &Value,
     idx: &mut TranscriptIndex,
     kb: &mut knowledge::Knowledge,
+    th: &mut threads::Threads,
 ) -> JsonRpcResponse {
     let tool_name = params["name"].as_str().unwrap_or("");
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
@@ -440,6 +479,10 @@ fn handle_tools_call(
         "blackbox_absorb" => kb.absorb(&arguments),
         "blackbox_lint" => kb.lint(),
         "blackbox_review" => kb.review(&arguments),
+
+        // Thread tools
+        "blackbox_thread" => th.thread(&arguments),
+        "blackbox_thread_list" => th.thread_list(&arguments),
 
         _ => {
             return tool_response(id, &format!("Unknown tool: {}", tool_name), true);
@@ -551,6 +594,11 @@ fn main() -> Result<()> {
     let mut kb = knowledge::Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
 
+    // Open thread store
+    let th_path = home.join(".claude-shared").join("blackbox-threads.json");
+    let mut th = threads::Threads::open(&th_path)?;
+    tracing::info!("Thread store: {}", th_path.display());
+
     // Spawn background reindex thread (every 2 minutes)
     let reindex_interval = std::env::var("BLACKBOX_REINDEX_INTERVAL_SECS")
         .ok()
@@ -606,7 +654,7 @@ fn main() -> Result<()> {
             "tools/list" => Some(handle_tools_list(msg.id)),
             "tools/call" => {
                 let params = msg.params.as_ref().cloned().unwrap_or(json!({}));
-                Some(handle_tools_call(msg.id, &params, &mut idx, &mut kb))
+                Some(handle_tools_call(msg.id, &params, &mut idx, &mut kb, &mut th))
             }
             "ping" => Some(JsonRpcResponse::success(msg.id, json!({}))),
             _ => {
