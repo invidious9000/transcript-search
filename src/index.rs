@@ -190,6 +190,18 @@ impl TranscriptIndex {
             }
         }
 
+        // Auto-exclude the caller's own session by detecting which active session
+        // contains the search query as a recent user message (self-reference).
+        if let Some(caller_sid) = detect_caller_session(&self.config.roots, query_str) {
+            clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.session_id, &caller_sid),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
         let query = BooleanQuery::new(clauses);
         let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
 
@@ -845,6 +857,7 @@ impl TranscriptIndex {
                 };
 
                 let sid = v["session_id"].as_str().unwrap_or("").to_string();
+
                 let name = claude_names.get(&sid).cloned().unwrap_or_default();
 
                 if let Some(nf) = name_filter {
@@ -882,6 +895,7 @@ impl TranscriptIndex {
                         }
 
                         let session_id = extract_codex_session_id(path);
+
                         let cwd = extract_codex_cwd(path);
                         let project = cwd.as_deref().unwrap_or("");
 
@@ -1215,6 +1229,114 @@ fn extract_codex_first_prompt(path: &Path) -> String {
         }
     }
     String::new()
+}
+
+/// Detect which active session is the caller by checking if any active session's
+/// recent user messages contain the search query verbatim. Returns the session UUID
+/// of the likely caller, or None if no match.
+fn detect_caller_session(roots: &[(String, PathBuf)], query: &str) -> Option<String> {
+    let query_lower = query.to_lowercase();
+    // For each active session, find its transcript and check the tail for the query
+    for (_account, root) in roots {
+        let sessions_dir = root.join("sessions");
+        if !sessions_dir.exists() {
+            continue;
+        }
+        let entries = match fs::read_dir(&sessions_dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e != "json").unwrap_or(true) {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let v: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let sid = match v["sessionId"].as_str() {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            // Find the transcript file for this session
+            let projects_dir = root.join("projects");
+            if !projects_dir.exists() {
+                continue;
+            }
+            // Search for <session-id>.jsonl in projects/
+            let transcript = find_transcript_for_session(&projects_dir, &sid);
+            if let Some(tp) = transcript {
+                if transcript_tail_contains_query(&tp, &query_lower) {
+                    return Some(sid);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find a transcript file matching a session ID in the projects directory.
+fn find_transcript_for_session(projects_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    for entry in WalkDir::new(projects_dir)
+        .follow_links(true)
+        .max_depth(3)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let p = entry.path();
+        if p.extension().map(|e| e == "jsonl").unwrap_or(false)
+            && p.file_stem().map(|s| s.to_string_lossy()) == Some(session_id.into())
+            && !p.to_string_lossy().contains("/subagents/")
+        {
+            return Some(p.to_path_buf());
+        }
+    }
+    None
+}
+
+/// Check if the last ~20 lines of a transcript contain a user message with the query.
+fn transcript_tail_contains_query(path: &Path, query_lower: &str) -> bool {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    // Read from the end — seek to last 64KB
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let seek_pos = size.saturating_sub(65536);
+    let _ = file.seek(SeekFrom::Start(seek_pos));
+
+    let mut tail = String::new();
+    let _ = file.read_to_string(&mut tail);
+
+    // Check last ~20 JSONL lines for user messages containing the query
+    let lines: Vec<&str> = tail.lines().collect();
+    let start = lines.len().saturating_sub(20);
+    for line in &lines[start..] {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // Claude format: type=human, content array with text blocks
+        if v["type"].as_str() == Some("human") {
+            if let Some(content) = v["message"]["content"].as_array() {
+                for block in content {
+                    if let Some(text) = block["text"].as_str() {
+                        if text.to_lowercase().contains(&query_lower) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Build a map of session UUID -> friendly name from Claude session files.

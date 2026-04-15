@@ -242,6 +242,10 @@ fn tool_definitions() -> Value {
                             "type": "integer",
                             "description": "Skip this many sessions (default: 0)"
                         },
+                        "exclude_session": {
+                            "type": "string",
+                            "description": "Session UUID to exclude (use to avoid matching your own session)"
+                        },
                         "limit": {
                             "type": "integer",
                             "description": "Max sessions to return (default: 30, max: 100)"
