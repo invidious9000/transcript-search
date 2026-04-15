@@ -581,8 +581,22 @@ impl Knowledge {
             md.push('\n');
         }
 
-        // ── Layer 2: Shared Memory ──
-        // Everything that's NOT steering — shared across all providers
+        // ── Gemini: steerage → PROJECT.md → memory ──
+        // Gemini deprioritizes content at the bottom, so PROJECT.md goes
+        // between steerage and memory instead of after both.
+        if provider == "gemini" {
+            self.render_project_md(project_dir, &mut md);
+            self.render_shared_memory(provider, project_dir, &mut md);
+        } else {
+            // ── Everyone else: steerage → memory → PROJECT.md ──
+            self.render_shared_memory(provider, project_dir, &mut md);
+            self.render_project_md(project_dir, &mut md);
+        }
+
+        Ok(md)
+    }
+
+    fn render_shared_memory(&self, provider: &str, project_dir: Option<&str>, md: &mut String) {
         let memory_categories = [
             Category::Profile,
             Category::Convention,
@@ -600,29 +614,27 @@ impl Knowledge {
             if !entry_in_scope(entry, project_dir) {
                 continue;
             }
-            // Shared memory is unfiltered — same for all providers
             let heading = entry.category.heading();
             by_category.entry(heading).or_default().push(entry);
         }
 
-        // Render in stable category order
         for cat in &memory_categories {
             let heading = cat.heading();
             if let Some(entries) = by_category.get(heading) {
                 let mut sorted = entries.clone();
                 sorted.sort_by_key(|e| e.weight);
                 md.push_str(&format!("## {}\n\n", heading));
-                render_entries(&sorted, provider, &mut md);
+                render_entries(&sorted, provider, md);
                 md.push('\n');
             }
         }
+    }
 
-        // ── Layer 3: PROJECT.md ──
+    fn render_project_md(&self, project_dir: Option<&str>, md: &mut String) {
         if let Some(dir) = project_dir {
             let project_md = Path::new(dir).join("PROJECT.md");
             if project_md.exists() {
-                let content = fs::read_to_string(&project_md)
-                    .unwrap_or_default();
+                let content = fs::read_to_string(&project_md).unwrap_or_default();
                 if !content.is_empty() {
                     md.push_str("## Project Details\n\n");
                     md.push_str(&content);
@@ -630,8 +642,6 @@ impl Knowledge {
                 }
             }
         }
-
-        Ok(md)
     }
 
     // ── Absorb ─────────────────────────────────────────────────────
