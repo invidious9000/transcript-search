@@ -53,6 +53,8 @@ pub struct SessionLink {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Thread {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub topic: String,
     pub project: String,
     pub status: ThreadStatus,
@@ -171,7 +173,8 @@ impl Threads {
             "continue" => self.thread_continue(args),
             "resolve" => self.thread_resolve(args),
             "promote" => self.thread_promote(args),
-            _ => anyhow::bail!("Unknown action: {}. Use: open, continue, resolve, promote", action),
+            "rename" => self.thread_rename(args),
+            _ => anyhow::bail!("Unknown action: {}. Use: open, continue, resolve, promote, rename", action),
         }
     }
 
@@ -201,8 +204,11 @@ impl Threads {
             notes.push(n.to_string());
         }
 
+        let name = args["name"].as_str().map(String::from);
+
         let thread = Thread {
             id: id.clone(),
+            name,
             topic: topic.to_string(),
             project: project.to_string(),
             status: ThreadStatus::Open,
@@ -250,6 +256,11 @@ impl Threads {
         // Update handoff doc
         if let Some(doc) = args["handoff_doc"].as_str() {
             thread.handoff_doc = Some(doc.to_string());
+        }
+
+        // Update name if provided
+        if let Some(name) = args["name"].as_str() {
+            thread.name = Some(name.to_string());
         }
 
         thread.status = ThreadStatus::Active;
@@ -318,11 +329,33 @@ impl Threads {
         ))
     }
 
+    fn thread_rename(&mut self, args: &Value) -> Result<String> {
+        let id = args["id"]
+            .as_str()
+            .context("'id' is required")?;
+        let new_name = args["name"]
+            .as_str()
+            .context("'name' is required for rename")?;
+
+        let thread = self.store.threads.iter_mut()
+            .find(|t| t.id == id)
+            .context("Thread not found")?;
+
+        thread.name = Some(new_name.to_string());
+        thread.last_activity = Self::now_iso();
+        let topic = thread.topic.clone();
+
+        self.save()?;
+
+        Ok(format!("Thread {} renamed to \"{}\" (topic: {})", id, new_name, topic))
+    }
+
     // ── blackbox_thread_list (query) ───────────────────────────────
 
     pub fn thread_list(&self, args: &Value) -> Result<String> {
         let status_filter = args["status"].as_str();
         let project_filter = args["project"].as_str();
+        let name_filter = args["name"].as_str();
         let stale_days = args["stale_days"].as_u64();
         let include_resolved = args["include_resolved"].as_bool().unwrap_or(false);
 
@@ -351,6 +384,18 @@ impl Threads {
             // Project filter
             if let Some(pf) = project_filter {
                 if !thread.project.to_lowercase().contains(&pf.to_lowercase()) {
+                    continue;
+                }
+            }
+
+            // Name filter
+            if let Some(nf) = name_filter {
+                let nf_lower = nf.to_lowercase();
+                let name_matches = thread.name.as_ref()
+                    .map(|n| n.to_lowercase().contains(&nf_lower))
+                    .unwrap_or(false);
+                let topic_matches = thread.topic.to_lowercase().contains(&nf_lower);
+                if !name_matches && !topic_matches {
                     continue;
                 }
             }
@@ -399,9 +444,12 @@ impl Threads {
                 t.project.rsplit('/').next().unwrap_or(&t.project)
             };
 
+            let display_name = t.name.as_deref().unwrap_or("-");
+
             lines.push(format!(
-                "{} | {} | {} | {} | {} | {} | {}",
+                "{} | {} | {} | {} | {} | {} | {} | {}",
                 t.id,
+                display_name,
                 t.status.as_str(),
                 age_str,
                 project,

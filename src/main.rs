@@ -389,9 +389,10 @@ fn tool_definitions() -> Value {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["open", "continue", "resolve", "promote"],
-                            "description": "open: create new thread. continue: link session/add notes to existing. resolve: mark done. promote: graduated to graph entity."
+                            "enum": ["open", "continue", "resolve", "promote", "rename"],
+                            "description": "open: create new thread. continue: link session/add notes to existing. resolve: mark done. promote: graduated to graph entity. rename: change friendly name."
                         },
+                        "name": { "type": "string", "description": "Friendly name for the thread (short, typeable). Set on open, update via rename or continue." },
                         "id": { "type": "string", "description": "Thread ID (required for continue/resolve/promote)." },
                         "topic": { "type": "string", "description": "Short description of the work (required for open)." },
                         "project": { "type": "string", "description": "Project path or name." },
@@ -413,6 +414,7 @@ fn tool_definitions() -> Value {
                     "properties": {
                         "status": { "type": "string", "enum": ["open", "active", "stale", "resolved", "promoted"], "description": "Filter by status." },
                         "project": { "type": "string", "description": "Filter by project name substring." },
+                        "name": { "type": "string", "description": "Filter by thread name or topic substring." },
                         "stale_days": { "type": "integer", "description": "Only show threads with no activity in this many days." },
                         "include_resolved": { "type": "boolean", "description": "Include resolved/promoted threads (default: false)." }
                     }
