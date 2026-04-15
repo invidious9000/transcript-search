@@ -791,15 +791,19 @@ impl Knowledge {
         let mut absorbed = 0u32;
         let mut disabled = 0u32;
 
+        // Track which provider files were actually scanned
+        let mut scanned_providers: Vec<String> = Vec::new();
+
         // Collect all entry IDs found across ALL rendered files
         let mut all_found_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
 
-        for (filename, _provider) in &files {
+        for (filename, provider) in &files {
             let path = Path::new(project_dir).join(filename);
             if !path.exists() {
                 continue;
             }
+            scanned_providers.push(provider.to_string());
 
             let content = fs::read_to_string(&path)?;
 
@@ -835,8 +839,8 @@ impl Knowledge {
             }
         }
 
-        // Disable entries that are missing from ALL files they should appear in
-        // (only after scanning all files to avoid the per-file disability race)
+        // Disable entries missing from scanned files — but only if the entry would
+        // have been rendered in at least one of the files we actually scanned.
         for entry in &mut self.store.entries {
             if entry.status != Status::Active {
                 continue;
@@ -844,8 +848,13 @@ impl Knowledge {
             if !entry_in_scope(entry, Some(project_dir)) {
                 continue;
             }
-            // Never disable render=false entries — they are intentionally never in markdown
             if !entry.render {
+                continue;
+            }
+            // Only disable if the entry is visible to at least one scanned provider
+            let visible_to_scanned = scanned_providers.iter()
+                .any(|p| entry_visible_to(entry, p));
+            if !visible_to_scanned {
                 continue;
             }
             if !all_found_ids.contains(&entry.id) {

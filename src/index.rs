@@ -1099,14 +1099,37 @@ impl TranscriptIndex {
             }
         }
 
+        // Purge documents for deleted source files
+        let current_files = scan_source_files(&self.config);
+        let current_paths: std::collections::HashSet<String> =
+            current_files.iter().map(|(p, _, _)| p.clone()).collect();
+        let mut purged = 0u64;
+        let stale_paths: Vec<String> = meta.keys()
+            .filter(|p| !current_paths.contains(p.as_str()))
+            .cloned()
+            .collect();
+        for path in &stale_paths {
+            let term = Term::from_field_text(f.file_path, path);
+            writer.delete_term(term);
+            meta.remove(path.as_str());
+            purged += 1;
+        }
+
         writer.commit()?;
         self.reader.reload()?;
         save_meta(&self.config.meta_path, &meta)?;
 
-        let msg = format!(
-            "Indexed {} files ({} docs), skipped {} unchanged",
-            indexed_files, indexed_docs, skipped
-        );
+        let msg = if purged > 0 {
+            format!(
+                "Indexed {} files ({} docs), skipped {} unchanged, purged {} deleted",
+                indexed_files, indexed_docs, skipped, purged
+            )
+        } else {
+            format!(
+                "Indexed {} files ({} docs), skipped {} unchanged",
+                indexed_files, indexed_docs, skipped
+            )
+        };
         tracing::info!("{}", msg);
         Ok(msg)
     }
