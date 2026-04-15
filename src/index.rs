@@ -1232,22 +1232,29 @@ fn extract_codex_first_prompt(path: &Path) -> String {
 }
 
 /// Detect the caller's session by finding the most recently modified transcript
-/// whose tail contains the search query. Provider-agnostic — just greps recent files.
+/// whose tail contains the search query in a user message. Provider-agnostic.
 fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<String> {
     let query_lower = query.to_lowercase();
     let now = std::time::SystemTime::now();
+    let max_age_secs = 300; // 5-minute window
 
-    // Collect all JSONL transcript files modified in the last 60 seconds
+    // Collect recently-modified JSONL transcripts (max_depth=4 to bound WalkDir)
     let mut recent: Vec<(PathBuf, u64)> = Vec::new();
     let scan = |dir: &Path, out: &mut Vec<(PathBuf, u64)>| {
-        for entry in WalkDir::new(dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(dir)
+            .follow_links(true)
+            .max_depth(4)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             let p = entry.path();
-            if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
-                if let Ok(meta) = entry.metadata() {
-                    if let Ok(mtime) = meta.modified() {
-                        if now.duration_since(mtime).map(|d| d.as_secs() < 60).unwrap_or(false) {
-                            let age = now.duration_since(mtime).unwrap_or_default().as_secs();
-                            out.push((p.to_path_buf(), age));
+            if !p.extension().map(|e| e == "jsonl").unwrap_or(false) { continue; }
+            if p.to_string_lossy().contains("/subagents/") { continue; }
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    if let Ok(age) = now.duration_since(mtime) {
+                        if age.as_secs() < max_age_secs {
+                            out.push((p.to_path_buf(), age.as_secs()));
                         }
                     }
                 }
@@ -1264,52 +1271,70 @@ fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<String> 
         if sessions_dir.exists() { scan(&sessions_dir, &mut recent); }
     }
 
-    // Sort by most recent first
+    // Most recently modified first
     recent.sort_by_key(|(_p, age)| *age);
 
-    // Check each for the query in the tail
     for (path, _age) in &recent {
+        // Read tail safely — use read_to_end + lossy conversion to handle mid-char seeks
         use std::io::{Read, Seek, SeekFrom};
         let mut file = match fs::File::open(path) {
             Ok(f) => f,
             Err(_) => continue,
         };
         let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let _ = file.seek(SeekFrom::Start(size.saturating_sub(32768)));
-        let mut tail = String::new();
-        let _ = file.read_to_string(&mut tail);
+        let _ = file.seek(SeekFrom::Start(size.saturating_sub(65536)));
+        let mut raw = Vec::new();
+        let _ = file.read_to_end(&mut raw);
+        let tail = String::from_utf8_lossy(&raw);
 
-        // Only match user-role messages — not assistant/tool content about the same topic
         let is_codex = path.to_string_lossy().contains("/.codex/");
-        let last_lines: Vec<&str> = tail.lines().collect();
-        let check_start = last_lines.len().saturating_sub(30);
-        let mut found = false;
-        for line in &last_lines[check_start..] {
+        let lines: Vec<&str> = tail.lines().collect();
+        let start = lines.len().saturating_sub(50);
+
+        for line in &lines[start..] {
             let v: Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let is_user = if is_codex {
-                v["type"].as_str() == Some("response_item")
+
+            // Extract user message text only — not raw JSON line
+            let user_text: Option<String> = if is_codex {
+                if v["type"].as_str() == Some("response_item")
                     && v["payload"]["role"].as_str() == Some("user")
+                {
+                    v["payload"]["content"].as_array().map(|blocks| {
+                        blocks.iter()
+                            .filter_map(|b| b["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                } else {
+                    None
+                }
             } else {
-                v["type"].as_str() == Some("human")
+                // Claude format: type=user, message.content array
+                if v["type"].as_str() == Some("user") {
+                    v["message"]["content"].as_array().map(|blocks| {
+                        blocks.iter()
+                            .filter_map(|b| b["text"].as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                } else {
+                    None
+                }
             };
-            if !is_user { continue; }
-            // Check if any text content contains the query
-            let text = line.to_lowercase();
-            if text.contains(&query_lower) {
-                found = true;
-                break;
-            }
-        }
-        if found {
-            if is_codex {
-                return Some(extract_codex_session_id(path));
-            } else if let Some(stem) = path.file_stem() {
-                let s = stem.to_string_lossy().to_string();
-                if looks_like_uuid(&s) {
-                    return Some(s);
+
+            if let Some(text) = user_text {
+                if text.to_lowercase().contains(&query_lower) {
+                    if is_codex {
+                        return Some(extract_codex_session_id(path));
+                    } else if let Some(stem) = path.file_stem() {
+                        let s = stem.to_string_lossy().to_string();
+                        if looks_like_uuid(&s) {
+                            return Some(s);
+                        }
+                    }
                 }
             }
         }
