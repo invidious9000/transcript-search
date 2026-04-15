@@ -302,9 +302,31 @@ impl TranscriptIndex {
     // ── Session ─────────────────────────────────────────────────────
 
     pub fn session(&self, args: &Value) -> Result<String> {
-        let session_id = args["session_id"]
+        let raw_id = args["session_id"]
             .as_str()
             .context("'session_id' is required")?;
+
+        // If it's a friendly name, resolve to UUID
+        let resolved_id = resolve_session_name(
+            raw_id,
+            &self.config.roots,
+            self.config.codex_root.as_ref(),
+        );
+        let session_id = resolved_id.as_deref().unwrap_or(raw_id);
+
+        // Load name maps for display
+        let claude_names = load_claude_session_names(&self.config.roots);
+        let codex_names = load_codex_session_names(self.config.codex_root.as_ref());
+        let name = claude_names
+            .get(session_id)
+            .or_else(|| codex_names.get(session_id))
+            .cloned()
+            .unwrap_or_default();
+        let name_line = if name.is_empty() {
+            String::new()
+        } else {
+            format!("Name: {name}\n")
+        };
 
         // Try session-meta JSON files first
         for (account_name, root) in &self.config.roots {
@@ -324,6 +346,7 @@ impl TranscriptIndex {
 
                 return Ok(format!(
                     "Session: {session_id}\n\
+                     {name_line}\
                      Account: {account_name}\n\
                      Project: {project}\n\
                      Duration: {duration} min\n\
@@ -352,6 +375,7 @@ impl TranscriptIndex {
             let file_path = self.doc_text(&doc, self.fields.file_path);
             Ok(format!(
                 "Session: {session_id}\n\
+                 {name_line}\
                  Account: {account}\n\
                  Project: {project}\n\
                  File: {file_path}\n\
@@ -509,6 +533,14 @@ impl TranscriptIndex {
 
     /// Resolve a session ID to its JSONL file path(s) — main transcript + subagents.
     fn resolve_session_files(&self, session_id: &str) -> Result<Vec<String>> {
+        // If session_id is a friendly name, resolve to UUID first
+        let resolved_id = resolve_session_name(
+            session_id,
+            &self.config.roots,
+            self.config.codex_root.as_ref(),
+        );
+        let session_id = resolved_id.as_deref().unwrap_or(session_id);
+
         let mut main_file: Option<String> = None;
 
         // Strategy 1: index lookup — may return a subagent file, so derive main from it
@@ -523,8 +555,17 @@ impl TranscriptIndex {
                 let doc: TantivyDocument = searcher.doc(*addr)?;
                 let fp = self.doc_text(&doc, self.fields.file_path);
                 if !fp.is_empty() {
-                    // The hit might be a subagent file. Derive the main transcript path.
-                    main_file = Some(Self::derive_main_transcript(&fp, session_id));
+                    let derived = Self::derive_main_transcript(&fp, session_id);
+                    // Skip monolithic files (e.g. history.jsonl) that contain mixed sessions.
+                    // A valid per-session file either has the session_id in its name (Claude)
+                    // or follows the codex rollout-*-UUID.jsonl pattern.
+                    let stem = Path::new(&derived)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if stem.contains(session_id) || stem == session_id {
+                        main_file = Some(derived);
+                    }
                 }
             }
         }
@@ -554,6 +595,30 @@ impl TranscriptIndex {
                 }
                 if main_file.is_some() {
                     break;
+                }
+            }
+        }
+
+        // Strategy 3: codex sessions — look for rollout-*-<session-id>.jsonl
+        if main_file.is_none() || !Path::new(main_file.as_ref().unwrap()).exists() {
+            main_file = None;
+            if let Some(ref codex_root) = self.config.codex_root {
+                let sessions_dir = codex_root.join("sessions");
+                if sessions_dir.exists() {
+                    for entry in WalkDir::new(&sessions_dir)
+                        .follow_links(true)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                    {
+                        let p = entry.path();
+                        if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
+                            let extracted = extract_codex_session_id(p);
+                            if extracted == session_id {
+                                main_file = Some(p.to_string_lossy().to_string());
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -719,8 +784,13 @@ impl TranscriptIndex {
     pub fn sessions_list(&self, args: &Value) -> Result<String> {
         let account_filter = args["account"].as_str();
         let project_filter = args["project"].as_str();
+        let name_filter = args["name"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(30).min(100) as usize;
         let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+
+        // Load session name maps
+        let claude_names = load_claude_session_names(&self.config.roots);
+        let codex_names = load_codex_session_names(self.config.codex_root.as_ref());
 
         let mut entries: Vec<SessionEntry> = Vec::new();
 
@@ -774,14 +844,24 @@ impl TranscriptIndex {
                     first_prompt
                 };
 
+                let sid = v["session_id"].as_str().unwrap_or("").to_string();
+                let name = claude_names.get(&sid).cloned().unwrap_or_default();
+
+                if let Some(nf) = name_filter {
+                    if !name.to_lowercase().contains(&nf.to_lowercase()) {
+                        continue;
+                    }
+                }
+
                 entries.push(SessionEntry {
-                    session_id: v["session_id"].as_str().unwrap_or("").to_string(),
+                    session_id: sid,
                     account: account_name.clone(),
                     project: shorten_project(&project),
                     start_time: start,
                     duration_minutes: v["duration_minutes"].as_u64().unwrap_or(0),
                     user_messages: v["user_message_count"].as_u64().unwrap_or(0),
                     first_prompt: prompt_preview,
+                    name,
                 });
             }
         }
@@ -825,6 +905,13 @@ impl TranscriptIndex {
 
                         // Get first user prompt (read only first ~20 lines)
                         let first_prompt = extract_codex_first_prompt(path);
+                        let name = codex_names.get(&session_id).cloned().unwrap_or_default();
+
+                        if let Some(nf) = name_filter {
+                            if !name.to_lowercase().contains(&nf.to_lowercase()) {
+                                continue;
+                            }
+                        }
 
                         entries.push(SessionEntry {
                             session_id,
@@ -834,6 +921,7 @@ impl TranscriptIndex {
                             duration_minutes: 0,
                             user_messages: 0,
                             first_prompt,
+                            name,
                         });
                     }
                 }
@@ -864,9 +952,14 @@ impl TranscriptIndex {
             } else {
                 "-".to_string()
             };
+            let name_col = if e.name.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", e.name)
+            };
             lines.push(format!(
-                "{} | {:>4} | {:<8} | {:<30} | {} | {}",
-                date, dur, e.account, e.project, e.session_id, e.first_prompt
+                "{} | {:>4} | {:<8} | {:<30} | {}{} | {}",
+                date, dur, e.account, e.project, e.session_id, name_col, e.first_prompt
             ));
         }
 
@@ -1077,6 +1170,7 @@ struct SessionEntry {
     #[allow(dead_code)]
     user_messages: u64,
     first_prompt: String,
+    name: String,
 }
 
 /// Extract the first user prompt from a Codex session file (reads first ~30 lines).
@@ -1121,6 +1215,117 @@ fn extract_codex_first_prompt(path: &Path) -> String {
         }
     }
     String::new()
+}
+
+/// Build a map of session UUID -> friendly name from Claude session files.
+/// Claude stores sessions in ~/.claude/sessions/{pid}.json with { sessionId, name? }.
+fn load_claude_session_names(roots: &[(String, PathBuf)]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for (_account, root) in roots {
+        let sessions_dir = root.join("sessions");
+        if !sessions_dir.exists() {
+            continue;
+        }
+        let entries = match fs::read_dir(&sessions_dir) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e != "json").unwrap_or(true) {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let v: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if let (Some(sid), Some(name)) = (v["sessionId"].as_str(), v["name"].as_str()) {
+                if !name.is_empty() {
+                    map.insert(sid.to_string(), name.to_string());
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Build a map of session UUID -> friendly name from Codex session_index.jsonl.
+/// Format: one JSON object per line: { "id": "UUID", "thread_name": "friendly-name" }
+/// Append-only — last entry per ID wins (supports renames).
+fn load_codex_session_names(codex_root: Option<&PathBuf>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let root = match codex_root {
+        Some(r) => r,
+        None => return map,
+    };
+    let index_path = root.join("session_index.jsonl");
+    let file = match fs::File::open(&index_path) {
+        Ok(f) => f,
+        Err(_) => return map,
+    };
+    let reader = BufReader::new(file);
+    for line in reader.lines().flatten() {
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let (Some(id), Some(name)) = (v["id"].as_str(), v["thread_name"].as_str()) {
+            if !name.is_empty() {
+                map.insert(id.to_string(), name.to_string());
+            }
+        }
+    }
+    map
+}
+
+/// Resolve a friendly session name to a UUID. Checks both Claude and Codex sources.
+/// Returns None if the input already looks like a UUID or no match is found.
+fn resolve_session_name(
+    name: &str,
+    roots: &[(String, PathBuf)],
+    codex_root: Option<&PathBuf>,
+) -> Option<String> {
+    // If it already looks like a UUID, don't resolve
+    if looks_like_uuid(name) {
+        return None;
+    }
+    let name_lower = name.to_lowercase();
+
+    // Check Claude sessions
+    let claude_names = load_claude_session_names(roots);
+    for (sid, n) in &claude_names {
+        if n.to_lowercase() == name_lower {
+            return Some(sid.clone());
+        }
+    }
+
+    // Check Codex sessions
+    let codex_names = load_codex_session_names(codex_root);
+    for (sid, n) in &codex_names {
+        if n.to_lowercase() == name_lower {
+            return Some(sid.clone());
+        }
+    }
+
+    None
+}
+
+/// Quick check: does this string look like a UUID (8-4-4-4-12 hex)?
+fn looks_like_uuid(s: &str) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    s.chars().enumerate().all(|(i, c)| {
+        if i == 8 || i == 13 || i == 18 || i == 23 {
+            c == '-'
+        } else {
+            c.is_ascii_hexdigit()
+        }
+    })
 }
 
 /// Shorten a project path for display: /home/user/repos/foo -> foo

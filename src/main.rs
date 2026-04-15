@@ -126,13 +126,13 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "blackbox_session",
-                "description": "Get summary info for a session: first prompt, project, duration, tool usage, message counts.",
+                "description": "Get summary info for a session: first prompt, project, duration, tool usage, message counts. Accepts UUID or friendly session name.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "session_id": {
                             "type": "string",
-                            "description": "Session UUID"
+                            "description": "Session UUID or friendly name (e.g. 'bbox', 'claude-test')"
                         }
                     },
                     "required": ["session_id"]
@@ -140,13 +140,13 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "blackbox_messages",
-                "description": "List messages from a session in chronological order. Returns the conversation flow with role labels and timestamps. Use session_id to find by UUID, or file_path for a known transcript. Large sessions are paginated via offset/limit.",
+                "description": "List messages from a session in chronological order. Returns the conversation flow with role labels and timestamps. Use session_id (UUID or friendly name) to find a session, or file_path for a known transcript. Large sessions are paginated via offset/limit.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "session_id": {
                             "type": "string",
-                            "description": "Session UUID. Resolves to file path(s) via index or filesystem."
+                            "description": "Session UUID or friendly name (e.g. 'bbox', 'claude-test'). Resolves to file path(s) via index or filesystem."
                         },
                         "file_path": {
                             "type": "string",
@@ -221,7 +221,7 @@ fn tool_definitions() -> Value {
             },
             {
                 "name": "blackbox_sessions_list",
-                "description": "Browse sessions across all accounts, sorted by most recent. Shows date, duration, account, project, session ID, and first prompt. Use to find sessions without knowing keywords.",
+                "description": "Browse sessions across all accounts, sorted by most recent. Shows date, duration, account, project, session ID, friendly name, and first prompt. Use to find sessions without knowing keywords. Supports filtering by friendly session name.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -232,6 +232,10 @@ fn tool_definitions() -> Value {
                         "project": {
                             "type": "string",
                             "description": "Filter by project name substring (case-insensitive)"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Filter by friendly session name substring (case-insensitive)"
                         },
                         "offset": {
                             "type": "integer",
@@ -344,6 +348,17 @@ fn tool_definitions() -> Value {
                 }
             },
             {
+                "name": "blackbox_bootstrap",
+                "description": "Bootstrap a new repo into the blackbox knowledge system. Scans for existing instruction files (CLAUDE.md, AGENTS.md, .cursorrules, copilot-instructions.md) and returns their contents with classification guidance. The agent then decomposes them into PROJECT.md (project-specific docs) + blackbox_learn entries (cross-project knowledge). Run this once when onboarding a repo.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "project": { "type": "string", "description": "Absolute path to the repo root." }
+                    },
+                    "required": ["project"]
+                }
+            },
+            {
                 "name": "blackbox_remember",
                 "description": "Store a fact for on-demand recall only — NOT rendered into CLAUDE.md/AGENTS.md/GEMINI.md. Use this for observations, context, decisions, and notes that should be searchable via blackbox_knowledge but don't need to be in every session's context window.",
                 "inputSchema": {
@@ -417,6 +432,7 @@ fn handle_tools_call(
 
         // Knowledge store tools
         "blackbox_learn" => kb.learn(&arguments, false),
+        "blackbox_bootstrap" => kb.bootstrap(&arguments),
         "blackbox_remember" => kb.remember(&arguments, false),
         "blackbox_knowledge" => kb.list(&arguments),
         "blackbox_forget" => kb.forget(&arguments),
