@@ -173,22 +173,7 @@ impl Knowledge {
     }
 
     fn now_iso() -> String {
-        // Simple UTC timestamp
-        let d = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default();
-        let secs = d.as_secs();
-        let days = secs / 86400;
-        let time_secs = secs % 86400;
-        let hours = time_secs / 3600;
-        let mins = (time_secs % 3600) / 60;
-        let s = time_secs % 60;
-        // Approximate date calculation (good enough for timestamps)
-        let (year, month, day) = epoch_days_to_date(days);
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            year, month, day, hours, mins, s
-        )
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
     fn gen_id() -> String {
@@ -1130,40 +1115,6 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     drop(file);
     fs::rename(&tmp, path)?;
     Ok(())
-}
-
-/// Convert days since Unix epoch to (year, month, day).
-fn epoch_days_to_date(days: u64) -> (u64, u64, u64) {
-    // Simplified — handles 2000-2099 correctly
-    let mut y = 1970;
-    let mut remaining = days as i64;
-    loop {
-        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-            366
-        } else {
-            365
-        };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days: [i64; 12] = [
-        31,
-        if leap { 29 } else { 28 },
-        31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
-    ];
-    let mut m = 0;
-    for (i, &md) in month_days.iter().enumerate() {
-        if remaining < md {
-            m = i;
-            break;
-        }
-        remaining -= md;
-    }
-    (y as u64, (m + 1) as u64, (remaining + 1) as u64)
 }
 
 // ── Bootstrap ─────────────────────────────────────────────────────

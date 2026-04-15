@@ -124,32 +124,7 @@ impl Threads {
     }
 
     fn now_iso() -> String {
-        use std::time::SystemTime;
-        let d = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let secs = d.as_secs();
-        let (days_since_epoch, rem) = (secs / 86400, secs % 86400);
-        let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-
-        // Simple date calculation from epoch days
-        let mut y: i64 = 1970;
-        let mut remaining_days = days_since_epoch as i64;
-        loop {
-            let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-            if remaining_days < days_in_year { break; }
-            remaining_days -= days_in_year;
-            y += 1;
-        }
-        let months = [31, if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
-                       31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        let mut mo = 0;
-        for days_in_month in &months {
-            if remaining_days < *days_in_month { break; }
-            remaining_days -= days_in_month;
-            mo += 1;
-        }
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo + 1, remaining_days + 1, h, m, s)
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
     fn gen_id() -> String {

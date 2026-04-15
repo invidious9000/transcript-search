@@ -170,7 +170,7 @@ fn parse_assistant_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent
     events
 }
 
-fn extract_tool_result_text(block: &Value) -> Option<String> {
+pub fn extract_tool_result_text(block: &Value) -> Option<String> {
     match &block["content"] {
         Value::String(s) => Some(s.clone()),
         Value::Array(parts) => {

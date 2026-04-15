@@ -1254,19 +1254,7 @@ fn extract_codex_first_prompt(path: &Path) -> String {
     String::new()
 }
 
-/// Extract text from a content field that may be a String or Array of blocks.
-fn extract_content_text(content: &Value) -> Option<String> {
-    match content {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
-        Value::Array(blocks) => {
-            let texts: Vec<&str> = blocks.iter()
-                .filter_map(|b| b["text"].as_str())
-                .collect();
-            if texts.is_empty() { None } else { Some(texts.join(" ")) }
-        }
-        _ => None,
-    }
-}
+
 
 /// Detect the caller's session by finding the most recently modified transcript
 /// whose tail contains the search query in a user message. Provider-agnostic.
@@ -1339,13 +1327,13 @@ fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<String> 
                 if v["type"].as_str() == Some("response_item")
                     && v["payload"]["role"].as_str() == Some("user")
                 {
-                    extract_content_text(&v["payload"]["content"])
+                    parser::extract_tool_result_text(&v["payload"])
                 } else {
                     None
                 }
             } else {
                 if v["type"].as_str() == Some("user") {
-                    extract_content_text(&v["message"]["content"])
+                    parser::extract_tool_result_text(&v["message"])
                 } else {
                     None
                 }
