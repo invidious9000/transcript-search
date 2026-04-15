@@ -1279,18 +1279,37 @@ fn detect_caller_session(config: &ReindexConfig, query: &str) -> Option<String> 
         let mut tail = String::new();
         let _ = file.read_to_string(&mut tail);
 
-        if tail.to_lowercase().contains(&query_lower) {
-            // Extract session ID from this file
-            let is_codex = path.to_string_lossy().contains("/.codex/");
+        // Only match user-role messages — not assistant/tool content about the same topic
+        let is_codex = path.to_string_lossy().contains("/.codex/");
+        let last_lines: Vec<&str> = tail.lines().collect();
+        let check_start = last_lines.len().saturating_sub(30);
+        let mut found = false;
+        for line in &last_lines[check_start..] {
+            let v: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let is_user = if is_codex {
+                v["type"].as_str() == Some("response_item")
+                    && v["payload"]["role"].as_str() == Some("user")
+            } else {
+                v["type"].as_str() == Some("human")
+            };
+            if !is_user { continue; }
+            // Check if any text content contains the query
+            let text = line.to_lowercase();
+            if text.contains(&query_lower) {
+                found = true;
+                break;
+            }
+        }
+        if found {
             if is_codex {
                 return Some(extract_codex_session_id(path));
-            } else {
-                // Claude: session ID is the file stem
-                if let Some(stem) = path.file_stem() {
-                    let s = stem.to_string_lossy().to_string();
-                    if looks_like_uuid(&s) {
-                        return Some(s);
-                    }
+            } else if let Some(stem) = path.file_stem() {
+                let s = stem.to_string_lossy().to_string();
+                if looks_like_uuid(&s) {
+                    return Some(s);
                 }
             }
         }
