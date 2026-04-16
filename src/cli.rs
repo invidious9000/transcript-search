@@ -771,16 +771,28 @@ fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
     // line-level style into default spans has been flaky in practice, so
     // we bake the line style into every span's style here — guarantees
     // the styling survives all the way to the buffer.
+    //
+    // We also strip the leading `#+ ` span tui-markdown emits for ATX
+    // headings — the marker is noise once the heading itself is visibly
+    // styled; stripping matches what rendered markdown normally looks
+    // like.
     let line_style = convert_core_style(line.style);
-    let spans: Vec<Span<'static>> = line
-        .spans
-        .into_iter()
+    let mut iter = line.spans.into_iter().peekable();
+    if iter.peek().is_some_and(|s| is_heading_marker_span(&s.content)) {
+        let _ = iter.next();
+    }
+    let spans: Vec<Span<'static>> = iter
         .map(|s| {
             let merged = line_style.patch(convert_core_style(s.style));
             Span::styled(s.content.into_owned(), merged)
         })
         .collect();
     Line::from(spans)
+}
+
+fn is_heading_marker_span(s: &str) -> bool {
+    let t = s.trim_end();
+    !t.is_empty() && t.chars().all(|c| c == '#')
 }
 
 /// True if the line is ONLY a numbered-list marker like "1. ", "42. "
