@@ -11,7 +11,10 @@ use std::io::{self, BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -277,6 +280,16 @@ struct App {
     fullscreen: bool,
     /// Last rendered body height — used for page-scroll step size.
     last_body_h: u16,
+    /// Per-lane horizontal weight (in pct-ish units). Adjusted by drag.
+    lane_weights: Vec<u16>,
+    /// Column range per visible lane: (start_inclusive, end_exclusive,
+    /// absolute lane index in `lanes`). Updated every draw so mouse
+    /// events can map column → lane identity regardless of fullscreen.
+    lane_columns: Vec<(u16, u16, usize)>,
+    /// Body area y bounds (top inclusive, bottom exclusive).
+    body_y_range: (u16, u16),
+    /// If dragging a divider, which one: the index of the right-hand lane.
+    dragging_divider: Option<usize>,
     quit: bool,
 }
 
@@ -338,11 +351,16 @@ fn main() -> anyhow::Result<()> {
     }
 
     let lanes: Vec<Lane> = roster.into_iter().map(Lane::from_roster).collect();
+    let n = lanes.len();
     let app = App {
         lanes,
         selected: 0,
         fullscreen: false,
         last_body_h: 0,
+        lane_weights: vec![100; n],
+        lane_columns: Vec::with_capacity(n),
+        body_y_range: (0, 0),
+        dragging_divider: None,
         quit: false,
     };
     run_tui(app)
@@ -353,7 +371,7 @@ fn main() -> anyhow::Result<()> {
 fn run_tui(mut app: App) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -364,13 +382,16 @@ fn run_tui(mut app: App) -> anyhow::Result<()> {
         loop {
             terminal.draw(|f| draw(f, &mut app))?;
 
-            // Handle input with short timeout so file polling stays timely.
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    handle_key(&mut app, key);
-                    if app.quit {
-                        break;
+                match event::read()? {
+                    Event::Key(key) => {
+                        handle_key(&mut app, key);
+                        if app.quit {
+                            break;
+                        }
                     }
+                    Event::Mouse(ev) => handle_mouse(&mut app, ev),
+                    _ => {}
                 }
             }
 
@@ -385,8 +406,115 @@ fn run_tui(mut app: App) -> anyhow::Result<()> {
     })();
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     result
+}
+
+fn handle_mouse(app: &mut App, ev: MouseEvent) {
+    let (col, row) = (ev.column, ev.row);
+    let (body_top, body_bot) = app.body_y_range;
+    let in_body = row >= body_top && row < body_bot;
+
+    match ev.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !in_body {
+                return;
+            }
+            // Divider hit has priority — checked against internal boundaries only.
+            if let Some(div_idx) = divider_at(&app.lane_columns, col) {
+                app.dragging_divider = Some(div_idx);
+                return;
+            }
+            if let Some(lane_idx) = lane_at(&app.lane_columns, col) {
+                app.selected = lane_idx;
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.dragging_divider = None;
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(div_idx) = app.dragging_divider {
+                resize_divider(app, div_idx, col);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if !in_body {
+                return;
+            }
+            if let Some(idx) = lane_at(&app.lane_columns, col) {
+                if let Some(l) = app.lanes.get_mut(idx) {
+                    l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(3);
+                }
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if !in_body {
+                return;
+            }
+            if let Some(idx) = lane_at(&app.lane_columns, col) {
+                if let Some(l) = app.lanes.get_mut(idx) {
+                    l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(3);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Find the (absolute) lane index whose column range contains `col`.
+fn lane_at(lane_columns: &[(u16, u16, usize)], col: u16) -> Option<usize> {
+    lane_columns
+        .iter()
+        .find(|&&(start, end, _)| col >= start && col < end)
+        .map(|&(_, _, lane_idx)| lane_idx)
+}
+
+/// Find the divider sitting at `col` (within ±1 column tolerance).
+/// Returns the *visible-slot* index of the right-hand lane (for use
+/// with `resize_divider` which operates on lane_columns slots, not
+/// absolute lane indexes). Only internal dividers qualify — the
+/// leftmost edge is the window border, not a divider.
+fn divider_at(lane_columns: &[(u16, u16, usize)], col: u16) -> Option<usize> {
+    for (i, &(start, _, _)) in lane_columns.iter().enumerate().skip(1) {
+        if col + 1 >= start && col <= start + 1 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Resize: the divider between visible slots `div_idx-1` and `div_idx`
+/// was dragged to `target_col`. Rebalance those two lanes' weights so
+/// the new split is honored; other lanes keep their weights. Enforces
+/// a minimum visible width so a lane can't get crushed to zero.
+fn resize_divider(app: &mut App, div_idx: usize, target_col: u16) {
+    if div_idx == 0 || div_idx >= app.lane_columns.len() {
+        return;
+    }
+    let (left_start, _, left_lane) = app.lane_columns[div_idx - 1];
+    let (_, right_end, right_lane) = app.lane_columns[div_idx];
+    let total_w = right_end.saturating_sub(left_start);
+    if total_w == 0 {
+        return;
+    }
+    const MIN_LANE: u16 = 12;
+    let lo = left_start.saturating_add(MIN_LANE);
+    let hi = right_end.saturating_sub(MIN_LANE);
+    if hi <= lo {
+        return;
+    }
+    let divider = target_col.clamp(lo, hi);
+    let left_w = divider - left_start;
+
+    let combined = app.lane_weights[left_lane] + app.lane_weights[right_lane];
+    if combined == 0 {
+        return;
+    }
+    let new_left = ((left_w as u32 * combined as u32) / total_w as u32) as u16;
+    let new_left = new_left.max(1);
+    let new_right = combined.saturating_sub(new_left).max(1);
+    app.lane_weights[left_lane] = new_left;
+    app.lane_weights[right_lane] = new_right;
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -450,6 +578,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
         .split(area);
     draw_tab_strip(f, chunks[0], app);
+    app.body_y_range = (chunks[1].y, chunks[1].y.saturating_add(chunks[1].height));
     draw_body(f, chunks[1], app);
     draw_status(f, chunks[2], app);
 }
@@ -487,18 +616,27 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         (0..app.lanes.len()).collect()
     };
     if indexes.is_empty() {
+        app.lane_columns.clear();
         return;
     }
-    let n = indexes.len() as u32;
-    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Ratio(1, n)).collect();
+    // Use Fill(weight) so the user's drag-adjusted weights are honored
+    // proportionally without having to normalize to 100 on every drag.
+    let constraints: Vec<Constraint> = indexes
+        .iter()
+        .map(|&i| Constraint::Fill(app.lane_weights.get(i).copied().unwrap_or(100)))
+        .collect();
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
         .split(area);
     let mut max_body_h = 0u16;
+    app.lane_columns.clear();
     for (slot, &lane_idx) in indexes.iter().enumerate() {
+        let rect = cols[slot];
+        app.lane_columns
+            .push((rect.x, rect.x.saturating_add(rect.width), lane_idx));
         let is_selected = lane_idx == app.selected;
-        let body_h = draw_lane(f, cols[slot], &mut app.lanes[lane_idx], is_selected);
+        let body_h = draw_lane(f, rect, &mut app.lanes[lane_idx], is_selected);
         if is_selected {
             max_body_h = max_body_h.max(body_h);
         }
@@ -616,7 +754,7 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let n = app.lanes.len();
     let selected = app.lanes.get(app.selected).map(|l| l.bro.as_str()).unwrap_or("-");
     let mode = if app.fullscreen { "FULL" } else { "SPLIT" };
-    let help = "Tab cycle • f full • ↑↓/j/k scroll • PgUp/PgDn page • G live • g top • q quit";
+    let help = "click:lane • drag:resize • wheel:scroll • Tab • f full • G live • g top • q quit";
     let line = format!(" bro tail • {n} lanes • {mode}:{selected}   {help}");
     f.render_widget(
         Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
