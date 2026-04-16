@@ -54,19 +54,19 @@ impl Provider {
 
     pub fn models(&self) -> &'static [ModelInfo] {
         match self {
-            Provider::Claude => &CLAUDE_MODELS,
-            Provider::Codex => &CODEX_MODELS,
-            Provider::Copilot => &COPILOT_MODELS,
-            Provider::Vibe => &VIBE_MODELS,
-            Provider::Gemini => &GEMINI_MODELS,
+            Provider::Claude => CLAUDE_MODELS,
+            Provider::Codex => CODEX_MODELS,
+            Provider::Copilot => COPILOT_MODELS,
+            Provider::Vibe => VIBE_MODELS,
+            Provider::Gemini => GEMINI_MODELS,
         }
     }
 
     pub fn efforts(&self) -> &'static [EffortInfo] {
         match self {
-            Provider::Claude => &CLAUDE_EFFORTS,
-            Provider::Codex => &CODEX_EFFORTS,
-            Provider::Copilot => &COPILOT_EFFORTS,
+            Provider::Claude => CLAUDE_EFFORTS,
+            Provider::Codex => CODEX_EFFORTS,
+            Provider::Copilot => COPILOT_EFFORTS,
             _ => &[],
         }
     }

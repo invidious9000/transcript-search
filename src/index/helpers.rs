@@ -271,7 +271,7 @@ pub(super) fn load_codex_session_names(codex_root: Option<&PathBuf>) -> HashMap<
         Err(_) => return map,
     };
     let reader = BufReader::new(file);
-    for line in reader.lines().flatten() {
+    for line in reader.lines().map_while(Result::ok) {
         let v: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(_) => continue,

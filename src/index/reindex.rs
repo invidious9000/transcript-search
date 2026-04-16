@@ -296,6 +296,10 @@ pub(super) fn should_skip_file(
     }
 }
 
+// Many parameters, each already minimal (FieldHandles/account/writer/meta
+// + three &mut u64 counters). Grouping the counters into a struct would
+// obscure what's being mutated without adding type safety.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn index_directory_standalone(
     dir: &Path,
     account_name: &str,
@@ -360,7 +364,7 @@ pub(super) fn index_directory_standalone(
 
         meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
         *indexed_files += 1;
-        if *indexed_files % 500 == 0 {
+        if (*indexed_files).is_multiple_of(500) {
             tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
             writer.commit()?;
         }
@@ -368,6 +372,7 @@ pub(super) fn index_directory_standalone(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn index_history_standalone(
     history: &Path,
     account_name: &str,
@@ -457,7 +462,7 @@ pub(super) fn index_codex_directory_standalone(
 
         meta.insert(path_str, FileMeta { mtime, size: file_meta.len() });
         *indexed_files += 1;
-        if *indexed_files % 500 == 0 {
+        if (*indexed_files).is_multiple_of(500) {
             tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);
             writer.commit()?;
         }

@@ -997,11 +997,10 @@ impl Knowledge {
         let mut disabled = 0u32;
 
         for entry in &self.store.entries {
-            if entry.approval == Approval::AgentInferred || entry.approval == Approval::Imported {
-                if entry.status == Status::Active {
+            if (entry.approval == Approval::AgentInferred || entry.approval == Approval::Imported)
+                && entry.status == Status::Active {
                     unverified += 1;
                 }
-            }
             if Self::is_expired(entry) && entry.status == Status::Active {
                 expired += 1;
                 issues.push(format!("[{}] expired: {}", entry.id, entry.title));

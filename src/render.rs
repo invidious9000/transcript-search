@@ -268,12 +268,12 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
 }
 
 pub fn builtin_preamble(provider: &str) -> String {
-    let mut sections = Vec::new();
-
-    sections.push(knowledge_section());
-    sections.push(transcript_section());
-    sections.push(threads_section());
-    sections.push(orchestration_section());
+    let mut sections = vec![
+        knowledge_section(),
+        transcript_section(),
+        threads_section(),
+        orchestration_section(),
+    ];
 
     // Provider-specific notes
     match provider {

@@ -35,7 +35,7 @@ async fn main() -> anyhow::Result<()> {
 
     let port = std::env::var("BBOX_PORT")
         .or_else(|_| std::env::var("BRO_PORT"))
-        .unwrap_or_else(|_| "7263".into());
+        .unwrap_or_else(|_| "7264".into());
 
     // Parse filter flags
     let mut team_filter: Option<String> = None;

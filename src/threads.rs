@@ -669,8 +669,8 @@ impl Threads {
         }
         let months = [31, if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
                        31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for i in 0..(m as usize - 1).min(11) {
-            epoch_days += months[i] as i64;
+        for days in months.iter().take((m as usize - 1).min(11)) {
+            epoch_days += *days as i64;
         }
         epoch_days += d as i64 - 1;
 

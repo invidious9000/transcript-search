@@ -241,11 +241,11 @@ impl TranscriptIndex {
         };
 
         let mut output = Vec::new();
-        for i in start..end {
+        for (i, line) in (start..end).zip(&lines[start..end]) {
             let events = if is_codex {
-                parser::parse_codex_line(lines[i], &codex_sid)
+                parser::parse_codex_line(line, &codex_sid)
             } else {
-                parser::parse_transcript_line(lines[i])
+                parser::parse_transcript_line(line)
             };
             if events.is_empty() {
                 continue;
@@ -404,7 +404,7 @@ impl TranscriptIndex {
                         .unwrap_or_default();
                     format!("=== Subagent: {} ===", name)
                 } else {
-                    format!("=== Main transcript ===")
+                    "=== Main transcript ===".to_string()
                 };
                 file_labels.push((all_messages.len(), label));
             }
@@ -483,18 +483,15 @@ impl TranscriptIndex {
         // Assemble body with size cap (80KB) to avoid blowing MCP result limits
         const MAX_RESPONSE_BYTES: usize = 80_000;
         let mut body = String::new();
-        let mut included = 0usize;
-        for msg in &page {
-            let entry = format!("{}\n\n", msg);
+        for (included, msg) in page.iter().enumerate() {
+            let entry = format!("{msg}\n\n");
             if body.len() + entry.len() > MAX_RESPONSE_BYTES {
                 body.push_str(&format!(
-                    "[Response truncated at {} messages — narrow with role filter, smaller limit, or higher max_content_length]\n",
-                    included
+                    "[Response truncated at {included} messages — narrow with role filter, smaller limit, or higher max_content_length]\n"
                 ));
                 break;
             }
             body.push_str(&entry);
-            included += 1;
         }
 
         Ok(format!("{}\n\n{}", header, body.trim_end()))

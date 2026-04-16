@@ -212,6 +212,7 @@ pub fn apply_lens(prompt: &str, lens: Option<&str>, allow_recursion: bool) -> St
 }
 
 /// Spawn a provider CLI process and return a tracked Task.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_task(
     provider: Provider,
     args: Vec<String>,
@@ -325,39 +326,46 @@ pub fn spawn_task(
         tokio::spawn(async move {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
+            let mut last_emitted_snippet: Option<String> = None;
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Ok(evt) = serde_json::from_str::<Value>(&line) {
-                    let mut inner = task_ref.inner.lock();
-                    inner.events.push(evt.clone());
-                    let mut sink = EventSink {
-                        last_assistant_message: inner.last_assistant_message.clone(),
-                        usage: inner.usage.clone(),
-                        cost_usd: inner.cost_usd,
-                        num_turns: inner.num_turns,
-                        session_id: if inner.session_id != "pending" {
-                            Some(inner.session_id.clone())
-                        } else {
-                            None
-                        },
-                    };
-                    provider.parse_event(&evt, &mut sink);
-                    inner.last_assistant_message = sink.last_assistant_message;
-                    inner.usage = sink.usage;
-                    inner.cost_usd = sink.cost_usd;
-                    inner.num_turns = sink.num_turns;
-                    if let Some(sid) = sink.session_id {
-                        if inner.session_id == "pending" {
-                            inner.session_id = sid;
+                    let snippet_to_emit = {
+                        let mut inner = task_ref.inner.lock();
+                        inner.events.push(evt.clone());
+                        let mut sink = EventSink {
+                            last_assistant_message: inner.last_assistant_message.clone(),
+                            usage: inner.usage.clone(),
+                            cost_usd: inner.cost_usd,
+                            num_turns: inner.num_turns,
+                            session_id: if inner.session_id != "pending" {
+                                Some(inner.session_id.clone())
+                            } else {
+                                None
+                            },
+                        };
+                        provider.parse_event(&evt, &mut sink);
+                        inner.last_assistant_message = sink.last_assistant_message;
+                        inner.usage = sink.usage;
+                        inner.cost_usd = sink.cost_usd;
+                        inner.num_turns = sink.num_turns;
+                        if let Some(sid) = sink.session_id {
+                            if inner.session_id == "pending" {
+                                inner.session_id = sid;
+                            }
                         }
-                    }
+                        inner.last_assistant_message.as_ref().map(|msg| {
+                            if msg.len() > 80 { msg[..80].to_string() } else { msg.clone() }
+                        })
+                    };
 
-                    // Emit tail progress
-                    if let Some(ref msg) = inner.last_assistant_message {
-                        let snippet = if msg.len() > 80 { &msg[..80] } else { msg };
-                        let _ = tail_tx_clone.send(tail::TailEvent::TaskProgress {
-                            task_id: task_id_clone.clone(),
-                            activity: snippet.to_string(),
-                        });
+                    if let Some(snippet) = snippet_to_emit {
+                        if last_emitted_snippet.as_deref() != Some(snippet.as_str()) {
+                            let _ = tail_tx_clone.send(tail::TailEvent::TaskProgress {
+                                task_id: task_id_clone.clone(),
+                                activity: snippet.clone(),
+                            });
+                            last_emitted_snippet = Some(snippet);
+                        }
                     }
                 }
             }
@@ -563,7 +571,7 @@ pub fn now_ms() -> u64 {
 pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
     let end = completed_at.unwrap_or_else(now_ms);
     let ms = end.saturating_sub(started_at);
-    let s = (ms / 1000) as u64;
+    let s = ms / 1000 ;
     if s < 60 {
         format!("{s}s")
     } else {

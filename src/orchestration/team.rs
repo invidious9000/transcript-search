@@ -208,12 +208,11 @@ pub fn propagate_session_id(task_id: &str, session_id: &str, store_dir: &Path) {
     for mut team in load_all_teams(store_dir) {
         let mut dirty = false;
         for member in &mut team.members {
-            if member.task_history.contains(&task_id.to_string()) {
-                if member.session_id.as_deref().unwrap_or("pending") == "pending" {
+            if member.task_history.contains(&task_id.to_string())
+                && member.session_id.as_deref().unwrap_or("pending") == "pending" {
                     member.session_id = Some(session_id.to_string());
                     dirty = true;
                 }
-            }
         }
         if dirty {
             save_team(&team, store_dir);
@@ -268,8 +267,8 @@ fn list_json_files<T: serde::de::DeserializeOwned>(dir: &Path) -> Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::providers::Provider;
-    use crate::orchestration::brofile;
+    
+    
 
     fn temp_store() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()

@@ -6,6 +6,11 @@ use super::providers::Provider;
 // Tail events — broadcast to SSE subscribers
 // ---------------------------------------------------------------------------
 
+// Variants intentionally share the `Task` prefix: the serde tag field is
+// `type` with snake_case values ("task_started", "task_completed", …)
+// which is what SSE consumers match on. Dropping the prefix would change
+// the wire format.
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TailEvent {
