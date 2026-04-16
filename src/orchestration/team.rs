@@ -1,0 +1,404 @@
+use std::fs;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+
+/// Global mutex for team file read-modify-write operations.
+/// Prevents concurrent updates from clobbering each other.
+static TEAM_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+// ---------------------------------------------------------------------------
+// Teamplate (blueprint)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamplateMember {
+    pub brofile: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default = "default_one")]
+    pub count: u32,
+}
+
+fn default_one() -> u32 { 1 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Teamplate {
+    pub name: String,
+    pub members: Vec<TeamplateMember>,
+}
+
+// ---------------------------------------------------------------------------
+// Team (live instance)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamMember {
+    pub name: String,
+    pub brofile: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub task_history: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Team {
+    pub name: String,
+    pub teamplate: String,
+    pub members: Vec<TeamMember>,
+    pub project_dir: Option<String>,
+    pub created_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Teamplate disk ops
+// ---------------------------------------------------------------------------
+
+fn teamplates_dir(store_dir: &Path) -> PathBuf {
+    store_dir.join("teamplates")
+}
+
+fn project_teamplates_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".bro").join("teamplates")
+}
+
+pub fn save_teamplate(tp: &Teamplate, scope: &str, store_dir: &Path, project_dir: Option<&str>) {
+    let dir = if scope == "project" {
+        project_teamplates_dir(Path::new(project_dir.unwrap_or(".")))
+    } else {
+        teamplates_dir(store_dir)
+    };
+    atomic_write_json(&dir, &tp.name, tp);
+}
+
+pub fn resolve_teamplate(name: &str, store_dir: &Path, project_dir: Option<&str>) -> Option<Teamplate> {
+    if let Some(pd) = project_dir {
+        if let Some(tp) = load_json(&project_teamplates_dir(Path::new(pd)), name) {
+            return Some(tp);
+        }
+    }
+    load_json(&teamplates_dir(store_dir), name)
+}
+
+pub fn list_teamplates(scope: &str, store_dir: &Path, project_dir: Option<&str>) -> Vec<Teamplate> {
+    let dir = if scope == "project" {
+        project_teamplates_dir(Path::new(project_dir.unwrap_or(".")))
+    } else {
+        teamplates_dir(store_dir)
+    };
+    list_json_files(&dir)
+}
+
+pub fn delete_teamplate(name: &str, scope: &str, store_dir: &Path, project_dir: Option<&str>) -> bool {
+    let dir = if scope == "project" {
+        project_teamplates_dir(Path::new(project_dir.unwrap_or(".")))
+    } else {
+        teamplates_dir(store_dir)
+    };
+    fs::remove_file(dir.join(format!("{name}.json"))).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Team disk ops
+// ---------------------------------------------------------------------------
+
+fn teams_dir(store_dir: &Path) -> PathBuf {
+    store_dir.join("teams")
+}
+
+pub fn save_team(team: &Team, store_dir: &Path) {
+    atomic_write_json(&teams_dir(store_dir), &team.name, team);
+}
+
+/// Acquire the team file lock for read-modify-write operations.
+pub fn lock_teams() -> std::sync::MutexGuard<'static, ()> {
+    TEAM_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn load_team(name: &str, store_dir: &Path) -> Option<Team> {
+    load_json(&teams_dir(store_dir), name)
+}
+
+pub fn load_all_teams(store_dir: &Path) -> Vec<Team> {
+    list_json_files(&teams_dir(store_dir))
+}
+
+pub fn remove_team(name: &str, store_dir: &Path) -> bool {
+    fs::remove_file(teams_dir(store_dir).join(format!("{name}.json"))).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Instantiation
+// ---------------------------------------------------------------------------
+
+pub fn instantiate_team(
+    tp: &Teamplate,
+    team_name: &str,
+    project_dir: Option<&str>,
+    store_dir: &Path,
+) -> Team {
+    let mut members = Vec::new();
+    for slot in &tp.members {
+        let count = slot.count.max(1);
+        for i in 0..count {
+            let name = if let Some(ref alias) = slot.alias {
+                if count > 1 { format!("{alias}-{}", i + 1) } else { alias.clone() }
+            } else if count > 1 {
+                format!("{}-{}", slot.brofile, i + 1)
+            } else {
+                slot.brofile.clone()
+            };
+            members.push(TeamMember {
+                name,
+                brofile: slot.brofile.clone(),
+                session_id: None,
+                task_history: vec![],
+            });
+        }
+    }
+
+    let team = Team {
+        name: team_name.to_string(),
+        teamplate: tp.name.clone(),
+        members,
+        project_dir: project_dir.map(String::from),
+        created_at: super::now_ms(),
+    };
+    save_team(&team, store_dir);
+    team
+}
+
+// ---------------------------------------------------------------------------
+// Bro resolution — find a named bro across all teams
+// ---------------------------------------------------------------------------
+
+pub struct BroMatch<'a> {
+    pub team: &'a Team,
+    pub member_idx: usize,
+}
+
+pub fn find_bro<'a>(name: &str, teams: &'a [Team]) -> Option<BroMatch<'a>> {
+    for team in teams {
+        for (i, member) in team.members.iter().enumerate() {
+            if member.name == name {
+                return Some(BroMatch { team, member_idx: i });
+            }
+        }
+    }
+    None
+}
+
+pub fn find_bro_name_for_task(task_id: &str, store_dir: &Path) -> Option<String> {
+    for team in load_all_teams(store_dir) {
+        for member in &team.members {
+            if member.task_history.contains(&task_id.to_string()) {
+                return Some(member.name.clone());
+            }
+        }
+    }
+    None
+}
+
+/// After a task completes and discovers its sessionId, propagate it back to the team member.
+pub fn propagate_session_id(task_id: &str, session_id: &str, store_dir: &Path) {
+    let _lock = lock_teams();
+    for mut team in load_all_teams(store_dir) {
+        let mut dirty = false;
+        for member in &mut team.members {
+            if member.task_history.contains(&task_id.to_string()) {
+                if member.session_id.as_deref().unwrap_or("pending") == "pending" {
+                    member.session_id = Some(session_id.to_string());
+                    dirty = true;
+                }
+            }
+        }
+        if dirty {
+            save_team(&team, store_dir);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic JSON file helpers
+// ---------------------------------------------------------------------------
+
+fn atomic_write_json<T: Serialize>(dir: &Path, name: &str, value: &T) {
+    let _ = fs::create_dir_all(dir);
+    let file = dir.join(format!("{name}.json"));
+    let tmp = dir.join(format!("{name}.json.tmp"));
+    if let Ok(data) = serde_json::to_string_pretty(value) {
+        if let Ok(mut f) = fs::File::create(&tmp) {
+            let _ = f.write_all(data.as_bytes());
+            let _ = f.sync_all();
+            let _ = fs::rename(&tmp, &file);
+        }
+    }
+}
+
+fn load_json<T: serde::de::DeserializeOwned>(dir: &Path, name: &str) -> Option<T> {
+    let file = dir.join(format!("{name}.json"));
+    let data = fs::read_to_string(&file).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn list_json_files<T: serde::de::DeserializeOwned>(dir: &Path) -> Vec<T> {
+    let mut results = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Ok(data) = fs::read_to_string(&path) {
+                    if let Ok(item) = serde_json::from_str::<T>(&data) {
+                        results.push(item);
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::providers::Provider;
+    use crate::orchestration::brofile;
+
+    fn temp_store() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn test_save_and_load_teamplate() {
+        let dir = temp_store();
+        let tp = Teamplate {
+            name: "review-panel".into(),
+            members: vec![
+                TeamplateMember { brofile: "reviewer".into(), alias: None, count: 1 },
+                TeamplateMember { brofile: "critic".into(), alias: Some("devil".into()), count: 1 },
+            ],
+        };
+        save_teamplate(&tp, "global", dir.path(), None);
+        let loaded = resolve_teamplate("review-panel", dir.path(), None);
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.members.len(), 2);
+        assert_eq!(loaded.members[1].alias.as_deref(), Some("devil"));
+    }
+
+    #[test]
+    fn test_instantiate_team() {
+        let dir = temp_store();
+        let tp = Teamplate {
+            name: "test-tp".into(),
+            members: vec![
+                TeamplateMember { brofile: "worker".into(), alias: None, count: 2 },
+                TeamplateMember { brofile: "lead".into(), alias: Some("boss".into()), count: 1 },
+            ],
+        };
+
+        let team = instantiate_team(&tp, "test-team", Some("/tmp/proj"), dir.path());
+        assert_eq!(team.name, "test-team");
+        assert_eq!(team.members.len(), 3);
+        assert_eq!(team.members[0].name, "worker-1");
+        assert_eq!(team.members[1].name, "worker-2");
+        assert_eq!(team.members[2].name, "boss");
+        assert_eq!(team.project_dir.as_deref(), Some("/tmp/proj"));
+
+        // Should be persisted
+        let loaded = load_team("test-team", dir.path());
+        assert!(loaded.is_some());
+    }
+
+    #[test]
+    fn test_find_bro() {
+        let teams = vec![Team {
+            name: "t1".into(),
+            teamplate: "tp1".into(),
+            members: vec![
+                TeamMember { name: "alice".into(), brofile: "reviewer".into(), session_id: None, task_history: vec![] },
+                TeamMember { name: "bob".into(), brofile: "critic".into(), session_id: None, task_history: vec![] },
+            ],
+            project_dir: None,
+            created_at: 0,
+        }];
+
+        let found = find_bro("alice", &teams);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().member_idx, 0);
+
+        let found = find_bro("bob", &teams);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().member_idx, 1);
+
+        assert!(find_bro("charlie", &teams).is_none());
+    }
+
+    #[test]
+    fn test_find_bro_name_for_task() {
+        let dir = temp_store();
+        let team = Team {
+            name: "t1".into(),
+            teamplate: "tp1".into(),
+            members: vec![
+                TeamMember {
+                    name: "alice".into(),
+                    brofile: "reviewer".into(),
+                    session_id: None,
+                    task_history: vec!["task-123".into()],
+                },
+            ],
+            project_dir: None,
+            created_at: 0,
+        };
+        save_team(&team, dir.path());
+
+        assert_eq!(find_bro_name_for_task("task-123", dir.path()), Some("alice".into()));
+        assert_eq!(find_bro_name_for_task("task-999", dir.path()), None);
+    }
+
+    #[test]
+    fn test_propagate_session_id() {
+        let dir = temp_store();
+        let team = Team {
+            name: "t1".into(),
+            teamplate: "tp1".into(),
+            members: vec![
+                TeamMember {
+                    name: "alice".into(),
+                    brofile: "reviewer".into(),
+                    session_id: Some("pending".into()),
+                    task_history: vec!["task-abc".into()],
+                },
+            ],
+            project_dir: None,
+            created_at: 0,
+        };
+        save_team(&team, dir.path());
+
+        propagate_session_id("task-abc", "real-session-id", dir.path());
+
+        let loaded = load_team("t1", dir.path()).unwrap();
+        assert_eq!(loaded.members[0].session_id.as_deref(), Some("real-session-id"));
+    }
+
+    #[test]
+    fn test_dissolve_team() {
+        let dir = temp_store();
+        let tp = Teamplate {
+            name: "tp".into(),
+            members: vec![TeamplateMember { brofile: "w".into(), alias: None, count: 1 }],
+        };
+        let _team = instantiate_team(&tp, "to-dissolve", None, dir.path());
+        assert!(load_team("to-dissolve", dir.path()).is_some());
+        assert!(remove_team("to-dissolve", dir.path()));
+        assert!(load_team("to-dissolve", dir.path()).is_none());
+    }
+}

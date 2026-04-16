@@ -41,6 +41,70 @@ impl ThreadStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeKind {
+    SpawnedFrom,  // this thread was opened from another
+    BlockedBy,    // this thread is blocked until target resolves
+    RelatesTo,    // general relationship
+    Subsumes,     // this thread absorbs/replaces target
+}
+
+impl EdgeKind {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "spawned_from" => Some(Self::SpawnedFrom),
+            "blocked_by" => Some(Self::BlockedBy),
+            "relates_to" => Some(Self::RelatesTo),
+            "subsumes" => Some(Self::Subsumes),
+            _ => None,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::SpawnedFrom => "spawned_from",
+            Self::BlockedBy => "blocked_by",
+            Self::RelatesTo => "relates_to",
+            Self::Subsumes => "subsumes",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeTarget {
+    Thread,
+    Session,
+}
+
+impl EdgeTarget {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "thread" => Some(Self::Thread),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadEdge {
+    pub kind: EdgeKind,
+    pub target: String, // thread ID or session ID
+    #[serde(default = "EdgeTarget::default")]
+    pub target_type: EdgeTarget,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: String,
+}
+
+impl EdgeTarget {
+    fn default() -> Self {
+        Self::Thread
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionLink {
     pub session_id: String,
@@ -63,6 +127,8 @@ pub struct Thread {
     pub handoff_doc: Option<String>,
     #[serde(default)]
     pub notes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edges: Vec<ThreadEdge>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub promoted_to: Option<String>, // graph entity ref when promoted
     pub created_at: String,
@@ -144,12 +210,14 @@ impl Threads {
             .context("'action' is required (open, continue, resolve, promote)")?;
 
         match action {
+            "get" => self.thread_get(args),
             "open" => self.thread_open(args),
             "continue" => self.thread_continue(args),
+            "link" => self.thread_link(args),
             "resolve" => self.thread_resolve(args),
             "promote" => self.thread_promote(args),
             "rename" => self.thread_rename(args),
-            _ => anyhow::bail!("Unknown action: {}. Use: open, continue, resolve, promote, rename", action),
+            _ => anyhow::bail!("Unknown action: {}. Use: get, open, continue, link, resolve, promote, rename", action),
         }
     }
 
@@ -190,6 +258,7 @@ impl Threads {
             sessions,
             handoff_doc,
             notes,
+            edges: Vec::new(),
             promoted_to: None,
             created_at: now.clone(),
             last_activity: now,
@@ -202,10 +271,171 @@ impl Threads {
         Ok(format!("Thread created: {} — \"{}\"", id, topic))
     }
 
-    fn thread_continue(&mut self, args: &Value) -> Result<String> {
-        let id = args["id"]
+    fn thread_get(&self, args: &Value) -> Result<String> {
+        let id = args["id"].as_str();
+        let name = args["name"].as_str();
+
+        let thread = if let Some(id) = id {
+            self.store.threads.iter().find(|t| t.id == id)
+        } else if let Some(name) = name {
+            let name_lower = name.to_lowercase();
+            self.store.threads.iter().find(|t| {
+                t.name.as_ref().map(|n| n.to_lowercase() == name_lower).unwrap_or(false)
+                    || t.id == name
+            })
+        } else {
+            anyhow::bail!("'id' or 'name' is required for get");
+        };
+
+        let thread = thread.context("Thread not found")?;
+
+        // Build a readable representation
+        let mut out = String::new();
+        out.push_str(&format!("# {} — {}\n", thread.id, thread.topic));
+        if let Some(name) = &thread.name {
+            out.push_str(&format!("Name: {}\n", name));
+        }
+        out.push_str(&format!("Status: {}\n", thread.status.as_str()));
+        out.push_str(&format!("Project: {}\n", if thread.project.is_empty() { "-" } else { &thread.project }));
+        out.push_str(&format!("Created: {}\n", thread.created_at));
+        out.push_str(&format!("Last activity: {}\n", thread.last_activity));
+        if let Some(resolved) = &thread.resolved_at {
+            out.push_str(&format!("Resolved: {}\n", resolved));
+        }
+        if let Some(doc) = &thread.handoff_doc {
+            out.push_str(&format!("Handoff doc: {}\n", doc));
+        }
+        if let Some(promoted) = &thread.promoted_to {
+            out.push_str(&format!("Promoted to: {}\n", promoted));
+        }
+
+        // Sessions
+        if thread.sessions.is_empty() {
+            out.push_str("\nSessions: none\n");
+        } else {
+            out.push_str(&format!("\nSessions ({}):\n", thread.sessions.len()));
+            for s in &thread.sessions {
+                let display = s.name.as_deref().unwrap_or(&s.session_id);
+                out.push_str(&format!("  - {} ({}) linked {}\n", display, s.provider, s.linked_at));
+            }
+        }
+
+        // Edges
+        if !thread.edges.is_empty() {
+            out.push_str(&format!("\nEdges ({}):\n", thread.edges.len()));
+            for e in &thread.edges {
+                let target_label = match e.target_type {
+                    EdgeTarget::Thread => {
+                        let name = self.store.threads.iter()
+                            .find(|t| t.id == e.target)
+                            .and_then(|t| t.name.as_deref())
+                            .unwrap_or("?");
+                        format!("{} ({})", e.target, name)
+                    }
+                    EdgeTarget::Session => {
+                        // Check if this session is linked on any thread for a friendly name
+                        let name = self.store.threads.iter()
+                            .flat_map(|t| t.sessions.iter())
+                            .find(|s| s.session_id == e.target)
+                            .and_then(|s| s.name.as_deref());
+                        match name {
+                            Some(n) => format!("session:{} ({})", &e.target[..e.target.len().min(8)], n),
+                            None => format!("session:{}", &e.target[..e.target.len().min(8)]),
+                        }
+                    }
+                };
+                out.push_str(&format!("  - {} → {}", e.kind.as_str(), target_label));
+                if let Some(note) = &e.note {
+                    out.push_str(&format!(" — {}", note));
+                }
+                out.push('\n');
+            }
+        }
+
+        // Notes
+        if thread.notes.is_empty() {
+            out.push_str("\nNotes: none\n");
+        } else {
+            out.push_str(&format!("\nNotes ({}):\n", thread.notes.len()));
+            for (i, note) in thread.notes.iter().enumerate() {
+                out.push_str(&format!("\n--- Note {} ---\n{}\n", i + 1, note));
+            }
+        }
+
+        Ok(out)
+    }
+
+    fn thread_link(&mut self, args: &Value) -> Result<String> {
+        let id = self.resolve_thread_id(args)?;
+        let target = args["target"]
             .as_str()
-            .context("'id' is required")?;
+            .context("'target' is required (target thread or session ID)")?;
+        let kind_str = args["edge"]
+            .as_str()
+            .context("'edge' is required (spawned_from, blocked_by, relates_to, subsumes)")?;
+        let kind = EdgeKind::from_str(kind_str)
+            .with_context(|| format!("Unknown edge kind: {}. Use: spawned_from, blocked_by, relates_to, subsumes", kind_str))?;
+        let note = args["note"].as_str().map(String::from);
+
+        let target_type_str = args["target_type"].as_str().unwrap_or("thread");
+        let target_type = EdgeTarget::from_str(target_type_str)
+            .with_context(|| format!("Unknown target_type: {}. Use: thread, session", target_type_str))?;
+
+        // Validate target exists (threads only — sessions are external, trust the caller)
+        if target_type == EdgeTarget::Thread {
+            if !self.store.threads.iter().any(|t| t.id == target) {
+                anyhow::bail!("Target thread {} not found", target);
+            }
+        }
+
+        let thread = self.store.threads.iter_mut()
+            .find(|t| t.id == id)
+            .context("Source thread not found")?;
+
+        // Check for duplicate edge
+        if thread.edges.iter().any(|e| e.kind == kind && e.target == target && e.target_type == target_type) {
+            anyhow::bail!("Edge {} → {} already exists", kind_str, target);
+        }
+
+        let now = Self::now_iso();
+        thread.edges.push(ThreadEdge {
+            kind,
+            target: target.to_string(),
+            target_type,
+            note,
+            created_at: now.clone(),
+        });
+        thread.last_activity = now;
+
+        let topic = thread.topic.clone();
+        self.save()?;
+
+        Ok(format!("Thread {} ({}) — added {} edge to {}", id, topic, kind_str, target))
+    }
+
+    /// Resolve a thread by `id` or `name` field in args.
+    fn resolve_thread_id(&self, args: &Value) -> Result<String> {
+        if let Some(id) = args["id"].as_str() {
+            if self.store.threads.iter().any(|t| t.id == id) {
+                return Ok(id.to_string());
+            }
+            anyhow::bail!("Thread not found: {id}");
+        }
+        if let Some(name) = args["name"].as_str() {
+            let name_lower = name.to_lowercase();
+            if let Some(t) = self.store.threads.iter().find(|t| {
+                t.name.as_ref().map(|n| n.to_lowercase() == name_lower).unwrap_or(false)
+                    || t.id == name
+            }) {
+                return Ok(t.id.clone());
+            }
+            anyhow::bail!("Thread not found: {name}");
+        }
+        anyhow::bail!("'id' or 'name' is required");
+    }
+
+    fn thread_continue(&mut self, args: &Value) -> Result<String> {
+        let id = self.resolve_thread_id(args)?;
 
         let thread = self.store.threads.iter_mut()
             .find(|t| t.id == id)
@@ -248,9 +478,7 @@ impl Threads {
     }
 
     fn thread_resolve(&mut self, args: &Value) -> Result<String> {
-        let id = args["id"]
-            .as_str()
-            .context("'id' is required")?;
+        let id = self.resolve_thread_id(args)?;
 
         let thread = self.store.threads.iter_mut()
             .find(|t| t.id == id)
@@ -273,9 +501,7 @@ impl Threads {
     }
 
     fn thread_promote(&mut self, args: &Value) -> Result<String> {
-        let id = args["id"]
-            .as_str()
-            .context("'id' is required")?;
+        let id = self.resolve_thread_id(args)?;
         let promoted_to = args["promoted_to"]
             .as_str()
             .context("'promoted_to' is required (graph entity reference)")?;
@@ -305,15 +531,17 @@ impl Threads {
     }
 
     fn thread_rename(&mut self, args: &Value) -> Result<String> {
+        // For rename, 'id' is lookup and 'name' is the new name.
         let id = args["id"]
             .as_str()
-            .context("'id' is required")?;
+            .context("'id' is required for rename")?;
         let new_name = args["name"]
             .as_str()
             .context("'name' is required for rename")?;
 
+        // Try to find by id directly, then fall back to id-as-name lookup
         let thread = self.store.threads.iter_mut()
-            .find(|t| t.id == id)
+            .find(|t| t.id == id || t.name.as_deref().map(|n| n.to_lowercase()) == Some(id.to_lowercase()))
             .context("Thread not found")?;
 
         thread.name = Some(new_name.to_string());
@@ -421,14 +649,43 @@ impl Threads {
 
             let display_name = t.name.as_deref().unwrap_or("-");
 
+            let edges_str = if t.edges.is_empty() {
+                String::new()
+            } else {
+                let edge_parts: Vec<String> = t.edges.iter().map(|e| {
+                    let label = match e.target_type {
+                        EdgeTarget::Thread => {
+                            self.store.threads.iter()
+                                .find(|t2| t2.id == e.target)
+                                .and_then(|t2| t2.name.as_deref())
+                                .unwrap_or("?")
+                                .to_string()
+                        }
+                        EdgeTarget::Session => {
+                            let name = self.store.threads.iter()
+                                .flat_map(|t2| t2.sessions.iter())
+                                .find(|s| s.session_id == e.target)
+                                .and_then(|s| s.name.as_deref());
+                            match name {
+                                Some(n) => format!("session:{}", n),
+                                None => format!("session:{}", &e.target[..e.target.len().min(8)]),
+                            }
+                        }
+                    };
+                    format!("{}→{}", e.kind.as_str(), label)
+                }).collect();
+                format!(" [{}]", edge_parts.join(", "))
+            };
+
             lines.push(format!(
-                "{} | {} | {} | {} | {} | {} | {} | {}",
+                "{} | {} | {} | {} | {} | {}{} | {} | {}",
                 t.id,
                 display_name,
                 t.status.as_str(),
                 age_str,
                 project,
                 t.topic,
+                edges_str,
                 sessions_str,
                 handoff,
             ));

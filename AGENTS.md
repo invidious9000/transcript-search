@@ -60,20 +60,24 @@ Configuration:
 - Always use `resume` (not `exec`) for multi-turn conversations — `exec` starts fresh with no memory
 - Named bro targeting resolves provider, account, lens, and sessionId automatically
 
-## Standing Orders
+**Codex-specific:** Roles map as: `user` → human input, `assistant` → model output, `developer` → system context, `tool_use`/`tool_result` → function calls.
 
-<!-- bb:entry=e2849e5f -->
-**Claude multi-account setup**
+## Critical Instructions
 
-This user runs multiple Claude accounts (`~/.claude`, `~/.claude-account2`, `~/.claude-account3`). Shared state lives in `~/.claude-shared/` and is symlinked into each account directory. Per-project memory is shared via symlinks from each account's `projects/` dir to `~/.claude-shared/project-memory/`.
+<!-- bb:entry=ae114ca6 -->
+**RTK prefix-based usage**
 
-<!-- /bb:entry=e2849e5f -->
-<!-- bb:entry=f8cd9d45 -->
-**RTK hook-based usage**
+Always prefix shell commands with `rtk`. RTK is a token-optimized CLI proxy (60-90% savings). If RTK has a dedicated filter, it uses it. If not, it passes through unchanged — always safe to use.
 
-All shell commands are automatically rewritten by the RTK hook. Example: `git status` → `rtk git status` (transparent, 0 tokens overhead). Use `rtk gain` for savings analytics, `rtk proxy <cmd>` to bypass filtering.
+```bash
+rtk git status
+rtk cargo test
+rtk npm run build
+```
 
-<!-- /bb:entry=f8cd9d45 -->
+Meta commands: `rtk gain` (savings analytics), `rtk gain --history` (usage history), `rtk proxy <cmd>` (bypass filtering).
+
+<!-- /bb:entry=ae114ca6 -->
 
 ## User Profile
 

@@ -1,0 +1,74 @@
+use serde::Serialize;
+
+use super::providers::Provider;
+
+// ---------------------------------------------------------------------------
+// Tail events — broadcast to SSE subscribers
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TailEvent {
+    TaskStarted {
+        task_id: String,
+        provider: Provider,
+        bro_name: Option<String>,
+    },
+    TaskProgress {
+        task_id: String,
+        activity: String,
+    },
+    TaskCompleted {
+        task_id: String,
+        elapsed: String,
+        cost: Option<f64>,
+    },
+    TaskFailed {
+        task_id: String,
+        elapsed: String,
+        error: String,
+    },
+    TaskCancelled {
+        task_id: String,
+        elapsed: String,
+    },
+}
+
+impl TailEvent {
+    pub fn task_id(&self) -> &str {
+        match self {
+            TailEvent::TaskStarted { task_id, .. }
+            | TailEvent::TaskProgress { task_id, .. }
+            | TailEvent::TaskCompleted { task_id, .. }
+            | TailEvent::TaskFailed { task_id, .. }
+            | TailEvent::TaskCancelled { task_id, .. } => task_id,
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tail_event_task_id() {
+        let evt = TailEvent::TaskProgress {
+            task_id: "my-task".into(),
+            activity: "working".into(),
+        };
+        assert_eq!(evt.task_id(), "my-task");
+    }
+
+    #[test]
+    fn test_tail_event_serialization() {
+        let evt = TailEvent::TaskFailed {
+            task_id: "t2".into(),
+            elapsed: "5s".into(),
+            error: "spawn error".into(),
+        };
+        let json = serde_json::to_string(&evt).unwrap();
+        assert!(json.contains("\"type\":\"task_failed\""));
+        assert!(json.contains("spawn error"));
+    }
+}

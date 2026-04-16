@@ -1,19 +1,69 @@
 [package]
-name = "transcript-search"
-version = "0.1.0"
+name = "blackbox"
+version = "0.2.0"
 edition = "2021"
 
+[[bin]]
+name = "blackboxd"
+path = "src/main.rs"
+
+[[bin]]
+name = "bro"
+path = "src/cli.rs"
+
 [dependencies]
+# Search index
 tantivy = "0.22"
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = "0.8"
+
+# Filesystem
 walkdir = "2"
 dirs = "6"
+
+# Error handling
 anyhow = "1"
+
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+
+# Time
 chrono = "0.4"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# MCP SDK
+rmcp = { version = "1.4", features = ["server", "macros", "transport-streamable-http-server"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# HTTP server (for /tail endpoint outside MCP)
+axum = "0.8"
+
+# IDs
+uuid = { version = "1", features = ["v4"] }
+
+# CLI HTTP client
+reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
+futures-util = "0.3"
+futures = "0.3"
+
+# Terminal
+crossterm = "0.28"
+
+# SSE stream construction
+async-stream = "0.3"
+
+# Process management (SIGTERM)
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
