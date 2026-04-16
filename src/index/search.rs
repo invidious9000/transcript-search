@@ -424,7 +424,7 @@ impl TranscriptIndex {
                 };
                 for ev in &events {
                     if let Some(rf) = role_filter {
-                        if ev.role != rf {
+                        if ev.role.as_ref() != rf {
                             continue;
                         }
                     }
@@ -677,10 +677,10 @@ impl TranscriptIndex {
                 };
                 for ev in &events {
                     if let Some(rf) = role_filter {
-                        if ev.role != rf { continue; }
+                        if ev.role.as_ref() != rf { continue; }
                     }
                     // Skip tool_result — too noisy for topic extraction
-                    if ev.role == "tool_result" { continue; }
+                    if ev.role == crate::parser::MessageRole::ToolResult { continue; }
                     all_content.push(' ');
                     all_content.push_str(&ev.content);
                 }

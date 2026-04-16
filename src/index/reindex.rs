@@ -269,7 +269,7 @@ pub(super) fn event_to_doc_standalone(
     doc.add_text(f.session_id, &event.session_id);
     doc.add_text(f.account, account);
     doc.add_text(f.project, event.cwd.as_deref().unwrap_or(""));
-    doc.add_text(f.role, &event.role);
+    doc.add_text(f.role, event.role.as_ref());
     doc.add_text(f.file_path, file_path);
     doc.add_u64(f.byte_offset, byte_offset);
     doc.add_u64(f.is_subagent, if event.is_subagent || is_subagent { 1 } else { 0 });
@@ -346,7 +346,7 @@ pub(super) fn index_directory_standalone(
                 doc.add_text(f.session_id, &event.session_id);
                 doc.add_text(f.account, account_name);
                 doc.add_text(f.project, proj);
-                doc.add_text(f.role, &event.role);
+                doc.add_text(f.role, event.role.as_ref());
                 doc.add_text(f.file_path, &path_str);
                 doc.add_u64(f.byte_offset, line_offset);
                 doc.add_u64(f.is_subagent, if is_sub { 1 } else { 0 });

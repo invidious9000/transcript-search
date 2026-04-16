@@ -1,8 +1,32 @@
 use serde_json::Value;
 
+/// The role associated with a single transcript event. All provider
+/// formats (Claude Code, Codex CLI, history.jsonl) normalize into this
+/// fixed set; parsers that encounter a role outside this set return no
+/// event rather than inventing one.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash,
+    strum::EnumString, strum::AsRefStr, strum::Display,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum MessageRole {
+    /// Human-typed input.
+    User,
+    /// Model output.
+    Assistant,
+    /// Model reasoning / thinking blocks.
+    Thinking,
+    /// Tool invocation by the model.
+    ToolUse,
+    /// Tool output returned to the model.
+    ToolResult,
+    /// System / developer context (Codex-specific).
+    Developer,
+}
+
 /// A single searchable unit extracted from a JSONL transcript event.
 pub struct ParsedEvent {
-    pub role: String,
+    pub role: MessageRole,
     pub content: String,
     pub session_id: String,
     pub timestamp: Option<String>,
@@ -72,7 +96,7 @@ pub fn parse_history_line(line: &str) -> Vec<ParsedEvent> {
     });
 
     vec![ParsedEvent {
-        role: "user".to_string(),
+        role: MessageRole::User,
         content: truncate(display),
         session_id,
         timestamp,
@@ -96,7 +120,7 @@ fn parse_user_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent> {
     match &message["content"] {
         // String content = human-typed message
         Value::String(s) if !s.is_empty() => {
-            vec![make_event("user", &truncate(s), base)]
+            vec![make_event(MessageRole::User, &truncate(s), base)]
         }
         // Array content = tool results (sent as user role in Claude API)
         Value::Array(blocks) => {
@@ -106,7 +130,7 @@ fn parse_user_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent> {
                     Some("text") => {
                         if let Some(text) = block["text"].as_str() {
                             if !text.is_empty() {
-                                events.push(make_event("user", &truncate(text), base));
+                                events.push(make_event(MessageRole::User, &truncate(text), base));
                             }
                         }
                     }
@@ -117,7 +141,7 @@ fn parse_user_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent> {
                                     .as_str()
                                     .unwrap_or("?");
                                 let content = format!("result:{} {}", tool_id, truncate(&text));
-                                events.push(make_event("tool_result", &content, base));
+                                events.push(make_event(MessageRole::ToolResult, &content, base));
                             }
                         }
                     }
@@ -147,14 +171,14 @@ fn parse_assistant_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent
             "text" => {
                 if let Some(text) = block["text"].as_str() {
                     if !text.is_empty() {
-                        events.push(make_event("assistant", &truncate(text), base));
+                        events.push(make_event(MessageRole::Assistant, &truncate(text), base));
                     }
                 }
             }
             "thinking" => {
                 if let Some(thinking) = block["thinking"].as_str() {
                     if !thinking.is_empty() {
-                        events.push(make_event("thinking", &truncate(thinking), base));
+                        events.push(make_event(MessageRole::Thinking, &truncate(thinking), base));
                     }
                 }
             }
@@ -162,7 +186,7 @@ fn parse_assistant_message(message: &Value, base: &EventBase) -> Vec<ParsedEvent
                 let tool_name = block["name"].as_str().unwrap_or("unknown");
                 let input_str = serde_json::to_string(&block["input"]).unwrap_or_default();
                 let content = format!("tool:{} {}", tool_name, truncate(&input_str));
-                events.push(make_event("tool_use", &content, base));
+                events.push(make_event(MessageRole::ToolUse, &content, base));
             }
             _ => {}
         }
@@ -221,7 +245,7 @@ pub fn parse_codex_line(line: &str, session_id: &str) -> Vec<ParsedEvent> {
                 agent_slug: None,
                 cwd,
             };
-            vec![make_event("developer", &truncate(base_instructions), &base)]
+            vec![make_event(MessageRole::Developer, &truncate(base_instructions), &base)]
         }
         "response_item" => {
             let payload = &v["payload"];
@@ -238,9 +262,9 @@ pub fn parse_codex_line(line: &str, session_id: &str) -> Vec<ParsedEvent> {
             };
 
             match role {
-                "user" => parse_codex_content_blocks(payload, "user", &base),
-                "assistant" => parse_codex_content_blocks(payload, "assistant", &base),
-                "developer" => parse_codex_content_blocks(payload, "developer", &base),
+                "user" => parse_codex_content_blocks(payload, MessageRole::User, &base),
+                "assistant" => parse_codex_content_blocks(payload, MessageRole::Assistant, &base),
+                "developer" => parse_codex_content_blocks(payload, MessageRole::Developer, &base),
                 _ => vec![],
             }
         }
@@ -264,7 +288,7 @@ pub fn parse_codex_history_line(line: &str) -> Vec<ParsedEvent> {
     let timestamp = v["ts"].as_u64().map(|s| format!("{}", s));
 
     vec![ParsedEvent {
-        role: "user".to_string(),
+        role: MessageRole::User,
         content: truncate(text),
         session_id,
         timestamp,
@@ -275,7 +299,7 @@ pub fn parse_codex_history_line(line: &str) -> Vec<ParsedEvent> {
     }]
 }
 
-fn parse_codex_content_blocks(payload: &Value, role: &str, base: &EventBase) -> Vec<ParsedEvent> {
+fn parse_codex_content_blocks(payload: &Value, role: MessageRole, base: &EventBase) -> Vec<ParsedEvent> {
     let content = match payload["content"].as_array() {
         Some(c) => c,
         None => {
@@ -304,20 +328,20 @@ fn parse_codex_content_blocks(payload: &Value, role: &str, base: &EventBase) -> 
                 let name = block["name"].as_str().unwrap_or("unknown");
                 let args = block["arguments"].as_str().unwrap_or("{}");
                 let content = format!("tool:{} {}", name, truncate(args));
-                events.push(make_event("tool_use", &content, base));
+                events.push(make_event(MessageRole::ToolUse, &content, base));
             }
             "function_call_output" => {
                 let output = block["output"].as_str().unwrap_or("");
                 if !output.is_empty() {
                     let content = format!("result: {}", truncate(output));
-                    events.push(make_event("tool_result", &content, base));
+                    events.push(make_event(MessageRole::ToolResult, &content, base));
                 }
             }
             "reasoning" => {
                 // Codex reasoning/thinking — map to "thinking"
                 if let Some(text) = block["text"].as_str() {
                     if !text.is_empty() {
-                        events.push(make_event("thinking", &truncate(text), base));
+                        events.push(make_event(MessageRole::Thinking, &truncate(text), base));
                     }
                 }
             }
@@ -327,9 +351,9 @@ fn parse_codex_content_blocks(payload: &Value, role: &str, base: &EventBase) -> 
     events
 }
 
-fn make_event(role: &str, content: &str, base: &EventBase) -> ParsedEvent {
+fn make_event(role: MessageRole, content: &str, base: &EventBase) -> ParsedEvent {
     ParsedEvent {
-        role: role.to_string(),
+        role,
         content: content.to_string(),
         session_id: base.session_id.clone(),
         timestamp: base.timestamp.clone(),
@@ -371,7 +395,7 @@ mod tests {
 
         let events = parse_transcript_line(&line);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].role, MessageRole::User);
         assert_eq!(events[0].content, "Hello world");
         assert_eq!(events[0].session_id, "session-123");
     }
@@ -392,9 +416,9 @@ mod tests {
 
         let events = parse_transcript_line(&line);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].role, MessageRole::User);
         assert_eq!(events[0].content, "Analyzing...");
-        assert_eq!(events[1].role, "tool_result");
+        assert_eq!(events[1].role, MessageRole::ToolResult);
         assert!(events[1].content.contains("result:call_1 Success"));
     }
 
@@ -415,11 +439,11 @@ mod tests {
 
         let events = parse_transcript_line(&line);
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].role, "thinking");
+        assert_eq!(events[0].role, MessageRole::Thinking);
         assert_eq!(events[0].content, "I should say hello");
-        assert_eq!(events[1].role, "assistant");
+        assert_eq!(events[1].role, MessageRole::Assistant);
         assert_eq!(events[1].content, "Hello!");
-        assert_eq!(events[2].role, "tool_use");
+        assert_eq!(events[2].role, MessageRole::ToolUse);
         assert!(events[2].content.contains("tool:read_file"));
         assert!(events[2].content.contains("foo.rs"));
     }
@@ -476,7 +500,7 @@ mod tests {
         let events = parse_history_line(&line);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].content, "ls command");
-        assert_eq!(events[0].role, "user");
+        assert_eq!(events[0].role, MessageRole::User);
         assert_eq!(events[0].cwd, Some("/p".to_string()));
     }
 
@@ -488,7 +512,7 @@ mod tests {
         }).to_string();
         let ev1 = parse_codex_line(&meta, "s1");
         assert_eq!(ev1.len(), 1);
-        assert_eq!(ev1[0].role, "developer");
+        assert_eq!(ev1[0].role, MessageRole::Developer);
         assert_eq!(ev1[0].content, "Be helpful");
 
         let resp = json!({
@@ -503,8 +527,8 @@ mod tests {
         }).to_string();
         let ev2 = parse_codex_line(&resp, "s1");
         assert_eq!(ev2.len(), 2);
-        assert_eq!(ev2[0].role, "assistant");
-        assert_eq!(ev2[1].role, "tool_use");
+        assert_eq!(ev2[0].role, MessageRole::Assistant);
+        assert_eq!(ev2[1].role, MessageRole::ToolUse);
         assert!(ev2[1].content.contains("tool:ls"));
     }
 
@@ -578,7 +602,7 @@ mod tests {
         }).to_string();
         let events = parse_codex_line(&line, "s1");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].role, "thinking");
+        assert_eq!(events[0].role, MessageRole::Thinking);
         assert_eq!(events[0].content, "Thinking hard");
     }
 
@@ -595,7 +619,7 @@ mod tests {
         }).to_string();
         let events = parse_codex_line(&line, "s1");
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].role, "tool_result");
+        assert_eq!(events[0].role, MessageRole::ToolResult);
         assert!(events[0].content.contains("result: Tool result"));
     }
 

@@ -119,6 +119,26 @@ pub struct BootstrapParams {
 
 // ── Schema ─────────────────────────────────────────────────────────
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Serialize, Deserialize,
+    strum::EnumString, strum::AsRefStr, strum::Display,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum Scope {
+    Global,
+    Project,
+}
+
+impl Scope {
+    /// Parse a free-form string into a Scope, defaulting to Global for
+    /// empty or unrecognized input. This matches the legacy behavior
+    /// where the param layer treated a missing `scope` as "global".
+    fn parse_or_global(s: Option<&str>) -> Self {
+        s.and_then(|s| s.parse().ok()).unwrap_or(Self::Global)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
@@ -183,7 +203,7 @@ pub struct KnowledgeEntry {
     #[serde(default)]
     pub variants: HashMap<String, String>, // provider → alternative content
     pub category: Category,
-    pub scope: String, // "global" or "project"
+    pub scope: Scope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(default)]
@@ -315,7 +335,7 @@ impl Knowledge {
         let category = Category::from_str(&p.category)
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
-        let scope = p.scope.clone().unwrap_or_else(|| "global".to_string());
+        let scope = Scope::parse_or_global(p.scope.as_deref());
         let providers = p.providers.clone().unwrap_or_default();
         let priority = match p.priority.as_deref().unwrap_or("standard") {
             "critical" => Priority::Critical,
@@ -344,8 +364,10 @@ impl Knowledge {
                 if let Some(exp) = p.expires_at.clone() {
                     entry.expires_at = Some(exp);
                 }
-                if let Some(s) = p.scope.clone() {
-                    entry.scope = s;
+                if let Some(s) = p.scope.as_deref() {
+                    if let Ok(parsed) = s.parse::<Scope>() {
+                        entry.scope = parsed;
+                    }
                 }
                 if let Some(proj) = p.project.clone() {
                     entry.project = Some(proj);
@@ -392,7 +414,7 @@ impl Knowledge {
         &mut self,
         content: String,
         category: Category,
-        scope: String,
+        scope: Scope,
         project: Option<String>,
     ) -> Result<String> {
         let title = derive_title(&content);
@@ -435,7 +457,7 @@ impl Knowledge {
         // (strum's EnumString::from_str returns Result; unwrap_or treats any
         // unknown string as plain Memory — consistent with prior behavior.)
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
-        let scope = p.scope.clone().unwrap_or_else(|| "global".to_string());
+        let scope = Scope::parse_or_global(p.scope.as_deref());
 
         let now = Self::now_iso();
         let id = Self::gen_id();
@@ -524,8 +546,10 @@ impl Knowledge {
                     }
                 }
                 if let Some(s) = scope_filter {
-                    if e.scope != s {
-                        return false;
+                    if let Ok(target) = s.parse::<Scope>() {
+                        if e.scope != target {
+                            return false;
+                        }
                     }
                 }
                 if let Some(p) = project_filter {
@@ -924,7 +948,7 @@ impl Knowledge {
                 self.import_entry(
                     section.trim().to_string(),
                     Category::Memory,
-                    "project".to_string(),
+                    Scope::Project,
                     Some(project_dir.to_string()),
                 )?;
                 absorbed += 1;
@@ -938,7 +962,7 @@ impl Knowledge {
             if entry.status != Status::Active {
                 continue;
             }
-            if entry.scope != "project" || entry.project.as_deref() != Some(project_dir) {
+            if entry.scope != Scope::Project || entry.project.as_deref() != Some(project_dir) {
                 continue;
             }
             if !entry.render {
@@ -1146,9 +1170,9 @@ enum ScopeFilter<'a> {
 
 impl<'a> ScopeFilter<'a> {
     fn matches(&self, entry: &KnowledgeEntry) -> bool {
-        match (self, entry.scope.as_str()) {
-            (ScopeFilter::Global, "global") => true,
-            (ScopeFilter::Project(dir), "project") => entry.project.as_deref() == Some(*dir),
+        match (self, &entry.scope) {
+            (ScopeFilter::Global, Scope::Global) => true,
+            (ScopeFilter::Project(dir), Scope::Project) => entry.project.as_deref() == Some(*dir),
             _ => false,
         }
     }
@@ -1288,7 +1312,7 @@ impl Knowledge {
             .iter()
             .filter(|e| {
                 e.status == Status::Active
-                    && e.scope == "project"
+                    && e.scope == Scope::Project
                     && e.project.as_deref() == Some(project_dir)
             })
             .count();
