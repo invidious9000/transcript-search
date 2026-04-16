@@ -6,6 +6,7 @@ pub mod tail;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncBufReadExt;
@@ -52,15 +53,15 @@ pub struct TaskInner {
 }
 
 pub struct Task {
-    pub inner: std::sync::Mutex<TaskInner>,
+    pub inner: Mutex<TaskInner>,
     pub notify: Arc<Notify>,
     /// Handle to the child process for cancellation. Only set while running.
-    child_id: std::sync::Mutex<Option<u32>>, // PID
+    child_id: Mutex<Option<u32>>, // PID
 }
 
 impl Task {
     pub fn id(&self) -> String {
-        self.inner.lock().unwrap().id.clone()
+        self.inner.lock().id.clone()
     }
 }
 
@@ -117,7 +118,7 @@ struct PersistedTask {
 impl TaskStore {
     pub fn persist(&self, store_dir: &std::path::Path) {
         let records: Vec<PersistedTask> = self.tasks.values().map(|t| {
-            let inner = t.inner.lock().unwrap();
+            let inner = t.inner.lock();
             PersistedTask {
                 id: inner.id.clone(),
                 provider: inner.provider,
@@ -166,7 +167,7 @@ impl TaskStore {
                 rec.stderr.push_str("\n[blackbox] server restarted while task was running");
             }
             let task = Arc::new(Task {
-                inner: std::sync::Mutex::new(TaskInner {
+                inner: Mutex::new(TaskInner {
                     id: rec.id.clone(),
                     provider: rec.provider,
                     session_id: rec.session_id,
@@ -183,7 +184,7 @@ impl TaskStore {
                     cwd: rec.cwd,
                 }),
                 notify: Arc::new(Notify::new()),
-                child_id: std::sync::Mutex::new(None),
+                child_id: Mutex::new(None),
             });
             store.insert(rec.id, task);
         }
@@ -218,7 +219,7 @@ pub fn spawn_task(
     cwd: Option<String>,
     env_overrides: Option<HashMap<String, String>>,
     store_dir: std::path::PathBuf,
-    task_store: Arc<std::sync::RwLock<TaskStore>>,
+    task_store: Arc<RwLock<TaskStore>>,
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
 ) -> Arc<Task> {
     let id = uuid::Uuid::new_v4().to_string();
@@ -251,7 +252,7 @@ pub fn spawn_task(
         Err(e) => {
             // Return a failed task immediately
             let task = Arc::new(Task {
-                inner: std::sync::Mutex::new(TaskInner {
+                inner: Mutex::new(TaskInner {
                     id: id.clone(),
                     provider,
                     session_id,
@@ -268,10 +269,10 @@ pub fn spawn_task(
                     cwd,
                 }),
                 notify: Arc::new(Notify::new()),
-                child_id: std::sync::Mutex::new(None),
+                child_id: Mutex::new(None),
             });
-            task_store.write().unwrap().insert(id, task.clone());
-            task_store.read().unwrap().persist(&store_dir);
+            task_store.write().insert(id, task.clone());
+            task_store.read().persist(&store_dir);
             task.notify.notify_waiters();
             return task;
         }
@@ -279,7 +280,7 @@ pub fn spawn_task(
 
     let pid = child.id();
     let task = Arc::new(Task {
-        inner: std::sync::Mutex::new(TaskInner {
+        inner: Mutex::new(TaskInner {
             id: id.clone(),
             provider,
             session_id: session_id.clone(),
@@ -296,10 +297,10 @@ pub fn spawn_task(
             cwd: cwd.clone(),
         }),
         notify: Arc::new(Notify::new()),
-        child_id: std::sync::Mutex::new(pid),
+        child_id: Mutex::new(pid),
     });
 
-    task_store.write().unwrap().insert(id.clone(), task.clone());
+    task_store.write().insert(id.clone(), task.clone());
 
     // Emit tail event
     let _ = tail_tx.send(tail::TailEvent::TaskStarted {
@@ -326,7 +327,7 @@ pub fn spawn_task(
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Ok(evt) = serde_json::from_str::<Value>(&line) {
-                    let mut inner = task_ref.inner.lock().unwrap();
+                    let mut inner = task_ref.inner.lock();
                     inner.events.push(evt.clone());
                     let mut sink = EventSink {
                         last_assistant_message: inner.last_assistant_message.clone(),
@@ -377,7 +378,7 @@ pub fn spawn_task(
                 }
             }
             if !buf.trim().is_empty() {
-                let mut inner = task_ref_bulk.inner.lock().unwrap();
+                let mut inner = task_ref_bulk.inner.lock();
                 let mut sink = EventSink {
                     last_assistant_message: inner.last_assistant_message.clone(),
                     usage: inner.usage.clone(),
@@ -406,7 +407,7 @@ pub fn spawn_task(
         let reader = tokio::io::BufReader::new(stderr_handle);
         let mut lines = reader.lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let mut inner = task_ref_err.inner.lock().unwrap();
+            let mut inner = task_ref_err.inner.lock();
             inner.stderr.push_str(&line);
             inner.stderr.push('\n');
         }
@@ -427,21 +428,21 @@ pub fn spawn_task(
 
         // Post-hoc vibe session discovery
         if provider == Provider::Vibe {
-            let inner = task_ref_wait.inner.lock().unwrap();
+            let inner = task_ref_wait.inner.lock();
             if inner.session_id == "pending" {
                 if let Some(ref c) = inner.cwd {
                     let start = inner.started_at;
                     let cwd_clone = c.clone();
                     drop(inner); // release lock before blocking call
                     if let Some(sid) = providers::discover_vibe_session(start, &cwd_clone) {
-                        task_ref_wait.inner.lock().unwrap().session_id = sid;
+                        task_ref_wait.inner.lock().session_id = sid;
                     }
                 }
             }
         }
 
         {
-            let mut inner = task_ref_wait.inner.lock().unwrap();
+            let mut inner = task_ref_wait.inner.lock();
             inner.exit_code = code;
             if inner.status != TaskStatus::Cancelled {
                 inner.status = if code == Some(0) { TaskStatus::Completed } else { TaskStatus::Failed };
@@ -470,7 +471,7 @@ pub fn spawn_task(
 
         // Propagate session ID to team members
         {
-            let inner = task_ref_wait.inner.lock().unwrap();
+            let inner = task_ref_wait.inner.lock();
             if inner.session_id != "pending" {
                 let sid = inner.session_id.clone();
                 let tid = inner.id.clone();
@@ -480,7 +481,7 @@ pub fn spawn_task(
         }
 
         // Persist and notify waiters
-        task_store.read().unwrap().persist(&store_dir);
+        task_store.read().persist(&store_dir);
         task_ref_wait.notify.notify_waiters();
     });
 
@@ -501,7 +502,7 @@ pub async fn wait_for_task(task: &Task) {
         notified.as_mut().enable();
 
         {
-            let inner = task.inner.lock().unwrap();
+            let inner = task.inner.lock();
             if inner.status.is_terminal() {
                 return;
             }
@@ -528,8 +529,8 @@ pub async fn wait_for_task_with_timeout(task: &Task, timeout_secs: Option<f64>) 
 }
 
 /// Cancel a running task.
-pub fn cancel_task(task: &Task, task_store: &std::sync::RwLock<TaskStore>, store_dir: &std::path::Path) -> Result<(), String> {
-    let mut inner = task.inner.lock().unwrap();
+pub fn cancel_task(task: &Task, task_store: &RwLock<TaskStore>, store_dir: &std::path::Path) -> Result<(), String> {
+    let mut inner = task.inner.lock();
     if inner.status != TaskStatus::Running {
         return Err(format!("Task already {}", serde_json::to_string(&inner.status).unwrap_or_default()));
     }
@@ -538,12 +539,12 @@ pub fn cancel_task(task: &Task, task_store: &std::sync::RwLock<TaskStore>, store
     drop(inner);
 
     // Kill the child process
-    if let Some(pid) = task.child_id.lock().unwrap().take() {
+    if let Some(pid) = task.child_id.lock().take() {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
     }
-    task_store.read().unwrap().persist(store_dir);
+    task_store.read().persist(store_dir);
     task.notify.notify_waiters();
     Ok(())
 }
@@ -571,7 +572,7 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
 }
 
 pub fn task_result_json(task: &Task) -> Value {
-    let inner = task.inner.lock().unwrap();
+    let inner = task.inner.lock();
     let mut obj = serde_json::json!({
         "taskId": inner.id,
         "provider": inner.provider,
@@ -611,7 +612,7 @@ pub fn task_result_json(task: &Task) -> Value {
 
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
     let mut obj = task_result_json(task);
-    let inner = task.inner.lock().unwrap();
+    let inner = task.inner.lock();
     obj["eventCount"] = Value::from(inner.events.len());
     if tail > 0 && !inner.events.is_empty() {
         let start = inner.events.len().saturating_sub(tail);
@@ -621,7 +622,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
 }
 
 pub fn timeout_snapshot_json(task: &Task) -> Value {
-    let inner = task.inner.lock().unwrap();
+    let inner = task.inner.lock();
     let elapsed = format_elapsed(inner.started_at, None);
     let event_count = inner.events.len();
     let last_activity = inner.last_assistant_message.as_deref().map(|msg| {
@@ -690,7 +691,7 @@ mod tests {
     #[test]
     fn test_task_result_json_completed() {
         let task = Arc::new(Task {
-            inner: std::sync::Mutex::new(TaskInner {
+            inner: Mutex::new(TaskInner {
                 id: "t1".into(),
                 provider: Provider::Claude,
                 session_id: "s1".into(),
@@ -707,7 +708,7 @@ mod tests {
                 cwd: None,
             }),
             notify: Arc::new(Notify::new()),
-            child_id: std::sync::Mutex::new(None),
+            child_id: Mutex::new(None),
         });
 
         let json = task_result_json(&task);
@@ -720,7 +721,7 @@ mod tests {
     #[test]
     fn test_task_result_json_failed() {
         let task = Arc::new(Task {
-            inner: std::sync::Mutex::new(TaskInner {
+            inner: Mutex::new(TaskInner {
                 id: "t2".into(),
                 provider: Provider::Codex,
                 session_id: "s2".into(),
@@ -737,7 +738,7 @@ mod tests {
                 cwd: None,
             }),
             notify: Arc::new(Notify::new()),
-            child_id: std::sync::Mutex::new(None),
+            child_id: Mutex::new(None),
         });
 
         let json = task_result_json(&task);
@@ -755,7 +756,7 @@ mod async_tests {
     #[tokio::test]
     async fn test_wait_for_task_already_terminal() {
         let task = Arc::new(Task {
-            inner: std::sync::Mutex::new(TaskInner {
+            inner: Mutex::new(TaskInner {
                 id: "t1".into(),
                 provider: Provider::Claude,
                 session_id: "s1".into(),
@@ -772,7 +773,7 @@ mod async_tests {
                 cwd: None,
             }),
             notify: Arc::new(Notify::new()),
-            child_id: std::sync::Mutex::new(None),
+            child_id: Mutex::new(None),
         });
         // Should return immediately without blocking
         wait_for_task(&task).await;
@@ -782,7 +783,7 @@ mod async_tests {
     async fn test_wait_for_task_notify_race() {
         // Simulate the race: task completes between status check and await
         let task = Arc::new(Task {
-            inner: std::sync::Mutex::new(TaskInner {
+            inner: Mutex::new(TaskInner {
                 id: "t2".into(),
                 provider: Provider::Claude,
                 session_id: "s1".into(),
@@ -799,7 +800,7 @@ mod async_tests {
                 cwd: None,
             }),
             notify: Arc::new(Notify::new()),
-            child_id: std::sync::Mutex::new(None),
+            child_id: Mutex::new(None),
         });
 
         let task_clone = task.clone();
@@ -807,7 +808,7 @@ mod async_tests {
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             {
-                let mut inner = task_clone.inner.lock().unwrap();
+                let mut inner = task_clone.inner.lock();
                 inner.status = TaskStatus::Completed;
                 inner.completed_at = Some(now_ms());
             }
@@ -822,7 +823,7 @@ mod async_tests {
     #[tokio::test]
     async fn test_wait_for_task_timeout() {
         let task = Arc::new(Task {
-            inner: std::sync::Mutex::new(TaskInner {
+            inner: Mutex::new(TaskInner {
                 id: "t3".into(),
                 provider: Provider::Claude,
                 session_id: "s1".into(),
@@ -839,7 +840,7 @@ mod async_tests {
                 cwd: None,
             }),
             notify: Arc::new(Notify::new()),
-            child_id: std::sync::Mutex::new(None),
+            child_id: Mutex::new(None),
         });
 
         // Should timeout after 0.1s

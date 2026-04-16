@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
@@ -114,8 +114,8 @@ pub fn save_team(team: &Team, store_dir: &Path) {
 }
 
 /// Acquire the team file lock for read-modify-write operations.
-pub fn lock_teams() -> std::sync::MutexGuard<'static, ()> {
-    TEAM_FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+pub fn lock_teams() -> MutexGuard<'static, ()> {
+    TEAM_FILE_LOCK.lock()
 }
 
 pub fn load_team(name: &str, store_dir: &Path) -> Option<Team> {

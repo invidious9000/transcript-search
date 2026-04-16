@@ -7,7 +7,9 @@ mod threads;
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use axum::extract::{Query, State as AxumState};
 use axum::response::sse::{Event, Sse};
@@ -78,6 +80,30 @@ impl BlackboxServer {
         let mut r = CallToolResult::success(msg.to_string().into_contents());
         r.is_error = Some(true);
         r
+    }
+
+    /// Run a sync tool handler: time it, log at debug (ok) / warn (err),
+    /// uniformly convert Result<String> into CallToolResult. Centralizes
+    /// the match-ok-err boilerplate that used to repeat in every bbox_*
+    /// handler and gives us per-call duration visibility in journald
+    /// (filter: `journalctl --user -u blackbox | grep bbox_`).
+    fn run<F>(tool: &'static str, op: F) -> CallToolResult
+    where
+        F: FnOnce() -> anyhow::Result<String>,
+    {
+        let start = std::time::Instant::now();
+        match op() {
+            Ok(text) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::info!(target: "blackbox::tool", tool, elapsed_ms = ms, bytes = text.len(), "ok");
+                Self::ok_text(&text)
+            }
+            Err(e) => {
+                let ms = start.elapsed().as_secs_f64() * 1000.0;
+                tracing::warn!(target: "blackbox::tool", tool, elapsed_ms = ms, error = %e, "err");
+                Self::err_text(&format!("Error: {e:#}"))
+            }
+        }
     }
 }
 
@@ -363,178 +389,104 @@ fn to_value<T: serde::Serialize>(p: &T) -> Value {
 impl BlackboxServer {
     #[tool(name = "bbox_search", description = "Full-text search across Claude Code conversation transcripts from all accounts. Returns ranked results with excerpts.")]
     fn bbox_search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
-        let args = to_value(&p);
-        let mut idx = self.state.idx.write().unwrap();
-        if idx.is_empty() {
-            if let Err(e) = idx.build_index(false) {
-                return Self::err_text(&format!("Auto-index failed: {e}"));
+        Self::run("bbox_search", || {
+            let mut idx = self.state.idx.write();
+            if idx.is_empty() {
+                idx.build_index(false).map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
-        }
-        drop(idx);
-        match self.state.idx.read().unwrap().search(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+            drop(idx);
+            self.state.idx.read().search(&to_value(&p))
+        })
     }
 
     #[tool(name = "bbox_context", description = "Get conversation context around a specific point in a transcript. Use after bbox_search.")]
     fn bbox_context(&self, Parameters(p): Parameters<ContextParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.idx.read().unwrap().context(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_context", || self.state.idx.read().context(&to_value(&p)))
     }
 
     #[tool(name = "bbox_session", description = "Get summary info for a session: first prompt, project, duration, tool usage, message counts.")]
     fn bbox_session(&self, Parameters(p): Parameters<SessionParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.idx.read().unwrap().session(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_session", || self.state.idx.read().session(&to_value(&p)))
     }
 
     #[tool(name = "bbox_messages", description = "List messages from a session in chronological order. Supports pagination, role filter, tail mode.")]
     fn bbox_messages(&self, Parameters(p): Parameters<MessagesParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.idx.read().unwrap().messages(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_messages", || self.state.idx.read().messages(&to_value(&p)))
     }
 
     #[tool(name = "bbox_reindex", description = "Build or incrementally update the transcript search index.")]
     fn bbox_reindex(&self, Parameters(p): Parameters<ReindexParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.idx.write().unwrap().reindex(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_reindex", || self.state.idx.write().reindex(&to_value(&p)))
     }
 
     #[tool(name = "bbox_topics", description = "Extract top terms from a session by frequency analysis. No LLM — pure term counting.")]
     fn bbox_topics(&self, Parameters(p): Parameters<TopicsParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.idx.read().unwrap().topics(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_topics", || self.state.idx.read().topics(&to_value(&p)))
     }
 
     #[tool(name = "bbox_sessions_list", description = "Browse sessions across all accounts, sorted by most recent.")]
     fn bbox_sessions_list(&self, Parameters(p): Parameters<SessionsListParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.idx.read().unwrap().sessions_list(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_sessions_list", || self.state.idx.read().sessions_list(&to_value(&p)))
     }
 
     #[tool(name = "bbox_stats", description = "Corpus statistics: indexed document count, index size, source file counts.")]
     fn bbox_stats(&self) -> CallToolResult {
-        match self.state.idx.read().unwrap().stats() {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_stats", || self.state.idx.read().stats())
     }
 
     #[tool(name = "bbox_learn", description = "Add or update a knowledge entry. Entries are rendered into CLAUDE.md/AGENTS.md/GEMINI.md.")]
     fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.write().unwrap().learn(&args, false) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_learn", || self.state.kb.write().learn(&to_value(&p), false))
     }
 
     #[tool(name = "bbox_remember", description = "Store a fact for on-demand recall only — NOT rendered into markdown files.")]
     fn bbox_remember(&self, Parameters(p): Parameters<RememberParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.write().unwrap().remember(&args, false) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_remember", || self.state.kb.write().remember(&to_value(&p), false))
     }
 
     #[tool(name = "bbox_knowledge", description = "List/search knowledge entries with filters.")]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.write().unwrap().list(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_knowledge", || self.state.kb.write().list(&to_value(&p)))
     }
 
     #[tool(name = "bbox_forget", description = "Remove or supersede a knowledge entry.")]
     fn bbox_forget(&self, Parameters(p): Parameters<ForgetParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.write().unwrap().forget(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_forget", || self.state.kb.write().forget(&to_value(&p)))
     }
 
     #[tool(name = "bbox_render", description = "Render knowledge entries into provider markdown files.")]
     fn bbox_render(&self, Parameters(p): Parameters<RenderParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.read().unwrap().render(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_render", || self.state.kb.read().render(&to_value(&p)))
     }
 
     #[tool(name = "bbox_absorb", description = "Absorb external changes from rendered files back into knowledge store.")]
     fn bbox_absorb(&self, Parameters(p): Parameters<AbsorbParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.write().unwrap().absorb(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_absorb", || self.state.kb.write().absorb(&to_value(&p)))
     }
 
     #[tool(name = "bbox_lint", description = "Health check: find contradictions, stale entries, duplicates.")]
     fn bbox_lint(&self) -> CallToolResult {
-        match self.state.kb.read().unwrap().lint() {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_lint", || self.state.kb.read().lint())
     }
 
     #[tool(name = "bbox_review", description = "Review unverified entries. List, approve, or reject.")]
     fn bbox_review(&self, Parameters(p): Parameters<ReviewParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.write().unwrap().review(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_review", || self.state.kb.write().review(&to_value(&p)))
     }
 
     #[tool(name = "bbox_bootstrap", description = "Bootstrap a new repo into the blackbox knowledge system.")]
     fn bbox_bootstrap(&self, Parameters(p): Parameters<BootstrapParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.kb.read().unwrap().bootstrap(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_bootstrap", || self.state.kb.read().bootstrap(&to_value(&p)))
     }
 
     #[tool(name = "bbox_thread", description = "Manage work threads — lightweight continuity tracker for non-dispatchable work.")]
     fn bbox_thread(&self, Parameters(p): Parameters<ThreadParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.threads.write().unwrap().thread(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_thread", || self.state.threads.write().thread(&to_value(&p)))
     }
 
     #[tool(name = "bbox_thread_list", description = "List and scan work threads. Shows open/active/stale threads by default.")]
     fn bbox_thread_list(&self, Parameters(p): Parameters<ThreadListParams>) -> CallToolResult {
-        let args = to_value(&p);
-        match self.state.threads.read().unwrap().thread_list(&args) {
-            Ok(text) => Self::ok_text(&text),
-            Err(e) => Self::err_text(&format!("Error: {e:#}")),
-        }
+        Self::run("bbox_thread_list", || self.state.threads.read().thread_list(&to_value(&p)))
     }
 }
 
@@ -707,7 +659,7 @@ impl BlackboxServer {
             self.record_task_to_bro(bro_name, &task);
         }
 
-        let inner = task.inner.lock().unwrap();
+        let inner = task.inner.lock();
         Self::ok_json(&json!({
             "taskId": inner.id,
             "sessionId": inner.session_id,
@@ -747,7 +699,7 @@ impl BlackboxServer {
             self.record_task_to_bro(bro_name, &task);
         }
 
-        let inner = task.inner.lock().unwrap();
+        let inner = task.inner.lock();
         Self::ok_json(&json!({
             "taskId": inner.id,
             "sessionId": inner.session_id,
@@ -761,7 +713,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<WaitParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> CallToolResult {
-        let task = match self.state.task_store.read().unwrap().get(&p.task_id) {
+        let task = match self.state.task_store.read().get(&p.task_id) {
             Some(t) => t,
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         };
@@ -779,7 +731,7 @@ impl BlackboxServer {
 
                 // Build the message under the lock, then drop before await
                 let msg = {
-                    let inner = task_progress.inner.lock().unwrap();
+                    let inner = task_progress.inner.lock();
                     if inner.status.is_terminal() { break; }
                     let bro_name = orchestration::team::find_bro_name_for_task(&task_id, &store_dir);
                     let label = bro_name.unwrap_or_else(|| task_id[..task_id.len().min(8)].to_string());
@@ -819,7 +771,7 @@ impl BlackboxServer {
         };
 
         let tasks: Vec<Arc<orch::Task>> = {
-            let store = self.state.task_store.read().unwrap();
+            let store = self.state.task_store.read();
             task_ids.iter().filter_map(|id| store.get(id)).collect()
         };
 
@@ -832,7 +784,7 @@ impl BlackboxServer {
             async move {
                 let completed = orch::wait_for_task_with_timeout(&task, timeout).await;
                 let bro_name = {
-                    let inner = task.inner.lock().unwrap();
+                    let inner = task.inner.lock();
                     orchestration::team::find_bro_name_for_task(&inner.id, &sd)
                 };
                 let mut r = if completed {
@@ -860,12 +812,12 @@ impl BlackboxServer {
         };
 
         let tasks: Vec<Arc<orch::Task>> = {
-            let store = self.state.task_store.read().unwrap();
+            let store = self.state.task_store.read();
             task_ids.iter().filter_map(|id| store.get(id)).collect()
         };
 
         // Check if any already done
-        let any_done = tasks.iter().any(|t| t.inner.lock().unwrap().status.is_terminal());
+        let any_done = tasks.iter().any(|t| t.inner.lock().status.is_terminal());
         if !any_done && !tasks.is_empty() {
             // Race them
             let futs: Vec<_> = tasks.iter().map(|t| {
@@ -886,11 +838,11 @@ impl BlackboxServer {
 
         let mut results = Vec::new();
         for task in &tasks {
-            let inner = task.inner.lock().unwrap();
+            let inner = task.inner.lock();
             let bro_name = orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
             drop(inner);
 
-            let mut r = if task.inner.lock().unwrap().status.is_terminal() {
+            let mut r = if task.inner.lock().status.is_terminal() {
                 orch::task_result_json(task)
             } else {
                 orch::timeout_snapshot_json(task)
@@ -958,7 +910,7 @@ impl BlackboxServer {
                         cwd.clone(), env_overrides, store_dir.clone(),
                         self.state.task_store.clone(), self.state.tail_tx.clone(),
                     );
-                    updated_team.members[i].session_id = Some(t.inner.lock().unwrap().session_id.clone());
+                    updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
                     t
                 }
             } else {
@@ -969,13 +921,13 @@ impl BlackboxServer {
                     cwd.clone(), env_overrides, store_dir.clone(),
                     self.state.task_store.clone(), self.state.tail_tx.clone(),
                 );
-                updated_team.members[i].session_id = Some(t.inner.lock().unwrap().session_id.clone());
+                updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
                 t
             };
 
             let tid = task.id();
             updated_team.members[i].task_history.push(tid.clone());
-            let sid = task.inner.lock().unwrap().session_id.clone();
+            let sid = task.inner.lock().session_id.clone();
             launched.push(json!({"bro": member.name, "taskId": tid, "sessionId": sid}));
         }
 
@@ -985,7 +937,7 @@ impl BlackboxServer {
 
     #[tool(name = "bro_status", description = "Non-blocking progress check. Returns current state without waiting.")]
     fn bro_status(&self, Parameters(p): Parameters<StatusParams>) -> CallToolResult {
-        match self.state.task_store.read().unwrap().get(&p.task_id) {
+        match self.state.task_store.read().get(&p.task_id) {
             Some(task) => Self::ok_json(&orch::task_status_json(&task, p.tail.unwrap_or(0))),
             None => Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         }
@@ -993,7 +945,7 @@ impl BlackboxServer {
 
     #[tool(name = "bro_dashboard", description = "List recent tasks and sessions. Use to look up a taskId or sessionId.")]
     fn bro_dashboard(&self, Parameters(p): Parameters<DashboardParams>) -> CallToolResult {
-        let store = self.state.task_store.read().unwrap();
+        let store = self.state.task_store.read();
         let limit = p.limit.unwrap_or(20);
 
         let filter_provider = p.provider.as_deref().and_then(Provider::from_str);
@@ -1008,14 +960,14 @@ impl BlackboxServer {
 
         let mut with_ts: Vec<(u64, Value)> = store.all_tasks().iter()
             .filter(|t| {
-                let inner = t.inner.lock().unwrap();
+                let inner = t.inner.lock();
                 if let Some(fp) = filter_provider { if inner.provider != fp { return false; } }
                 if let Some(fs) = filter_status { if inner.status != fs { return false; } }
                 if let Some(ref ids) = team_task_ids { if !ids.contains(&inner.id) { return false; } }
                 true
             })
             .map(|t| {
-                let inner = t.inner.lock().unwrap();
+                let inner = t.inner.lock();
                 let bro_name = orchestration::team::find_bro_name_for_task(&inner.id, &self.state.store_dir);
                 let mut entry = json!({
                     "taskId": inner.id,
@@ -1039,13 +991,13 @@ impl BlackboxServer {
 
     #[tool(name = "bro_cancel", description = "Cancel a running task (sends SIGTERM).")]
     fn bro_cancel(&self, Parameters(p): Parameters<CancelParams>) -> CallToolResult {
-        let task = match self.state.task_store.read().unwrap().get(&p.task_id) {
+        let task = match self.state.task_store.read().get(&p.task_id) {
             Some(t) => t,
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         };
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
             Ok(()) => {
-                let inner = task.inner.lock().unwrap();
+                let inner = task.inner.lock();
                 let _ = self.state.tail_tx.send(TailEvent::TaskCancelled {
                     task_id: inner.id.clone(),
                     elapsed: orch::format_elapsed(inner.started_at, inner.completed_at),
@@ -1238,7 +1190,7 @@ impl BlackboxServer {
                     None => return Self::err_text(&format!("Unknown team: {name}")),
                 };
                 if p.cancel_running.unwrap_or(false) {
-                    let task_store = self.state.task_store.read().unwrap();
+                    let task_store = self.state.task_store.read();
                     for member in &loaded_team.members {
                         for tid in &member.task_history {
                             if let Some(task) = task_store.get(tid) {
@@ -1256,11 +1208,11 @@ impl BlackboxServer {
                     Some(t) => t,
                     None => return Self::err_text(&format!("Unknown team: {name}")),
                 };
-                let task_store = self.state.task_store.read().unwrap();
+                let task_store = self.state.task_store.read();
                 let roster: Vec<Value> = loaded_team.members.iter().map(|m| {
                     let latest_tid = m.task_history.last();
                     let latest = latest_tid.and_then(|id| task_store.get(id)).map(|t| {
-                        let inner = t.inner.lock().unwrap();
+                        let inner = t.inner.lock();
                         json!({
                             "taskId": inner.id,
                             "status": inner.status,
@@ -1402,7 +1354,7 @@ impl BlackboxServer {
                 if member.name == bro_name {
                     member.task_history.push(tid.clone());
                     if member.session_id.as_deref().unwrap_or("pending") == "pending" {
-                        member.session_id = Some(task.inner.lock().unwrap().session_id.clone());
+                        member.session_id = Some(task.inner.lock().session_id.clone());
                     }
                     dirty = true;
                 }
@@ -1459,9 +1411,9 @@ async fn tail_handler(
                     // Apply provider filter — resolve from task store
                     if let Some(pf) = provider_filter {
                         // Check if this event's task matches the provider
-                        let task_provider = state.task_store.read().unwrap()
+                        let task_provider = state.task_store.read()
                             .get(event.task_id())
-                            .map(|t| t.inner.lock().unwrap().provider);
+                            .map(|t| t.inner.lock().provider);
                         if task_provider != Some(pf) {
                             continue;
                         }
@@ -1669,7 +1621,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // Persist tasks on shutdown
-    shared.task_store.read().unwrap().persist(&store_dir);
+    shared.task_store.read().persist(&store_dir);
     tracing::info!("blackboxd shut down");
     Ok(())
 }

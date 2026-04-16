@@ -172,6 +172,7 @@ dependencies = [
  "futures",
  "futures-util",
  "libc",
+ "parking_lot",
  "reqwest",
  "rmcp",
  "schemars 0.8.22",
