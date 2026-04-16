@@ -918,6 +918,13 @@ impl Knowledge {
                 {
                     continue;
                 }
+                // Skip render-emitted category headings (e.g. "## Standing Orders",
+                // "## Workflow") that sit between marker-wrapped entries. These
+                // are structural, not content — absorbing them creates junk
+                // entries like "## Tools [imported]" with no body.
+                if is_structural_only(section) {
+                    continue;
+                }
 
                 let entry_args = serde_json::json!({
                     "content": section.trim(),
@@ -1184,6 +1191,26 @@ fn extract_marker_id(line: &str) -> Option<String> {
     }
 }
 
+/// True if a candidate section contains only markdown headings and
+/// whitespace — i.e. render-emitted category separators like
+/// "## Standing Orders" sitting between marker-wrapped entries. These
+/// are structure, not absorbable content.
+fn is_structural_only(section: &str) -> bool {
+    let mut saw_heading = false;
+    for line in section.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            saw_heading = true;
+            continue;
+        }
+        return false;
+    }
+    saw_heading
+}
+
 /// Extract sections of content that are NOT wrapped in bb:entry markers.
 fn extract_unmarked_sections(content: &str) -> Vec<String> {
     let mut sections = Vec::new();
@@ -1388,6 +1415,68 @@ impl Knowledge {
         out.push_str("6. Delete or git-rm the original hand-authored files that are now generated.\n");
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structural_only_skips_bare_category_headings() {
+        assert!(is_structural_only("## Standing Orders\n"));
+        assert!(is_structural_only("\n## Conventions\n\n"));
+        assert!(is_structural_only("## A\n## B\n"));
+    }
+
+    #[test]
+    fn structural_only_rejects_heading_with_body() {
+        assert!(!is_structural_only("## New thing\n\nuser-written body text\n"));
+    }
+
+    #[test]
+    fn structural_only_rejects_empty() {
+        // A wholly-blank section isn't structural content either — it's
+        // filtered separately by the empty-trim check in absorb(). Be
+        // explicit about the contract: we require at least one heading.
+        assert!(!is_structural_only(""));
+        assert!(!is_structural_only("\n\n"));
+    }
+
+    #[test]
+    fn extract_unmarked_returns_category_headings_between_entries() {
+        // Regression: absorb used to ingest these as junk "## Tools" etc.
+        // entries. The fix is is_structural_only skipping them; this test
+        // just pins the shape extract_unmarked_sections produces so future
+        // refactors don't silently change it.
+        let content = "\
+## Standing Orders
+
+<!-- bb:entry=abc -->
+body
+<!-- /bb:entry=abc -->
+
+## Conventions
+
+<!-- bb:entry=def -->
+body
+<!-- /bb:entry=def -->
+";
+        let sections = extract_unmarked_sections(content);
+        assert!(
+            sections.iter().any(|s| s.contains("## Standing Orders")),
+            "expected Standing Orders heading to surface as unmarked"
+        );
+        assert!(
+            sections.iter().any(|s| s.contains("## Conventions")),
+            "expected Conventions heading to surface as unmarked"
+        );
+        for s in &sections {
+            assert!(
+                is_structural_only(s),
+                "all extracted sections should be structural-only in this shape: {s:?}"
+            );
+        }
     }
 }
 
