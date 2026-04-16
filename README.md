@@ -1,42 +1,238 @@
 # blackbox
 
-MCP server for AI dev tooling: full-text search across Claude Code / Codex / Copilot / Vibe / Gemini transcripts, a unified knowledge store rendered into provider markdown files, work-thread tracking, and multi-provider agent orchestration. Backed by [tantivy](https://github.com/quickwit-oss/tantivy) (Rust, BM25 ranking). Sub-50ms queries over hundreds of thousands of indexed documents.
+Single daemon for AI dev tooling: full-text search across Claude Code / Codex / Copilot / Vibe / Gemini transcripts, a unified knowledge store rendered into each provider's markdown files, work-thread tracking, and multi-provider agent orchestration with a live multi-lane tail TUI. Backed by [tantivy](https://github.com/quickwit-oss/tantivy) (Rust, BM25 ranking). Sub-50ms queries over hundreds of thousands of indexed documents.
 
 The crate is `blackbox`. It produces two binaries:
-- **`blackboxd`** — the MCP server daemon
-- **`bro`** — terminal client for live orchestration tail
+- **`blackboxd`** — HTTP-MCP daemon (one long-lived user service, shared across all CLIs on the host)
+- **`bro`** — terminal TUI for tailing live orchestration activity
 
-## Install
+---
+
+## Quick start
+
+Five steps. After step 5 every agent CLI on your host is talking to the same daemon, your existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content has been absorbed into one store, and the store is rendered back out to each provider in a consistent layered form.
+
+### 1. Build and install the binaries
 
 ```bash
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
 cargo build --release
-# binaries land at target/release/{blackboxd,bro}
+install -m 755 target/release/blackboxd ~/.local/bin/
+install -m 755 target/release/bro       ~/.local/bin/
 ```
 
-Add to your Claude Code MCP configuration (`~/.claude.json`):
+### 2. Run `blackboxd` as a systemd user service
 
+```bash
+cp deploy/blackbox.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now blackbox.service
+```
+
+One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI on the host, so they all share the same tantivy index, knowledge store, and orchestration state. Upgrades: rebuild, `install` (atomic), `systemctl --user restart blackbox`.
+
+Logs live in journald:
+```bash
+journalctl --user -u blackbox -f
+```
+
+### 3. Connect your CLIs
+
+The daemon listens on `127.0.0.1:7264/mcp` by default. Point every agent CLI at the same URL.
+
+**Claude Code** — `~/.claude*/.claude.json`:
 ```json
 {
   "mcpServers": {
-    "blackbox": {
-      "command": "/path/to/transcript-search/target/release/blackboxd",
-      "args": []
-    }
+    "blackbox": { "type": "http", "url": "http://127.0.0.1:7264/mcp" }
   }
 }
 ```
 
-For Codex CLI, add to `~/.codex/config.toml`:
-
+**Codex CLI** — `~/.codex/config.toml`:
 ```toml
 [mcp_servers.blackbox]
-command = "/path/to/transcript-search/target/release/blackboxd"
-args = []
+url = "http://127.0.0.1:7264/mcp"
 ```
 
-Restart your session. The first search auto-builds the index.
+Restart each CLI. The first transcript search will auto-build the index (1–3 minutes depending on corpus size).
+
+### 4. Bootstrap your first project
+
+`bbox_bootstrap` scans an existing repo's instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `PROJECT.md`, any headings it can identify) and migrates them into the unified knowledge store as discrete entries, preserving scope (global vs project) and category.
+
+From any connected CLI, run the MCP tool directly — for example in Claude Code:
+
+```
+bbox_bootstrap(project: "/home/you/repos/my-app")
+```
+
+Review the imports with `bbox_knowledge` or `bbox_review` (new entries land as `unverified` until you approve them).
+
+### 5. Render the store back out
+
+Rewrite the provider instruction files from the canonical store so every agent sees the same three-layer content (steerage → shared memory → project-specific):
+
+```
+bbox_render(scope: "both", project: "/home/you/repos/my-app")
+```
+
+- **`scope=global`** — patches `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. User-authored content outside the markers (including RTK `@imports`) is preserved. Originals snapshot to `~/.local/state/blackbox/backups/<ISO-ts>/` before every write.
+- **`scope=project`** — writes `<repo>/{CLAUDE,AGENTS,GEMINI}.md` with **only** project-scope entries + verbatim `PROJECT.md` content. Global entries aren't duplicated per project.
+- **`scope=both`** — both. Useful on first install or for a forced re-sync.
+
+From this point on: `bbox_learn` / `bbox_remember` to add or update, `bbox_render` to push changes out to provider files, `bbox_absorb` to pull external edits back in. See [Knowledge lifecycle](#knowledge-lifecycle) below for the full loop.
+
+---
+
+## Knowledge lifecycle
+
+Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) as *rendered outputs* of a single canonical store — not as sources of truth. This lets every agent on the host see consistent content, lets you edit in any file and have it reconciled, and keeps provider-specific quirks (Copilot's greedy reading, Gemini's unsupported global memory) handled in one place.
+
+```
+  edit from a CLI               edit in a rendered file
+        │                                 │
+   bbox_learn /                     bbox_absorb
+   bbox_remember                    (diff-based)
+        │                                 │
+        ▼                                 ▼
+   ┌───────────────────────────────────────────────┐
+   │     blackbox-knowledge.json (canonical)       │
+   │  entries tagged scope, category, provider,    │
+   │  verified, decay, timestamps                  │
+   └───────────────────────────────────────────────┘
+                        │
+                   bbox_render
+                        │
+        ┌───────────────┼────────────────┐
+        ▼               ▼                ▼
+   CLAUDE.md        AGENTS.md        GEMINI.md
+```
+
+| Tool | When to use |
+|---|---|
+| **`bbox_bootstrap`** | New repo — scan existing instruction files and import as entries. Run once per repo. |
+| **`bbox_learn`** | Add or update an entry. Entry will be rendered into provider markdown on next `bbox_render`. |
+| **`bbox_remember`** | Store an on-demand fact. **NOT rendered** into markdown — searchable via `bbox_knowledge` only. |
+| **`bbox_knowledge`** | List / search entries with category / scope / provider filters. |
+| **`bbox_render`** | Emit the canonical store back to provider instruction files (global / project / both). |
+| **`bbox_absorb`** | Detect external edits to rendered files and import them as unverified entries. |
+| **`bbox_review`** | Approve or reject unverified entries (from bootstrap or absorb). |
+| **`bbox_forget`** | Remove or supersede an entry. |
+| **`bbox_lint`** | Health check: contradictions, stale entries, duplicates. |
+
+`bbox_render` is the write step; without it, changes stay in the store and don't reach your agents. `bbox_absorb` is the inverse — handy after you've edited a `CLAUDE.md` directly and want the change captured before a later render overwrites it.
+
+---
+
+## `bro tail` — multi-lane orchestration TUI
+
+Live tail one or more bros (named agent instances) side-by-side:
+
+```bash
+bro tail alice bob                  # two specific bros
+bro tail --team review-panel        # every member of a team
+bro tail --provider codex           # all codex bros across all teams
+```
+
+Each lane seeds from the bro's session JSONL on disk, then follows it live. Displayed per event:
+- Assistant / user / developer text — markdown rendered, code fences syntax-highlighted via `syntect`.
+- Thinking blocks — italicized.
+- Tool use — name + extracted target (Bash→command, Read/Edit/Write→path, Grep→pattern, etc.).
+- Tool result — size, exit code (when present), preview, error-state color.
+- System signals — session init, compaction, hooks, system-reminders, slash commands — rendered as inline dividers so you can see *why* an agent shifted.
+
+**Keybindings:**
+
+| Key | Action |
+|---|---|
+| `Tab` / `Shift-Tab` | Cycle selected lane |
+| `f` | Fullscreen toggle on selected lane |
+| `↑`/`↓` or `k`/`j` | Scroll 1 line |
+| `PgUp`/`PgDn` | Scroll one page |
+| `g` / `Home` | Jump to top |
+| `G` / `End` | Jump to bottom (live mode) |
+| `q` / `Esc` / `Ctrl-C` | Quit |
+
+**Mouse:**
+
+| Action | Effect |
+|---|---|
+| Click lane body | Sets that lane as selected |
+| Click + drag on divider | Resize adjacent lanes (±1 col detection, 12-col minimum) |
+| Wheel up/down | Scrolls lane under cursor (no Tab required) |
+
+Footer per lane shows `● LIVE` or `⏸ -N` when scrolled up, plus running counts (text / tool / thinking / signal events). Scroll position stays anchored to content when new events arrive.
+
+Five providers at parity: Claude (`.jsonl`), Codex (`.jsonl`), Gemini (`.json` single-object), Copilot (`session-state/<id>/events.jsonl`), Vibe (`logs/session/.../messages.jsonl`).
+
+---
+
+## MCP tools reference
+
+### Transcript search (`bbox_*`)
+
+| Tool | Description |
+|---|---|
+| `bbox_search` | Full-text query with filters (account, project, role, include_subagents, limit). Terms ANDed by default; supports `OR`, `"phrase queries"`. Returns ranked results with highlighted excerpts. |
+| `bbox_messages` | Read a session's conversation flow. Accepts `session_id` or `file_path`. Supports `role` filter, `from_end` (tail mode), `offset`/`limit` pagination, `max_content_length`. |
+| `bbox_context` | Surrounding messages around a search hit (given file path + byte offset). |
+| `bbox_session` | Session metadata: first prompt, project, duration, tool usage, message counts. |
+| `bbox_topics` | Top terms from a session by frequency analysis (no LLM). Stop-word filtered. |
+| `bbox_sessions_list` | Browse sessions across accounts, sorted by recency. Filter by account, project. |
+| `bbox_reindex` | Incremental (default) or full rebuild. Only re-processes new/modified files. |
+| `bbox_stats` | Corpus statistics: document count, index size, per-account file counts. |
+
+### Knowledge store (`bbox_*`)
+
+See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative — quick reference here.
+
+| Tool | Description |
+|---|---|
+| `bbox_bootstrap` | Scan an existing repo's instruction files and migrate them into the knowledge store. |
+| `bbox_learn` | Add / update a knowledge entry. Rendered into provider markdown on next `bbox_render`. |
+| `bbox_remember` | Store a fact for on-demand recall only — NOT rendered into markdown. |
+| `bbox_knowledge` | List / search knowledge entries with category / scope / provider filters. |
+| `bbox_render` | Render entries → CLAUDE.md / AGENTS.md / GEMINI.md (steerage → memory → PROJECT.md). |
+| `bbox_absorb` | Detect external edits to rendered files and import them as unverified entries. |
+| `bbox_review` | Review unverified entries — list, approve, reject. |
+| `bbox_forget` | Remove or supersede an entry. |
+| `bbox_lint` | Health check: contradictions, stale entries, duplicates. |
+
+### Work threads (`bbox_*`)
+
+| Tool | Description |
+|---|---|
+| `bbox_thread` | Manage long-running work threads — friendly names, edges to other threads/sessions, notes. |
+| `bbox_thread_list` | List / scan threads (open / active / stale by default). |
+
+### Multi-provider orchestration (`bro_*`)
+
+Dispatch agent tasks to Claude, Codex, Copilot, Vibe, or Gemini and coordinate them as teams.
+
+| Tool | Description |
+|---|---|
+| `bro_exec` | Launch an agent task. Returns `{taskId, sessionId}` immediately. |
+| `bro_resume` | Resume a previous agent session with a follow-up prompt. |
+| `bro_wait` / `bro_when_all` / `bro_when_any` | Block until one / all / first task(s) complete. Emits MCP progress notifications (client-echoed `progressToken`) with a multi-lane activity snapshot every 15s. |
+| `bro_broadcast` | Send the same prompt to every team member. |
+| `bro_status` | Non-blocking progress check. |
+| `bro_cancel` | Send SIGTERM to a running task. |
+| `bro_dashboard` | List recent tasks and sessions. |
+| `bro_providers` | Show configured providers, binaries, and model/effort catalogs. |
+| `bro_brofile` | Manage brofile templates and named accounts. |
+| `bro_team` | Manage team templates and live teams. |
+
+### HTTP endpoints (non-MCP)
+
+| Path | Description |
+|---|---|
+| `GET /mcp` | MCP streamable-HTTP transport. All client CLIs connect here. |
+| `GET /tail` | SSE stream of orchestration lifecycle events. Filter via `?team=`/`?bro=`/`?provider=`. |
+| `GET /roster` | Resolves `?bros=a,b&team=X&provider=Y` selectors → `[{bro, team, provider, session_id, jsonl_path, model}]`. Used by `bro tail` to locate transcript files. |
+
+---
 
 ## What gets indexed
 
@@ -48,7 +244,7 @@ Restart your session. The first search auto-builds the index.
 | Claude Code | Tool use (name + input) | `tool_use` |
 | Claude Code | Tool results | `tool_result` |
 | Claude Code | Subagent transcripts | all roles, `is_subagent=1` |
-| Codex CLI | User/assistant/developer messages | `user`, `assistant`, `developer` |
+| Codex CLI | User / assistant / developer messages | `user`, `assistant`, `developer` |
 | Codex CLI | Function calls | `tool_use` |
 | Codex CLI | Function results | `tool_result` |
 | Codex CLI | Reasoning blocks | `thinking` |
@@ -56,76 +252,24 @@ Restart your session. The first search auto-builds the index.
 
 Content is capped at 12KB per document. Responses are capped at 80KB to avoid blowing MCP result limits.
 
-## MCP Tools
+`bro tail` reads a richer `TranscriptEvent` model that preserves tool-call structure and out-of-band system signals — the indexer projects that down to the flat `ParsedEvent` shape it needs.
 
-### Transcript search (`bbox_*`)
-
-| Tool | Description |
-|---|---|
-| `bbox_search` | Full-text query with filters (account, project, role, include_subagents, limit). Terms are ANDed by default; supports `OR`, `"phrase queries"`. Returns ranked results with highlighted excerpts. |
-| `bbox_messages` | Read a session's conversation flow. Accepts `session_id` or `file_path`. Supports `role` filter, `from_end` (tail mode), `offset`/`limit` pagination, `max_content_length`. |
-| `bbox_context` | Surrounding messages around a search hit (given file path + byte offset). |
-| `bbox_session` | Session metadata: first prompt, project, duration, tool usage, message counts. |
-| `bbox_topics` | Top terms from a session by frequency analysis (no LLM). Stop-word filtered. |
-| `bbox_sessions_list` | Browse sessions across accounts, sorted by recency. Filter by account, project. |
-| `bbox_reindex` | Incremental (default) or full rebuild. Only re-processes new/modified files. |
-| `bbox_stats` | Corpus statistics: document count, index size, per-account file counts. |
-
-### Knowledge store (`bbox_*`)
-
-| Tool | Description |
-|---|---|
-| `bbox_learn` | Add or update a knowledge entry. Entries render into provider markdown. |
-| `bbox_remember` | Store a fact for on-demand recall only — NOT rendered into markdown. |
-| `bbox_knowledge` | List/search knowledge entries with category/scope/provider filters. |
-| `bbox_forget` | Remove or supersede an entry. |
-| `bbox_render` | Render entries → CLAUDE.md / AGENTS.md / GEMINI.md (steerage → memory → PROJECT.md). |
-| `bbox_absorb` | Detect external edits to rendered files and import them as unverified entries. |
-| `bbox_lint` | Health check: contradictions, stale entries, duplicates. |
-| `bbox_review` | Review unverified entries — list, approve, reject. |
-| `bbox_bootstrap` | Scan a new repo's existing instruction files for migration into the knowledge store. |
-
-### Work threads (`bbox_*`)
-
-| Tool | Description |
-|---|---|
-| `bbox_thread` | Manage long-running work threads — friendly names, edges to other threads/sessions, notes. |
-| `bbox_thread_list` | List/scan threads (open/active/stale by default). |
-
-### Multi-provider orchestration (`bro_*`)
-
-Dispatch agent tasks to Claude, Codex, Copilot, Vibe, or Gemini and coordinate them as teams.
-
-| Tool | Description |
-|---|---|
-| `bro_exec` | Launch an agent task. Returns `{taskId, sessionId}` immediately. |
-| `bro_resume` | Resume a previous agent session with a follow-up prompt. |
-| `bro_wait` / `bro_when_all` / `bro_when_any` | Block until one / all / first task(s) complete. |
-| `bro_broadcast` | Send the same prompt to every team member. |
-| `bro_status` | Non-blocking progress check. |
-| `bro_cancel` | Send SIGTERM to a running task. |
-| `bro_dashboard` | List recent tasks and sessions. |
-| `bro_providers` | Show configured providers, binaries, and model/effort catalogs. |
-| `bro_brofile` | Manage brofile templates and named accounts. |
-| `bro_team` | Manage team templates and live teams. |
-
-Live tail from a terminal:
-```bash
-bro tail [--team NAME] [--bro NAME] [--provider NAME]
-```
+---
 
 ## Provider catalog
 
 Maintained in `src/orchestration/providers.rs`:
 
-- **Claude**: Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku).
-- **Codex**: gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
-- **Copilot**: Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
-- **Vibe**, **Gemini**: model lists only.
+- **Claude** — Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
+- **Codex** — gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
+- **Copilot** — Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
+- **Vibe**, **Gemini** — model lists only.
+
+---
 
 ## Configuration
 
-Auto-detection works out of the box for most setups. Override via environment variables.
+Auto-detection works out of the box for most setups. Override via environment variables (typically via a systemd unit drop-in — see *Multi-account example* below).
 
 | Env var | Default | Description |
 |---|---|---|
@@ -133,66 +277,81 @@ Auto-detection works out of the box for most setups. Override via environment va
 | `TRANSCRIPT_SEARCH_CODEX_ROOT` | `~/.codex` if it exists | Codex CLI data directory |
 | `TRANSCRIPT_SEARCH_INDEX_PATH` | `~/.claude-shared/transcript-index` or `~/.local/share/blackbox/index` | Tantivy index location |
 | `BLACKBOX_REINDEX_INTERVAL_SECS` | `120` | Background reindex interval (seconds) |
-| `BBOX_PORT` / `BRO_PORT` | `7263` | HTTP port for `/tail` endpoint |
-| `CLAUDE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` | from `$PATH` | Override provider binary paths |
-| `RUST_LOG` | `transcript_search=info` | Tracing filter |
+| `BBOX_PORT` / `BRO_PORT` | `7264` | HTTP port for MCP + `/tail` + `/roster` endpoints |
+| `CLAUDE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` / `VIBE_BIN` | from `$PATH` | Override provider binary paths |
+| `RUST_LOG` | `blackbox=info` | Tracing filter |
 
 ### Auto-detection
 
 By default the server:
-1. Always includes `~/.claude` as the `claude` account
-2. Scans `~/` for any `~/.claude-*` directories that contain a `projects/` subdirectory
-3. Includes `~/.codex` if `~/.codex/sessions/` exists
+1. Always includes `~/.claude` as the `claude` account.
+2. Scans `~/` for any `~/.claude-*` directories that contain a `projects/` subdirectory.
+3. Includes `~/.codex` if `~/.codex/sessions/` exists.
 
 ### Multi-account example
 
-```json
-{
-  "mcpServers": {
-    "blackbox": {
-      "command": "/path/to/blackboxd",
-      "args": [],
-      "env": {
-        "TRANSCRIPT_SEARCH_ROOTS": "personal=~/.claude,work=~/.claude-work"
-      }
-    }
-  }
-}
+Override account roots via a systemd unit drop-in:
+
+```ini
+# ~/.config/systemd/user/blackbox.service.d/accounts.conf
+[Service]
+Environment=TRANSCRIPT_SEARCH_ROOTS=personal=%h/.claude,work=%h/.claude-work
 ```
+Then `systemctl --user daemon-reload && systemctl --user restart blackbox`.
 
-## Usage tips
+---
 
-- **First search auto-indexes** if the index is empty. Takes 1-3 minutes depending on corpus size.
-- **Incremental reindex** is fast — skips unchanged files by mtime/size. Call `bbox_reindex` to pick up new sessions.
-- **Logs go to stderr** (stdout is MCP transport). Set `RUST_LOG=blackbox=debug` for verbose output.
-- **Add a CLAUDE.md cue** so Claude knows to use these tools:
-  ```markdown
-  ### Past conversations
-  When the user asks about past conversations, use the `bbox_*` MCP tools.
-  Do NOT write ad-hoc Python to parse JSONL transcript files.
-  ```
+## Transcript schemas (appendix)
 
-## JSONL transcript schemas
-
-**Claude Code** stores transcripts at `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`:
+**Claude Code** — `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`:
 ```jsonc
-{"type": "user|assistant|progress", "message": {...}, "sessionId": "uuid", "timestamp": "ISO-8601", ...}
+{"type": "user|assistant|system|summary", "message": {...}, "sessionId": "uuid", "timestamp": "ISO-8601", ...}
 ```
 
-**Codex CLI** stores transcripts at `~/.codex/sessions/YYYY/MM/DD/rollout-<timestamp>-<uuid>.jsonl`:
+**Codex CLI** — `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`:
 ```jsonc
 {"timestamp": "ISO-8601", "type": "session_meta|response_item|event_msg", "payload": {...}}
 ```
 
+**Gemini** — `~/.gemini/tmp/<project>/chats/session-<ts>-<first8>.json` (single JSON object, not JSONL):
+```jsonc
+{"sessionId": "uuid", "messages": [{"id", "timestamp", "type": "user|gemini", "content", "thoughts": [...], ...}]}
+```
+
+**Copilot** — `~/.copilot/session-state/<full-session-id>/events.jsonl`:
+```jsonc
+{"type": "session.start|user.message|assistant.message|tool.execution_start|tool.execution_complete|...", "data": {...}, "id", "timestamp", "parentId"}
+```
+
+**Vibe** — `~/.vibe/logs/session/session_<date>_<time>_<first8>/messages.jsonl`:
+```jsonc
+{"role": "user|assistant|tool", "content": "...", "tool_calls": [...], "tool_call_id": "...", "message_id": "..."}
+```
+
+---
+
 ## Architecture
 
-- **Tantivy** for full-text indexing with BM25 ranking, phrase queries, and positional indexing
-- **Separate documents per content block** — each text/thinking/tool_use block is its own document, enabling role-based filtering and precise excerpts
-- **Incremental indexing** via file mtime/size tracking
-- **MCP over stdio** — standard JSON-RPC 2.0, compatible with Claude Code and Codex CLI
-- **Knowledge render pipeline** — three-layer composition (steerage → shared memory → per-project PROJECT.md) into provider-specific markdown
-- **Multi-provider orchestration** — spawns provider CLIs as child processes, streams JSON events, manages task lifecycle and team coordination
+- **Tantivy** for full-text indexing with BM25 ranking, phrase queries, and positional indexing.
+- **Separate documents per content block** — each text / thinking / tool_use block is its own document, enabling role-based filtering and precise excerpts.
+- **Incremental indexing** via file mtime/size tracking; background reindex thread runs every 120s.
+- **MCP over streamable HTTP** — `rmcp` crate as transport, axum for auxiliary `/tail` and `/roster` endpoints. Progress notifications echo the caller's `progressToken` per spec.
+- **Knowledge render pipeline** — three-layer composition (steerage → shared memory → per-project PROJECT.md) into provider-specific markdown, with atomic-replace safety and external-edit absorption.
+- **Multi-provider orchestration** — spawns provider CLIs as child processes, streams JSON events, manages task lifecycle, team coordination, and SSE broadcast to `/tail` subscribers.
+- **Two-layer transcript model** — `parser::TranscriptEvent` (rich, tool-call structured, system-signal aware) for the `bro tail` TUI; projected to `ParsedEvent` for the flat tantivy doc shape.
 - **No LLM calls** — pure local indexing and retrieval. `bbox_topics` uses term frequency, not embeddings.
+
+Source layout (`src/`):
+
+- **main.rs** — `rmcp` server with `#[tool]`-annotated handlers, axum routes for `/tail` / `/roster`, progress-notifier plumbing, signal handling.
+- **cli.rs** — `bro` binary. Ratatui TUI with per-lane seed-from-history + live follow, tui-markdown + syntect rendering, crossterm mouse capture.
+- **index/** — Tantivy lifecycle, schema, search / browse / session handlers, incremental reindex thread, session-file discovery.
+- **parser.rs** — Claude / Codex / Gemini / Copilot / Vibe JSONL parsers emitting both rich `TranscriptEvent` and flat `ParsedEvent`.
+- **knowledge.rs**, **render.rs** — Knowledge CRUD and three-layer markdown render pipeline.
+- **threads.rs** — Work-thread tracker.
+- **orchestration/** — Provider catalogs, exec/resume arg builders, brofile/team persistence, task lifecycle, tail event stream, bro-name ↔ session-id resolution.
+
+---
 
 ## License
 
