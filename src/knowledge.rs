@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -118,8 +119,9 @@ pub struct BootstrapParams {
 
 // ── Schema ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Category {
     Profile,
     Convention,
@@ -131,19 +133,9 @@ pub enum Category {
 }
 
 impl Category {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "profile" => Some(Self::Profile),
-            "convention" => Some(Self::Convention),
-            "steering" => Some(Self::Steering),
-            "build" => Some(Self::Build),
-            "tool" => Some(Self::Tool),
-            "memory" => Some(Self::Memory),
-            "workflow" => Some(Self::Workflow),
-            _ => None,
-        }
-    }
-
+    /// Section heading used when rendering this category into the
+    /// managed CLAUDE.md / AGENTS.md / GEMINI.md block. Distinct from
+    /// the serialized snake_case form — this is human-facing.
     fn heading(&self) -> &str {
         match self {
             Self::Profile => "User Profile",
@@ -320,7 +312,8 @@ impl Knowledge {
     // ── CRUD ───────────────────────────────────────────────────────
 
     pub fn learn(&mut self, p: &LearnParams, from_agent: bool) -> Result<String> {
-        let category = Category::from_str(&p.category).context("invalid category")?;
+        let category = Category::from_str(&p.category)
+            .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
         let scope = p.scope.clone().unwrap_or_else(|| "global".to_string());
         let providers = p.providers.clone().unwrap_or_default();
@@ -439,6 +432,8 @@ impl Knowledge {
     pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
         let category_str = p.category.as_deref().unwrap_or("memory");
         let category = Category::from_str(category_str).unwrap_or(Category::Memory);
+        // (strum's EnumString::from_str returns Result; unwrap_or treats any
+        // unknown string as plain Memory — consistent with prior behavior.)
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
         let scope = p.scope.clone().unwrap_or_else(|| "global".to_string());
 
@@ -522,7 +517,7 @@ impl Knowledge {
                 }
 
                 if let Some(cat) = category_filter {
-                    if let Some(c) = Category::from_str(cat) {
+                    if let Ok(c) = Category::from_str(cat) {
                         if e.category != c {
                             return false;
                         }

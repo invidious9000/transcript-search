@@ -2,6 +2,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use std::str::FromStr;
+
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -43,84 +45,38 @@ pub struct ThreadListParams {
 
 // ── Schema ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum ThreadStatus {
     Open,
     Active,
     Stale,
     Resolved,
-    Promoted, // graduated to graph (finding/inquiry/task)
+    /// graduated to graph (finding/inquiry/task)
+    Promoted,
 }
 
-impl ThreadStatus {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "open" => Some(Self::Open),
-            "active" => Some(Self::Active),
-            "stale" => Some(Self::Stale),
-            "resolved" => Some(Self::Resolved),
-            "promoted" => Some(Self::Promoted),
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Open => "open",
-            Self::Active => "active",
-            Self::Stale => "stale",
-            Self::Resolved => "resolved",
-            Self::Promoted => "promoted",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum EdgeKind {
-    SpawnedFrom,  // this thread was opened from another
-    BlockedBy,    // this thread is blocked until target resolves
-    RelatesTo,    // general relationship
-    Subsumes,     // this thread absorbs/replaces target
+    /// this thread was opened from another
+    SpawnedFrom,
+    /// this thread is blocked until target resolves
+    BlockedBy,
+    /// general relationship
+    RelatesTo,
+    /// this thread absorbs/replaces target
+    Subsumes,
 }
 
-impl EdgeKind {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "spawned_from" => Some(Self::SpawnedFrom),
-            "blocked_by" => Some(Self::BlockedBy),
-            "relates_to" => Some(Self::RelatesTo),
-            "subsumes" => Some(Self::Subsumes),
-            _ => None,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        match self {
-            Self::SpawnedFrom => "spawned_from",
-            Self::BlockedBy => "blocked_by",
-            Self::RelatesTo => "relates_to",
-            Self::Subsumes => "subsumes",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum EdgeTarget {
     Thread,
     Session,
-}
-
-impl EdgeTarget {
-    fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "thread" => Some(Self::Thread),
-            "session" => Some(Self::Session),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -314,7 +270,7 @@ impl Threads {
         if let Some(name) = &thread.name {
             out.push_str(&format!("Name: {}\n", name));
         }
-        out.push_str(&format!("Status: {}\n", thread.status.as_str()));
+        out.push_str(&format!("Status: {}\n", thread.status.as_ref()));
         out.push_str(&format!("Project: {}\n", if thread.project.is_empty() { "-" } else { &thread.project }));
         out.push_str(&format!("Created: {}\n", thread.created_at));
         out.push_str(&format!("Last activity: {}\n", thread.last_activity));
@@ -363,7 +319,7 @@ impl Threads {
                         }
                     }
                 };
-                out.push_str(&format!("  - {} → {}", e.kind.as_str(), target_label));
+                out.push_str(&format!("  - {} → {}", e.kind.as_ref(), target_label));
                 if let Some(note) = &e.note {
                     out.push_str(&format!(" — {}", note));
                 }
@@ -391,11 +347,11 @@ impl Threads {
         let kind_str = p.edge.as_deref()
             .context("'edge' is required (spawned_from, blocked_by, relates_to, subsumes)")?;
         let kind = EdgeKind::from_str(kind_str)
-            .with_context(|| format!("Unknown edge kind: {kind_str}. Use: spawned_from, blocked_by, relates_to, subsumes"))?;
+            .map_err(|_| anyhow::anyhow!("Unknown edge kind: {kind_str}. Use: spawned_from, blocked_by, relates_to, subsumes"))?;
 
         let target_type_str = p.target_type.as_deref().unwrap_or("thread");
         let target_type = EdgeTarget::from_str(target_type_str)
-            .with_context(|| format!("Unknown target_type: {target_type_str}. Use: thread, session"))?;
+            .map_err(|_| anyhow::anyhow!("Unknown target_type: {target_type_str}. Use: thread, session"))?;
 
         // Validate target exists (threads only — sessions are external, trust the caller)
         if target_type == EdgeTarget::Thread
@@ -573,7 +529,7 @@ impl Threads {
         for thread in &self.store.threads {
             // Status filter
             if let Some(sf) = status_filter {
-                if let Some(target) = ThreadStatus::from_str(sf) {
+                if let Ok(target) = ThreadStatus::from_str(sf) {
                     if thread.status != target {
                         continue;
                     }
@@ -673,7 +629,7 @@ impl Threads {
                             }
                         }
                     };
-                    format!("{}→{}", e.kind.as_str(), label)
+                    format!("{}→{}", e.kind.as_ref(), label)
                 }).collect();
                 format!(" [{}]", edge_parts.join(", "))
             };
@@ -682,7 +638,7 @@ impl Threads {
                 "{} | {} | {} | {} | {} | {}{} | {} | {}",
                 t.id,
                 display_name,
-                t.status.as_str(),
+                t.status.as_ref(),
                 age_str,
                 project,
                 t.topic,

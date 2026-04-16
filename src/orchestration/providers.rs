@@ -7,8 +7,12 @@ use serde_json::Value;
 // Provider enum
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize,
+    strum::EnumString, strum::IntoStaticStr,
+)]
 #[serde(rename_all = "lowercase")]
+#[strum(serialize_all = "lowercase")]
 pub enum Provider {
     Claude,
     Codex,
@@ -27,24 +31,7 @@ impl Provider {
     ];
 
     pub fn as_str(&self) -> &'static str {
-        match self {
-            Provider::Claude => "claude",
-            Provider::Codex => "codex",
-            Provider::Copilot => "copilot",
-            Provider::Vibe => "vibe",
-            Provider::Gemini => "gemini",
-        }
-    }
-
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s {
-            "claude" => Some(Provider::Claude),
-            "codex" => Some(Provider::Codex),
-            "copilot" => Some(Provider::Copilot),
-            "vibe" => Some(Provider::Vibe),
-            "gemini" => Some(Provider::Gemini),
-            _ => None,
-        }
+        self.into()
     }
 
     pub fn bin(&self) -> String {
@@ -562,14 +549,16 @@ static GEMINI_MODELS: &[ModelInfo] = &[
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
 
     #[test]
     fn test_provider_roundtrip() {
         for p in Provider::ALL {
-            assert_eq!(Provider::from_str(p.as_str()), Some(*p));
+            assert_eq!(Provider::from_str(p.as_str()).ok(), Some(*p));
         }
-        assert_eq!(Provider::from_str("unknown"), None);
+        assert!(Provider::from_str("unknown").is_err());
     }
 
     #[test]

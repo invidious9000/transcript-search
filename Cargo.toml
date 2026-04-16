@@ -30,6 +30,10 @@ anyhow = "1"
 # Fast non-poisoning locks
 parking_lot = "0.12"
 
+# Enum ↔ string derives (FromStr, Display, AsRefStr) — replaces
+# hand-rolled from_str/as_str match blocks.
+strum = { version = "0.26", features = ["derive"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

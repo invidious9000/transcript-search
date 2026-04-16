@@ -6,7 +6,7 @@ mod render;
 mod threads;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -362,6 +362,80 @@ struct TeamMemberSlot {
     #[serde(default)] count: Option<u32>,
 }
 
+// ---------------------------------------------------------------------------
+// Progress notifications — MCP progressToken plumbing for blocking waits
+// ---------------------------------------------------------------------------
+//
+// Per MCP spec, progress notifications are correlated to a pending request via
+// the progressToken the caller put in `_meta`. The server MUST echo that exact
+// token back; otherwise clients drop the notification as unknown. Servers MUST
+// NOT send progress notifications unless the caller asked for them.
+
+const PROGRESS_TICK_SECS: u64 = 3;
+
+fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, bool) {
+    let inner = task.inner.lock();
+    let terminal = inner.status.is_terminal();
+    let bro_name = orchestration::team::find_bro_name_for_task(&inner.id, store_dir);
+    let label = bro_name.unwrap_or_else(|| inner.id[..inner.id.len().min(8)].to_string());
+    let elapsed = orch::format_elapsed(inner.started_at, inner.completed_at);
+    let events = inner.events.len();
+    let activity = if terminal {
+        format!("{:?}", inner.status)
+    } else {
+        inner.last_assistant_message.as_deref()
+            .map(|m| {
+                let c = m.replace('\n', " ");
+                if c.len() > 80 { format!("{}…", &c[..80]) } else { c }
+            })
+            .unwrap_or_else(|| if events == 0 { "starting…".into() } else { "working…".into() })
+    };
+    (format!("[{label}] {elapsed} | {events} ev | {activity}"), terminal)
+}
+
+fn format_progress_snapshot(tasks: &[Arc<orch::Task>], store_dir: &Path) -> (String, bool) {
+    let mut all_terminal = true;
+    let lines: Vec<String> = tasks.iter().map(|t| {
+        let (line, terminal) = format_bro_line(t, store_dir);
+        if !terminal { all_terminal = false; }
+        line
+    }).collect();
+    (lines.join("\n"), all_terminal)
+}
+
+fn spawn_progress_notifier(
+    tasks: Vec<Arc<orch::Task>>,
+    peer: rmcp::service::Peer<rmcp::RoleServer>,
+    progress_token: rmcp::model::ProgressToken,
+    store_dir: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tracing::info!(target: "blackbox::progress", token = ?progress_token, tasks = tasks.len(), "notifier spawned");
+    tokio::spawn(async move {
+        let mut tick = 0u64;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(PROGRESS_TICK_SECS)).await;
+            tick += 1;
+
+            let (msg, all_terminal) = format_progress_snapshot(&tasks, &store_dir);
+
+            let send_result = peer.send_notification(rmcp::model::ServerNotification::ProgressNotification(
+                rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+                    progress_token: progress_token.clone(),
+                    progress: tick as f64,
+                    total: None,
+                    message: Some(msg.clone()),
+                }),
+            )).await;
+            match send_result {
+                Ok(()) => tracing::info!(target: "blackbox::progress", tick, terminal = all_terminal, msg_len = msg.len(), "tick sent"),
+                Err(e) => tracing::warn!(target: "blackbox::progress", tick, error = %e, "tick send failed"),
+            }
+
+            if all_terminal { break; }
+        }
+    })
+}
+
 #[tool_router(router = bro_tools)]
 impl BlackboxServer {
     #[tool(name = "bro_exec", description = "Launch an agent task. Returns {taskId, sessionId} immediately. Prefer named bro over raw provider.")]
@@ -454,44 +528,19 @@ impl BlackboxServer {
             None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
         };
 
-        // Spawn progress notifier
-        let task_progress = task.clone();
-        let task_id = p.task_id.clone();
-        let store_dir = self.state.store_dir.clone();
-        let peer = context.peer.clone();
-        let progress_handle = tokio::spawn(async move {
-            let mut tick = 0u64;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                tick += 1;
-
-                // Build the message under the lock, then drop before await
-                let msg = {
-                    let inner = task_progress.inner.lock();
-                    if inner.status.is_terminal() { break; }
-                    let bro_name = orchestration::team::find_bro_name_for_task(&task_id, &store_dir);
-                    let label = bro_name.unwrap_or_else(|| task_id[..task_id.len().min(8)].to_string());
-                    let elapsed = orch::format_elapsed(inner.started_at, None);
-                    let events = inner.events.len();
-                    let activity = inner.last_assistant_message.as_deref()
-                        .map(|m| { let c = m.replace('\n', " "); if c.len() > 80 { format!("{}…", &c[..80]) } else { c } })
-                        .unwrap_or_else(|| if events == 0 { "starting…".into() } else { "working…".into() });
-                    format!("[{label}] {elapsed} | {events} events | {activity}")
-                }; // MutexGuard dropped here
-
-                let _ = peer.send_notification(rmcp::model::ServerNotification::ProgressNotification(
-                    rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
-                        progress_token: rmcp::model::ProgressToken(rmcp::model::NumberOrString::Number(tick as i64)),
-                        progress: tick as f64,
-                        total: None,
-                        message: Some(msg),
-                    }),
-                )).await;
-            }
+        let caller_token = context.meta.get_progress_token();
+        tracing::info!(target: "blackbox::progress", tool = "bro_wait", has_token = caller_token.is_some(), token = ?caller_token, "entry");
+        let progress_handle = caller_token.map(|token| {
+            spawn_progress_notifier(
+                vec![task.clone()],
+                context.peer.clone(),
+                token,
+                self.state.store_dir.clone(),
+            )
         });
 
         let completed = orch::wait_for_task_with_timeout(&task, p.timeout_seconds).await;
-        progress_handle.abort();
+        if let Some(h) = progress_handle { h.abort(); }
         if completed {
             Self::ok_json(&orch::task_result_json(&task))
         } else {
@@ -500,7 +549,11 @@ impl BlackboxServer {
     }
 
     #[tool(name = "bro_when_all", description = "Block until ALL tasks complete. Accepts team name or task_ids array. USE MAXIMUM TIMEOUT.")]
-    async fn bro_when_all(&self, Parameters(p): Parameters<WhenParams>) -> CallToolResult {
+    async fn bro_when_all(
+        &self,
+        Parameters(p): Parameters<WhenParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
         let task_ids = match self.resolve_when_targets(p.team.as_deref(), p.task_ids.as_deref()) {
             Ok(ids) => ids,
             Err(e) => return Self::err_text(&e),
@@ -510,6 +563,15 @@ impl BlackboxServer {
             let store = self.state.task_store.read();
             task_ids.iter().filter_map(|id| store.get(id)).collect()
         };
+
+        let progress_handle = context.meta.get_progress_token().map(|token| {
+            spawn_progress_notifier(
+                tasks.clone(),
+                context.peer.clone(),
+                token,
+                self.state.store_dir.clone(),
+            )
+        });
 
         // Wait concurrently (like Promise.all), not sequentially
         let timeout = p.timeout_seconds;
@@ -536,12 +598,17 @@ impl BlackboxServer {
         }).collect();
 
         let results: Vec<Value> = futures::future::join_all(futs).await;
+        if let Some(h) = progress_handle { h.abort(); }
         let all_done = results.iter().all(|r| r.get("timed_out").is_none());
         Self::ok_json(&json!({ "all_completed": all_done, "results": results }))
     }
 
     #[tool(name = "bro_when_any", description = "Block until the FIRST task completes. Returns all current states. USE MAXIMUM TIMEOUT.")]
-    async fn bro_when_any(&self, Parameters(p): Parameters<WhenParams>) -> CallToolResult {
+    async fn bro_when_any(
+        &self,
+        Parameters(p): Parameters<WhenParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
         let task_ids = match self.resolve_when_targets(p.team.as_deref(), p.task_ids.as_deref()) {
             Ok(ids) => ids,
             Err(e) => return Self::err_text(&e),
@@ -554,6 +621,19 @@ impl BlackboxServer {
 
         // Check if any already done
         let any_done = tasks.iter().any(|t| t.inner.lock().status.is_terminal());
+        let progress_handle = if !any_done && !tasks.is_empty() {
+            context.meta.get_progress_token().map(|token| {
+                spawn_progress_notifier(
+                    tasks.clone(),
+                    context.peer.clone(),
+                    token,
+                    self.state.store_dir.clone(),
+                )
+            })
+        } else {
+            None
+        };
+
         if !any_done && !tasks.is_empty() {
             // Race them
             let futs: Vec<_> = tasks.iter().map(|t| {
@@ -571,6 +651,7 @@ impl BlackboxServer {
                 }
             }
         }
+        if let Some(h) = progress_handle { h.abort(); }
 
         let mut results = Vec::new();
         for task in &tasks {
@@ -684,7 +765,7 @@ impl BlackboxServer {
         let store = self.state.task_store.read();
         let limit = p.limit.unwrap_or(20);
 
-        let filter_provider = p.provider.as_deref().and_then(Provider::from_str);
+        let filter_provider = p.provider.as_deref().and_then(|s| s.parse::<Provider>().ok());
         let filter_status: Option<orch::TaskStatus> = p.status.as_deref().and_then(|s| {
             serde_json::from_str(&format!("\"{s}\"")).ok()
         });
@@ -791,7 +872,7 @@ impl BlackboxServer {
                 if scope == "project" && p.project_dir.is_none() {
                     return Self::err_text("project_dir required for project scope");
                 }
-                let provider = match p.provider.as_deref().and_then(Provider::from_str) {
+                let provider = match p.provider.as_deref().and_then(|s| s.parse::<Provider>().ok()) {
                     Some(p) => p,
                     None => return Self::err_text("valid provider is required"),
                 };
@@ -1012,7 +1093,7 @@ impl BlackboxServer {
         }
 
         if let Some(p) = raw_provider {
-            let provider = Provider::from_str(p).ok_or(format!("Unknown provider: {p}"))?;
+            let provider = p.parse::<Provider>().map_err(|_| format!("Unknown provider: {p}"))?;
             return Ok((provider, None, None, None, project_dir.map(String::from)));
         }
 
@@ -1056,7 +1137,7 @@ impl BlackboxServer {
         }
 
         if let (Some(sid), Some(p)) = (session_id, raw_provider) {
-            let provider = Provider::from_str(p).ok_or(format!("Unknown provider: {p}"))?;
+            let provider = p.parse::<Provider>().map_err(|_| format!("Unknown provider: {p}"))?;
             return Ok((provider, sid.to_string(), None, None, None, project_dir.map(String::from)));
         }
 
@@ -1137,7 +1218,7 @@ async fn tail_handler(
     // Resolve team filter to a set of task IDs (dynamic — checks on each event)
     let team_name = query.team.clone();
     let bro_filter = query.bro.clone();
-    let provider_filter = query.provider.and_then(|p| Provider::from_str(&p));
+    let provider_filter = query.provider.and_then(|p| p.parse::<Provider>().ok());
     let store_dir = state.store_dir.clone();
 
     let stream = async_stream::stream! {
