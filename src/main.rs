@@ -111,279 +111,15 @@ impl BlackboxServer {
 // Bbox tools (search, knowledge, threads)
 // ---------------------------------------------------------------------------
 
-// Parameter structs for bbox tools
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct SearchParams {
-    /// Search query. Terms ANDed by default. Use quotes for phrases, OR for disjunction.
-    query: String,
-    /// Filter to account: 'claude', 'account2', 'account3', 'codex'
-    #[serde(default)]
-    account: Option<String>,
-    /// Filter by project path keywords
-    #[serde(default)]
-    project: Option<String>,
-    /// Filter by message role/type
-    #[serde(default)]
-    role: Option<String>,
-    /// Include subagent transcripts (default: true)
-    #[serde(default)]
-    include_subagents: Option<bool>,
-    /// Max results (default: 20, max: 100)
-    #[serde(default)]
-    limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct ContextParams {
-    /// Path to the JSONL transcript file
-    file_path: String,
-    /// Byte offset of the target line (from search results)
-    byte_offset: u64,
-    /// Number of JSONL events before/after to include (default: 5)
-    #[serde(default)]
-    context_lines: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct SessionParams {
-    /// Session UUID or friendly name
-    session_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct MessagesParams {
-    /// Session UUID or friendly name
-    #[serde(default)]
-    session_id: Option<String>,
-    /// Direct path to a JSONL transcript file
-    #[serde(default)]
-    file_path: Option<String>,
-    /// Filter to a specific role
-    #[serde(default)]
-    role: Option<String>,
-    /// Include subagent transcripts (default: false)
-    #[serde(default)]
-    include_subagents: Option<bool>,
-    /// Max characters per message (default: 500, 0 = full)
-    #[serde(default)]
-    max_content_length: Option<u64>,
-    /// Read from end of session (default: false)
-    #[serde(default)]
-    from_end: Option<bool>,
-    /// Skip this many messages (default: 0)
-    #[serde(default)]
-    offset: Option<u64>,
-    /// Max messages to return (default: 50, max: 200)
-    #[serde(default)]
-    limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct ReindexParams {
-    /// Force full reindex (default: false)
-    #[serde(default)]
-    full: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct TopicsParams {
-    /// Session UUID
-    #[serde(default)]
-    session_id: Option<String>,
-    /// Direct path to transcript file
-    #[serde(default)]
-    file_path: Option<String>,
-    /// Limit to specific role
-    #[serde(default)]
-    role: Option<String>,
-    /// Number of top terms (default: 25)
-    #[serde(default)]
-    limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct SessionsListParams {
-    /// Filter to account
-    #[serde(default)]
-    account: Option<String>,
-    /// Filter by project name substring
-    #[serde(default)]
-    project: Option<String>,
-    /// Filter by friendly session name
-    #[serde(default)]
-    name: Option<String>,
-    /// Skip sessions (default: 0)
-    #[serde(default)]
-    offset: Option<u64>,
-    /// Session UUID to exclude
-    #[serde(default)]
-    exclude_session: Option<String>,
-    /// Max sessions (default: 30, max: 100)
-    #[serde(default)]
-    limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct LearnParams {
-    /// The instruction, fact, or preference
-    content: String,
-    /// Entry category
-    category: String,
-    /// Short title (auto-generated if omitted)
-    #[serde(default)]
-    title: Option<String>,
-    /// global or project (default: global)
-    #[serde(default)]
-    scope: Option<String>,
-    /// Project path for project-scoped entries
-    #[serde(default)]
-    project: Option<String>,
-    /// Provider filter (empty = all)
-    #[serde(default)]
-    providers: Option<Vec<String>>,
-    /// Priority: critical, standard, supplementary
-    #[serde(default)]
-    priority: Option<String>,
-    /// Ordering within priority tier
-    #[serde(default)]
-    weight: Option<u32>,
-    /// ISO 8601 expiry time
-    #[serde(default)]
-    expires_at: Option<String>,
-    /// Update existing entry by ID
-    #[serde(default)]
-    id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct KnowledgeListParams {
-    #[serde(default)] category: Option<String>,
-    #[serde(default)] scope: Option<String>,
-    #[serde(default)] project: Option<String>,
-    #[serde(default)] provider: Option<String>,
-    #[serde(default)] status: Option<String>,
-    #[serde(default)] approval: Option<String>,
-    #[serde(default)] query: Option<String>,
-    #[serde(default)] limit: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct ForgetParams {
-    /// Entry ID to remove
-    id: String,
-    /// Mark as superseded instead of deleted
-    #[serde(default)]
-    superseded_by: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct RenderParams {
-    /// Render for specific provider or all
-    #[serde(default)]
-    provider: Option<String>,
-    /// Project directory path. Required when scope includes "project".
-    #[serde(default)]
-    project: Option<String>,
-    /// Which scope to render. "global" surgically patches each provider's
-    /// global-memory file (~/.claude-shared/CLAUDE.md, ~/.codex/AGENTS.md,
-    /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers and
-    /// snapshots the original to ~/.local/state/blackbox/backups/ first.
-    /// "project" writes <project>/{CLAUDE,AGENTS,GEMINI}.md from project-
-    /// scope entries + PROJECT.md only (no global content). "both" runs
-    /// both. Defaults to "both" if `project` is given, else "global".
-    #[serde(default)]
-    scope: Option<String>,
-    /// Preview without writing (default: false)
-    #[serde(default)]
-    dry_run: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct AbsorbParams {
-    /// Project directory path
-    project: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct ReviewParams {
-    /// list, approve, or reject (default: list)
-    #[serde(default)]
-    action: Option<String>,
-    /// Entry ID (required for approve/reject)
-    #[serde(default)]
-    id: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct BootstrapParams {
-    /// Absolute path to the repo root
-    project: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct RememberParams {
-    /// The fact, observation, or note
-    content: String,
-    /// Category (default: memory)
-    #[serde(default)]
-    category: Option<String>,
-    /// Short title
-    #[serde(default)]
-    title: Option<String>,
-    /// global or project (default: global)
-    #[serde(default)]
-    scope: Option<String>,
-    /// Project path
-    #[serde(default)]
-    project: Option<String>,
-    /// Set false for invariants (default: true)
-    #[serde(default)]
-    decay: Option<bool>,
-    /// ISO 8601 date to revisit
-    #[serde(default)]
-    review_at: Option<String>,
-    /// ISO 8601 expiry
-    #[serde(default)]
-    expires_at: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct ThreadParams {
-    /// get, open, continue, link, resolve, promote, rename
-    action: String,
-    #[serde(default)] name: Option<String>,
-    #[serde(default)] id: Option<String>,
-    #[serde(default)] topic: Option<String>,
-    #[serde(default)] project: Option<String>,
-    #[serde(default)] session_id: Option<String>,
-    #[serde(default)] provider: Option<String>,
-    #[serde(default)] session_name: Option<String>,
-    #[serde(default)] handoff_doc: Option<String>,
-    #[serde(default)] note: Option<String>,
-    #[serde(default)] target: Option<String>,
-    #[serde(default)] target_type: Option<String>,
-    #[serde(default)] edge: Option<String>,
-    #[serde(default)] promoted_to: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
-struct ThreadListParams {
-    #[serde(default)] status: Option<String>,
-    #[serde(default)] project: Option<String>,
-    #[serde(default)] name: Option<String>,
-    #[serde(default)] stale_days: Option<u64>,
-    #[serde(default)] include_resolved: Option<bool>,
-}
-
-/// Helper: convert params struct to serde_json::Value for passing to existing handlers.
-/// Strips null values to avoid confusing legacy handlers that check field presence.
-fn to_value<T: serde::Serialize>(p: &T) -> Value {
-    let mut v = serde_json::to_value(p).unwrap_or(json!({}));
-    if let Value::Object(ref mut map) = v {
-        map.retain(|_, val| !val.is_null());
-    }
-    v
-}
+use index::{
+    ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
+    SessionsListParams, TopicsParams,
+};
+use knowledge::{
+    AbsorbParams, BootstrapParams, ForgetParams, KnowledgeListParams, LearnParams,
+    RememberParams, RenderParams, ReviewParams,
+};
+use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
 impl BlackboxServer {
@@ -395,38 +131,38 @@ impl BlackboxServer {
                 idx.build_index(false).map_err(|e| anyhow::anyhow!("Auto-index failed: {e}"))?;
             }
             drop(idx);
-            self.state.idx.read().search(&to_value(&p))
+            self.state.idx.read().search(&p)
         })
     }
 
     #[tool(name = "bbox_context", description = "Get conversation context around a specific point in a transcript. Use after bbox_search.")]
     fn bbox_context(&self, Parameters(p): Parameters<ContextParams>) -> CallToolResult {
-        Self::run("bbox_context", || self.state.idx.read().context(&to_value(&p)))
+        Self::run("bbox_context", || self.state.idx.read().context(&p))
     }
 
     #[tool(name = "bbox_session", description = "Get summary info for a session: first prompt, project, duration, tool usage, message counts.")]
     fn bbox_session(&self, Parameters(p): Parameters<SessionParams>) -> CallToolResult {
-        Self::run("bbox_session", || self.state.idx.read().session(&to_value(&p)))
+        Self::run("bbox_session", || self.state.idx.read().session(&p))
     }
 
     #[tool(name = "bbox_messages", description = "List messages from a session in chronological order. Supports pagination, role filter, tail mode.")]
     fn bbox_messages(&self, Parameters(p): Parameters<MessagesParams>) -> CallToolResult {
-        Self::run("bbox_messages", || self.state.idx.read().messages(&to_value(&p)))
+        Self::run("bbox_messages", || self.state.idx.read().messages(&p))
     }
 
     #[tool(name = "bbox_reindex", description = "Build or incrementally update the transcript search index.")]
     fn bbox_reindex(&self, Parameters(p): Parameters<ReindexParams>) -> CallToolResult {
-        Self::run("bbox_reindex", || self.state.idx.write().reindex(&to_value(&p)))
+        Self::run("bbox_reindex", || self.state.idx.write().reindex(&p))
     }
 
     #[tool(name = "bbox_topics", description = "Extract top terms from a session by frequency analysis. No LLM — pure term counting.")]
     fn bbox_topics(&self, Parameters(p): Parameters<TopicsParams>) -> CallToolResult {
-        Self::run("bbox_topics", || self.state.idx.read().topics(&to_value(&p)))
+        Self::run("bbox_topics", || self.state.idx.read().topics(&p))
     }
 
     #[tool(name = "bbox_sessions_list", description = "Browse sessions across all accounts, sorted by most recent.")]
     fn bbox_sessions_list(&self, Parameters(p): Parameters<SessionsListParams>) -> CallToolResult {
-        Self::run("bbox_sessions_list", || self.state.idx.read().sessions_list(&to_value(&p)))
+        Self::run("bbox_sessions_list", || self.state.idx.read().sessions_list(&p))
     }
 
     #[tool(name = "bbox_stats", description = "Corpus statistics: indexed document count, index size, source file counts.")]
@@ -436,32 +172,32 @@ impl BlackboxServer {
 
     #[tool(name = "bbox_learn", description = "Add or update a knowledge entry. Entries are rendered into CLAUDE.md/AGENTS.md/GEMINI.md.")]
     fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
-        Self::run("bbox_learn", || self.state.kb.write().learn(&to_value(&p), false))
+        Self::run("bbox_learn", || self.state.kb.write().learn(&p, false))
     }
 
     #[tool(name = "bbox_remember", description = "Store a fact for on-demand recall only — NOT rendered into markdown files.")]
     fn bbox_remember(&self, Parameters(p): Parameters<RememberParams>) -> CallToolResult {
-        Self::run("bbox_remember", || self.state.kb.write().remember(&to_value(&p), false))
+        Self::run("bbox_remember", || self.state.kb.write().remember(&p, false))
     }
 
     #[tool(name = "bbox_knowledge", description = "List/search knowledge entries with filters.")]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
-        Self::run("bbox_knowledge", || self.state.kb.write().list(&to_value(&p)))
+        Self::run("bbox_knowledge", || self.state.kb.write().list(&p))
     }
 
     #[tool(name = "bbox_forget", description = "Remove or supersede a knowledge entry.")]
     fn bbox_forget(&self, Parameters(p): Parameters<ForgetParams>) -> CallToolResult {
-        Self::run("bbox_forget", || self.state.kb.write().forget(&to_value(&p)))
+        Self::run("bbox_forget", || self.state.kb.write().forget(&p))
     }
 
     #[tool(name = "bbox_render", description = "Render knowledge entries into provider markdown files.")]
     fn bbox_render(&self, Parameters(p): Parameters<RenderParams>) -> CallToolResult {
-        Self::run("bbox_render", || self.state.kb.read().render(&to_value(&p)))
+        Self::run("bbox_render", || self.state.kb.read().render(&p))
     }
 
     #[tool(name = "bbox_absorb", description = "Absorb external changes from rendered files back into knowledge store.")]
     fn bbox_absorb(&self, Parameters(p): Parameters<AbsorbParams>) -> CallToolResult {
-        Self::run("bbox_absorb", || self.state.kb.write().absorb(&to_value(&p)))
+        Self::run("bbox_absorb", || self.state.kb.write().absorb(&p))
     }
 
     #[tool(name = "bbox_lint", description = "Health check: find contradictions, stale entries, duplicates.")]
@@ -471,22 +207,22 @@ impl BlackboxServer {
 
     #[tool(name = "bbox_review", description = "Review unverified entries. List, approve, or reject.")]
     fn bbox_review(&self, Parameters(p): Parameters<ReviewParams>) -> CallToolResult {
-        Self::run("bbox_review", || self.state.kb.write().review(&to_value(&p)))
+        Self::run("bbox_review", || self.state.kb.write().review(&p))
     }
 
     #[tool(name = "bbox_bootstrap", description = "Bootstrap a new repo into the blackbox knowledge system.")]
     fn bbox_bootstrap(&self, Parameters(p): Parameters<BootstrapParams>) -> CallToolResult {
-        Self::run("bbox_bootstrap", || self.state.kb.read().bootstrap(&to_value(&p)))
+        Self::run("bbox_bootstrap", || self.state.kb.read().bootstrap(&p))
     }
 
     #[tool(name = "bbox_thread", description = "Manage work threads — lightweight continuity tracker for non-dispatchable work.")]
     fn bbox_thread(&self, Parameters(p): Parameters<ThreadParams>) -> CallToolResult {
-        Self::run("bbox_thread", || self.state.threads.write().thread(&to_value(&p)))
+        Self::run("bbox_thread", || self.state.threads.write().thread(&p))
     }
 
     #[tool(name = "bbox_thread_list", description = "List and scan work threads. Shows open/active/stale threads by default.")]
     fn bbox_thread_list(&self, Parameters(p): Parameters<ThreadListParams>) -> CallToolResult {
-        Self::run("bbox_thread_list", || self.state.threads.read().thread_list(&to_value(&p)))
+        Self::run("bbox_thread_list", || self.state.threads.read().thread_list(&p))
     }
 }
 
@@ -1626,27 +1362,3 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod main_tests {
-    use super::*;
-
-    #[test]
-    fn test_to_value_strips_nulls() {
-        #[derive(Serialize)]
-        struct TestParams {
-            required: String,
-            optional: Option<String>,
-            another: Option<u64>,
-        }
-        let p = TestParams {
-            required: "hello".into(),
-            optional: None,
-            another: Some(42),
-        };
-        let v = to_value(&p);
-        let map = v.as_object().unwrap();
-        assert_eq!(map.get("required").unwrap(), "hello");
-        assert!(map.get("optional").is_none(), "null fields should be stripped");
-        assert_eq!(map.get("another").unwrap(), 42);
-    }
-}

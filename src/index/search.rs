@@ -3,6 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use rmcp::schemars;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
@@ -16,15 +18,83 @@ use super::helpers::*;
 use super::reindex::*;
 use super::{FileMeta, TranscriptIndex};
 
+// ── MCP parameter structs ─────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchParams {
+    /// Search query. Terms ANDed by default. Use quotes for phrases, OR for disjunction.
+    pub query: String,
+    /// Filter to account: 'claude', 'account2', 'account3', 'codex'
+    #[serde(default)] pub account: Option<String>,
+    /// Filter by project path keywords
+    #[serde(default)] pub project: Option<String>,
+    /// Filter by message role/type
+    #[serde(default)] pub role: Option<String>,
+    /// Include subagent transcripts (default: true)
+    #[serde(default)] pub include_subagents: Option<bool>,
+    /// Max results (default: 20, max: 100)
+    #[serde(default)] pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContextParams {
+    /// Path to the JSONL transcript file
+    pub file_path: String,
+    /// Byte offset of the target line (from search results)
+    pub byte_offset: u64,
+    /// Number of JSONL events before/after to include (default: 5)
+    #[serde(default)] pub context_lines: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionParams {
+    /// Session UUID or friendly name
+    pub session_id: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct MessagesParams {
+    #[serde(default)] pub session_id: Option<String>,
+    #[serde(default)] pub file_path: Option<String>,
+    #[serde(default)] pub role: Option<String>,
+    #[serde(default)] pub include_subagents: Option<bool>,
+    #[serde(default)] pub max_content_length: Option<u64>,
+    #[serde(default)] pub from_end: Option<bool>,
+    #[serde(default)] pub offset: Option<u64>,
+    #[serde(default)] pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReindexParams {
+    /// Force full reindex (default: false)
+    #[serde(default)] pub full: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TopicsParams {
+    #[serde(default)] pub session_id: Option<String>,
+    #[serde(default)] pub file_path: Option<String>,
+    #[serde(default)] pub role: Option<String>,
+    #[serde(default)] pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionsListParams {
+    #[serde(default)] pub account: Option<String>,
+    #[serde(default)] pub project: Option<String>,
+    #[serde(default)] pub name: Option<String>,
+    #[serde(default)] pub offset: Option<u64>,
+    #[serde(default)] pub exclude_session: Option<String>,
+    #[serde(default)] pub limit: Option<u64>,
+}
+
 impl TranscriptIndex {
     // ── Search ──────────────────────────────────────────────────────
 
-    pub fn search(&self, args: &Value) -> Result<String> {
-        let query_str = args["query"]
-            .as_str()
-            .context("'query' is required")?;
-        let limit = args["limit"].as_u64().unwrap_or(20).min(100) as usize;
-        let include_subagents = args["include_subagents"].as_bool().unwrap_or(true);
+    pub fn search(&self, p: &SearchParams) -> Result<String> {
+        let query_str = p.query.as_str();
+        let limit = p.limit.unwrap_or(20).min(100) as usize;
+        let include_subagents = p.include_subagents.unwrap_or(true);
 
         if self.is_empty() {
             return Ok("Index is empty. Run blackbox_reindex first.".to_string());
@@ -52,7 +122,7 @@ impl TranscriptIndex {
             ));
         }
 
-        if let Some(account) = args["account"].as_str() {
+        if let Some(account) = p.account.as_deref() {
             clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
@@ -62,7 +132,7 @@ impl TranscriptIndex {
             ));
         }
 
-        if let Some(role) = args["role"].as_str() {
+        if let Some(role) = p.role.as_deref() {
             clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
@@ -72,7 +142,7 @@ impl TranscriptIndex {
             ));
         }
 
-        if let Some(project) = args["project"].as_str() {
+        if let Some(project) = p.project.as_deref() {
             // Project filter: parse as a query against the project field only
             let mut pqp = QueryParser::for_index(&self.index, vec![self.fields.project]);
             pqp.set_conjunction_by_default();
@@ -139,17 +209,13 @@ impl TranscriptIndex {
 
     // ── Context ─────────────────────────────────────────────────────
 
-    pub fn context(&self, args: &Value) -> Result<String> {
-        let file_path = args["file_path"]
-            .as_str()
-            .context("'file_path' is required")?;
-        let target_offset = args["byte_offset"]
-            .as_u64()
-            .context("'byte_offset' is required")?;
-        let ctx_lines = args["context_lines"].as_u64().unwrap_or(5) as usize;
+    pub fn context(&self, p: &ContextParams) -> Result<String> {
+        let file_path = p.file_path.as_str();
+        let target_offset = p.byte_offset;
+        let ctx_lines = p.context_lines.unwrap_or(5) as usize;
 
         let content = fs::read_to_string(file_path)
-            .with_context(|| format!("Failed to read {}", file_path))?;
+            .with_context(|| format!("Failed to read {file_path}"))?;
 
         let lines: Vec<&str> = content.split('\n').collect();
 
@@ -206,10 +272,8 @@ impl TranscriptIndex {
 
     // ── Session ─────────────────────────────────────────────────────
 
-    pub fn session(&self, args: &Value) -> Result<String> {
-        let raw_id = args["session_id"]
-            .as_str()
-            .context("'session_id' is required")?;
+    pub fn session(&self, p: &SessionParams) -> Result<String> {
+        let raw_id = p.session_id.as_str();
 
         // If it's a friendly name, resolve to UUID
         let resolved_id = resolve_session_name(
@@ -293,18 +357,18 @@ impl TranscriptIndex {
 
     // ── Messages ────────────────────────────────────────────────────
 
-    pub fn messages(&self, args: &Value) -> Result<String> {
-        let role_filter = args["role"].as_str();
-        let include_subagents = args["include_subagents"].as_bool().unwrap_or(false);
-        let max_length = args["max_content_length"].as_u64().unwrap_or(500) as usize;
-        let from_end = args["from_end"].as_bool().unwrap_or(false);
-        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
-        let limit = args["limit"].as_u64().unwrap_or(50).min(200) as usize;
+    pub fn messages(&self, p: &MessagesParams) -> Result<String> {
+        let role_filter = p.role.as_deref();
+        let include_subagents = p.include_subagents.unwrap_or(false);
+        let max_length = p.max_content_length.unwrap_or(500) as usize;
+        let from_end = p.from_end.unwrap_or(false);
+        let offset = p.offset.unwrap_or(0) as usize;
+        let limit = p.limit.unwrap_or(50).min(200) as usize;
 
         // Resolve to file path(s) — accept either file_path or session_id
-        let files: Vec<String> = if let Some(fp) = args["file_path"].as_str() {
+        let files: Vec<String> = if let Some(fp) = p.file_path.as_deref() {
             vec![fp.to_string()]
-        } else if let Some(sid) = args["session_id"].as_str() {
+        } else if let Some(sid) = p.session_id.as_deref() {
             self.resolve_session_files(sid)?
         } else {
             anyhow::bail!("Either 'session_id' or 'file_path' is required");
@@ -583,13 +647,11 @@ impl TranscriptIndex {
 
     // ── Topics ──────────────────────────────────────────────────────
 
-    pub fn topics(&self, args: &Value) -> Result<String> {
-        let top_n = args["limit"].as_u64().unwrap_or(25) as usize;
-        let role_filter = args["role"].as_str();
-
-        // Resolve session docs via session_id or file_path
-        let session_id: Option<&str> = args["session_id"].as_str();
-        let file_path: Option<&str> = args["file_path"].as_str();
+    pub fn topics(&self, p: &TopicsParams) -> Result<String> {
+        let top_n = p.limit.unwrap_or(25) as usize;
+        let role_filter = p.role.as_deref();
+        let session_id = p.session_id.as_deref();
+        let file_path = p.file_path.as_deref();
 
         if session_id.is_none() && file_path.is_none() {
             anyhow::bail!("Either 'session_id' or 'file_path' is required");
@@ -686,12 +748,12 @@ impl TranscriptIndex {
 
     // ── Sessions List ───────────────────────────────────────────────
 
-    pub fn sessions_list(&self, args: &Value) -> Result<String> {
-        let account_filter = args["account"].as_str();
-        let project_filter = args["project"].as_str();
-        let name_filter = args["name"].as_str();
-        let limit = args["limit"].as_u64().unwrap_or(30).min(100) as usize;
-        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    pub fn sessions_list(&self, p: &SessionsListParams) -> Result<String> {
+        let account_filter = p.account.as_deref();
+        let project_filter = p.project.as_deref();
+        let name_filter = p.name.as_deref();
+        let limit = p.limit.unwrap_or(30).min(100) as usize;
+        let offset = p.offset.unwrap_or(0) as usize;
 
         // Load session name maps
         let claude_names = load_claude_session_names(&self.config.roots);
@@ -933,9 +995,8 @@ impl TranscriptIndex {
 
     // ── Reindex ─────────────────────────────────────────────────────
 
-    pub fn reindex(&mut self, args: &Value) -> Result<String> {
-        let full = args["full"].as_bool().unwrap_or(false);
-        self.build_index(full)
+    pub fn reindex(&mut self, p: &ReindexParams) -> Result<String> {
+        self.build_index(p.full.unwrap_or(false))
     }
 
     pub fn build_index(&mut self, full: bool) -> Result<String> {

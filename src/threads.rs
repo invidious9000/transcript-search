@@ -3,8 +3,43 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
+// ── MCP parameter structs ─────────────────────────────────────────
+//
+// These are the typed inputs for the bbox_thread / bbox_thread_list
+// MCP tools. They live here (next to their domain methods) rather
+// than in `main.rs` so the server crate can own the schema alongside
+// the behavior it drives.
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThreadParams {
+    /// get, open, continue, link, resolve, promote, rename
+    pub action: String,
+    #[serde(default)] pub name: Option<String>,
+    #[serde(default)] pub id: Option<String>,
+    #[serde(default)] pub topic: Option<String>,
+    #[serde(default)] pub project: Option<String>,
+    #[serde(default)] pub session_id: Option<String>,
+    #[serde(default)] pub provider: Option<String>,
+    #[serde(default)] pub session_name: Option<String>,
+    #[serde(default)] pub handoff_doc: Option<String>,
+    #[serde(default)] pub note: Option<String>,
+    #[serde(default)] pub target: Option<String>,
+    #[serde(default)] pub target_type: Option<String>,
+    #[serde(default)] pub edge: Option<String>,
+    #[serde(default)] pub promoted_to: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ThreadListParams {
+    #[serde(default)] pub status: Option<String>,
+    #[serde(default)] pub project: Option<String>,
+    #[serde(default)] pub name: Option<String>,
+    #[serde(default)] pub stale_days: Option<u64>,
+    #[serde(default)] pub include_resolved: Option<bool>,
+}
 
 // ── Schema ─────────────────────────────────────────────────────────
 
@@ -204,59 +239,46 @@ impl Threads {
 
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
 
-    pub fn thread(&mut self, args: &Value) -> Result<String> {
-        let action = args["action"]
-            .as_str()
-            .context("'action' is required (open, continue, resolve, promote)")?;
-
-        match action {
-            "get" => self.thread_get(args),
-            "open" => self.thread_open(args),
-            "continue" => self.thread_continue(args),
-            "link" => self.thread_link(args),
-            "resolve" => self.thread_resolve(args),
-            "promote" => self.thread_promote(args),
-            "rename" => self.thread_rename(args),
-            _ => anyhow::bail!("Unknown action: {}. Use: get, open, continue, link, resolve, promote, rename", action),
+    pub fn thread(&mut self, p: &ThreadParams) -> Result<String> {
+        match p.action.as_str() {
+            "get" => self.thread_get(p),
+            "open" => self.thread_open(p),
+            "continue" => self.thread_continue(p),
+            "link" => self.thread_link(p),
+            "resolve" => self.thread_resolve(p),
+            "promote" => self.thread_promote(p),
+            "rename" => self.thread_rename(p),
+            other => anyhow::bail!("Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"),
         }
     }
 
-    fn thread_open(&mut self, args: &Value) -> Result<String> {
-        let topic = args["topic"]
-            .as_str()
-            .context("'topic' is required")?;
-        let project = args["project"].as_str().unwrap_or("");
-        let handoff_doc = args["handoff_doc"].as_str().map(String::from);
-        let note = args["note"].as_str();
+    fn thread_open(&mut self, p: &ThreadParams) -> Result<String> {
+        let topic = p.topic.as_deref().context("'topic' is required")?;
+        let project = p.project.as_deref().unwrap_or("");
 
         let now = Self::now_iso();
         let id = Self::gen_id();
 
         let mut sessions = Vec::new();
-        if let Some(sid) = args["session_id"].as_str() {
+        if let Some(sid) = p.session_id.as_deref() {
             sessions.push(SessionLink {
                 session_id: sid.to_string(),
-                provider: args["provider"].as_str().unwrap_or("unknown").to_string(),
-                name: args["session_name"].as_str().map(String::from),
+                provider: p.provider.as_deref().unwrap_or("unknown").to_string(),
+                name: p.session_name.clone(),
                 linked_at: now.clone(),
             });
         }
 
-        let mut notes = Vec::new();
-        if let Some(n) = note {
-            notes.push(n.to_string());
-        }
-
-        let name = args["name"].as_str().map(String::from);
+        let notes = p.note.clone().into_iter().collect();
 
         let thread = Thread {
             id: id.clone(),
-            name,
+            name: p.name.clone(),
             topic: topic.to_string(),
             project: project.to_string(),
             status: ThreadStatus::Open,
             sessions,
-            handoff_doc,
+            handoff_doc: p.handoff_doc.clone(),
             notes,
             edges: Vec::new(),
             promoted_to: None,
@@ -271,13 +293,10 @@ impl Threads {
         Ok(format!("Thread created: {} — \"{}\"", id, topic))
     }
 
-    fn thread_get(&self, args: &Value) -> Result<String> {
-        let id = args["id"].as_str();
-        let name = args["name"].as_str();
-
-        let thread = if let Some(id) = id {
+    fn thread_get(&self, p: &ThreadParams) -> Result<String> {
+        let thread = if let Some(id) = p.id.as_deref() {
             self.store.threads.iter().find(|t| t.id == id)
-        } else if let Some(name) = name {
+        } else if let Some(name) = p.name.as_deref() {
             let name_lower = name.to_lowercase();
             self.store.threads.iter().find(|t| {
                 t.name.as_ref().map(|n| n.to_lowercase() == name_lower).unwrap_or(false)
@@ -365,27 +384,24 @@ impl Threads {
         Ok(out)
     }
 
-    fn thread_link(&mut self, args: &Value) -> Result<String> {
-        let id = self.resolve_thread_id(args)?;
-        let target = args["target"]
-            .as_str()
+    fn thread_link(&mut self, p: &ThreadParams) -> Result<String> {
+        let id = self.resolve_thread_id(p)?;
+        let target = p.target.as_deref()
             .context("'target' is required (target thread or session ID)")?;
-        let kind_str = args["edge"]
-            .as_str()
+        let kind_str = p.edge.as_deref()
             .context("'edge' is required (spawned_from, blocked_by, relates_to, subsumes)")?;
         let kind = EdgeKind::from_str(kind_str)
-            .with_context(|| format!("Unknown edge kind: {}. Use: spawned_from, blocked_by, relates_to, subsumes", kind_str))?;
-        let note = args["note"].as_str().map(String::from);
+            .with_context(|| format!("Unknown edge kind: {kind_str}. Use: spawned_from, blocked_by, relates_to, subsumes"))?;
 
-        let target_type_str = args["target_type"].as_str().unwrap_or("thread");
+        let target_type_str = p.target_type.as_deref().unwrap_or("thread");
         let target_type = EdgeTarget::from_str(target_type_str)
-            .with_context(|| format!("Unknown target_type: {}. Use: thread, session", target_type_str))?;
+            .with_context(|| format!("Unknown target_type: {target_type_str}. Use: thread, session"))?;
 
         // Validate target exists (threads only — sessions are external, trust the caller)
-        if target_type == EdgeTarget::Thread {
-            if !self.store.threads.iter().any(|t| t.id == target) {
-                anyhow::bail!("Target thread {} not found", target);
-            }
+        if target_type == EdgeTarget::Thread
+            && !self.store.threads.iter().any(|t| t.id == target)
+        {
+            anyhow::bail!("Target thread {target} not found");
         }
 
         let thread = self.store.threads.iter_mut()
@@ -394,7 +410,7 @@ impl Threads {
 
         // Check for duplicate edge
         if thread.edges.iter().any(|e| e.kind == kind && e.target == target && e.target_type == target_type) {
-            anyhow::bail!("Edge {} → {} already exists", kind_str, target);
+            anyhow::bail!("Edge {kind_str} → {target} already exists");
         }
 
         let now = Self::now_iso();
@@ -402,7 +418,7 @@ impl Threads {
             kind,
             target: target.to_string(),
             target_type,
-            note,
+            note: p.note.clone(),
             created_at: now.clone(),
         });
         thread.last_activity = now;
@@ -410,18 +426,18 @@ impl Threads {
         let topic = thread.topic.clone();
         self.save()?;
 
-        Ok(format!("Thread {} ({}) — added {} edge to {}", id, topic, kind_str, target))
+        Ok(format!("Thread {id} ({topic}) — added {kind_str} edge to {target}"))
     }
 
-    /// Resolve a thread by `id` or `name` field in args.
-    fn resolve_thread_id(&self, args: &Value) -> Result<String> {
-        if let Some(id) = args["id"].as_str() {
+    /// Resolve a thread by `id` or `name` in the params.
+    fn resolve_thread_id(&self, p: &ThreadParams) -> Result<String> {
+        if let Some(id) = p.id.as_deref() {
             if self.store.threads.iter().any(|t| t.id == id) {
                 return Ok(id.to_string());
             }
             anyhow::bail!("Thread not found: {id}");
         }
-        if let Some(name) = args["name"].as_str() {
+        if let Some(name) = p.name.as_deref() {
             let name_lower = name.to_lowercase();
             if let Some(t) = self.store.threads.iter().find(|t| {
                 t.name.as_ref().map(|n| n.to_lowercase() == name_lower).unwrap_or(false)
@@ -434,8 +450,8 @@ impl Threads {
         anyhow::bail!("'id' or 'name' is required");
     }
 
-    fn thread_continue(&mut self, args: &Value) -> Result<String> {
-        let id = self.resolve_thread_id(args)?;
+    fn thread_continue(&mut self, p: &ThreadParams) -> Result<String> {
+        let id = self.resolve_thread_id(p)?;
 
         let thread = self.store.threads.iter_mut()
             .find(|t| t.id == id)
@@ -443,28 +459,21 @@ impl Threads {
 
         let now = Self::now_iso();
 
-        // Link a session
-        if let Some(sid) = args["session_id"].as_str() {
+        if let Some(sid) = p.session_id.as_deref() {
             thread.sessions.push(SessionLink {
                 session_id: sid.to_string(),
-                provider: args["provider"].as_str().unwrap_or("unknown").to_string(),
-                name: args["session_name"].as_str().map(String::from),
+                provider: p.provider.as_deref().unwrap_or("unknown").to_string(),
+                name: p.session_name.clone(),
                 linked_at: now.clone(),
             });
         }
-
-        // Add a note
-        if let Some(note) = args["note"].as_str() {
+        if let Some(note) = p.note.as_deref() {
             thread.notes.push(note.to_string());
         }
-
-        // Update handoff doc
-        if let Some(doc) = args["handoff_doc"].as_str() {
+        if let Some(doc) = p.handoff_doc.as_deref() {
             thread.handoff_doc = Some(doc.to_string());
         }
-
-        // Update name if provided
-        if let Some(name) = args["name"].as_str() {
+        if let Some(name) = p.name.as_deref() {
             thread.name = Some(name.to_string());
         }
 
@@ -474,11 +483,11 @@ impl Threads {
 
         self.save()?;
 
-        Ok(format!("Thread {} continued — \"{}\"", id, topic))
+        Ok(format!("Thread {id} continued — \"{topic}\""))
     }
 
-    fn thread_resolve(&mut self, args: &Value) -> Result<String> {
-        let id = self.resolve_thread_id(args)?;
+    fn thread_resolve(&mut self, p: &ThreadParams) -> Result<String> {
+        let id = self.resolve_thread_id(p)?;
 
         let thread = self.store.threads.iter_mut()
             .find(|t| t.id == id)
@@ -486,7 +495,7 @@ impl Threads {
 
         let now = Self::now_iso();
 
-        if let Some(note) = args["note"].as_str() {
+        if let Some(note) = p.note.as_deref() {
             thread.notes.push(note.to_string());
         }
 
@@ -497,13 +506,12 @@ impl Threads {
 
         self.save()?;
 
-        Ok(format!("Thread {} resolved — \"{}\"", id, topic))
+        Ok(format!("Thread {id} resolved — \"{topic}\""))
     }
 
-    fn thread_promote(&mut self, args: &Value) -> Result<String> {
-        let id = self.resolve_thread_id(args)?;
-        let promoted_to = args["promoted_to"]
-            .as_str()
+    fn thread_promote(&mut self, p: &ThreadParams) -> Result<String> {
+        let id = self.resolve_thread_id(p)?;
+        let promoted_to = p.promoted_to.as_deref()
             .context("'promoted_to' is required (graph entity reference)")?;
 
         let thread = self.store.threads.iter_mut()
@@ -512,7 +520,7 @@ impl Threads {
 
         let now = Self::now_iso();
 
-        if let Some(note) = args["note"].as_str() {
+        if let Some(note) = p.note.as_deref() {
             thread.notes.push(note.to_string());
         }
 
@@ -524,20 +532,13 @@ impl Threads {
 
         self.save()?;
 
-        Ok(format!(
-            "Thread {} promoted to {} — \"{}\"",
-            id, promoted_to, topic
-        ))
+        Ok(format!("Thread {id} promoted to {promoted_to} — \"{topic}\""))
     }
 
-    fn thread_rename(&mut self, args: &Value) -> Result<String> {
+    fn thread_rename(&mut self, p: &ThreadParams) -> Result<String> {
         // For rename, 'id' is lookup and 'name' is the new name.
-        let id = args["id"]
-            .as_str()
-            .context("'id' is required for rename")?;
-        let new_name = args["name"]
-            .as_str()
-            .context("'name' is required for rename")?;
+        let id = p.id.as_deref().context("'id' is required for rename")?;
+        let new_name = p.name.as_deref().context("'name' is required for rename")?;
 
         // Try to find by id directly, then fall back to id-as-name lookup
         let thread = self.store.threads.iter_mut()
@@ -550,17 +551,17 @@ impl Threads {
 
         self.save()?;
 
-        Ok(format!("Thread {} renamed to \"{}\" (topic: {})", id, new_name, topic))
+        Ok(format!("Thread {id} renamed to \"{new_name}\" (topic: {topic})"))
     }
 
     // ── blackbox_thread_list (query) ───────────────────────────────
 
-    pub fn thread_list(&self, args: &Value) -> Result<String> {
-        let status_filter = args["status"].as_str();
-        let project_filter = args["project"].as_str();
-        let name_filter = args["name"].as_str();
-        let stale_days = args["stale_days"].as_u64();
-        let include_resolved = args["include_resolved"].as_bool().unwrap_or(false);
+    pub fn thread_list(&self, p: &ThreadListParams) -> Result<String> {
+        let status_filter = p.status.as_deref();
+        let project_filter = p.project.as_deref();
+        let name_filter = p.name.as_deref();
+        let stale_days = p.stale_days;
+        let include_resolved = p.include_resolved.unwrap_or(false);
 
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -123,3 +123,7 @@ mod reindex;
 mod search;
 
 pub use reindex::spawn_reindex_thread;
+pub use search::{
+    ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
+    SessionsListParams, TopicsParams,
+};

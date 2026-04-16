@@ -5,8 +5,116 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+
+// ── MCP parameter structs ─────────────────────────────────────────
+//
+// Typed inputs for the bbox_* knowledge tools. Keeping them colocated
+// with the domain methods that consume them means adding a field is a
+// one-file change.
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LearnParams {
+    /// The instruction, fact, or preference
+    pub content: String,
+    /// Entry category
+    pub category: String,
+    /// Short title (auto-generated if omitted)
+    #[serde(default)] pub title: Option<String>,
+    /// global or project (default: global)
+    #[serde(default)] pub scope: Option<String>,
+    /// Project path for project-scoped entries
+    #[serde(default)] pub project: Option<String>,
+    /// Provider filter (empty = all)
+    #[serde(default)] pub providers: Option<Vec<String>>,
+    /// Priority: critical, standard, supplementary
+    #[serde(default)] pub priority: Option<String>,
+    /// Ordering within priority tier
+    #[serde(default)] pub weight: Option<u32>,
+    /// ISO 8601 expiry time
+    #[serde(default)] pub expires_at: Option<String>,
+    /// Update existing entry by ID
+    #[serde(default)] pub id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RememberParams {
+    /// The fact, observation, or note
+    pub content: String,
+    /// Category (default: memory)
+    #[serde(default)] pub category: Option<String>,
+    /// Short title
+    #[serde(default)] pub title: Option<String>,
+    /// global or project (default: global)
+    #[serde(default)] pub scope: Option<String>,
+    /// Project path
+    #[serde(default)] pub project: Option<String>,
+    /// Set false for invariants (default: true)
+    #[serde(default)] pub decay: Option<bool>,
+    /// ISO 8601 date to revisit
+    #[serde(default)] pub review_at: Option<String>,
+    /// ISO 8601 expiry
+    #[serde(default)] pub expires_at: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct KnowledgeListParams {
+    #[serde(default)] pub category: Option<String>,
+    #[serde(default)] pub scope: Option<String>,
+    #[serde(default)] pub project: Option<String>,
+    #[serde(default)] pub provider: Option<String>,
+    #[serde(default)] pub status: Option<String>,
+    #[serde(default)] pub approval: Option<String>,
+    #[serde(default)] pub query: Option<String>,
+    #[serde(default)] pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ForgetParams {
+    /// Entry ID to remove
+    pub id: String,
+    /// Mark as superseded instead of deleted
+    #[serde(default)] pub superseded_by: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RenderParams {
+    /// Render for specific provider or all
+    #[serde(default)] pub provider: Option<String>,
+    /// Project directory path. Required when scope includes "project".
+    #[serde(default)] pub project: Option<String>,
+    /// Which scope to render. "global" surgically patches each provider's
+    /// global-memory file (~/.claude-shared/CLAUDE.md, ~/.codex/AGENTS.md,
+    /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers and
+    /// snapshots the original to ~/.local/state/blackbox/backups/ first.
+    /// "project" writes <project>/{CLAUDE,AGENTS,GEMINI}.md from project-
+    /// scope entries + PROJECT.md only (no global content). "both" runs
+    /// both. Defaults to "both" if `project` is given, else "global".
+    #[serde(default)] pub scope: Option<String>,
+    /// Preview without writing (default: false)
+    #[serde(default)] pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AbsorbParams {
+    /// Project directory path
+    pub project: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ReviewParams {
+    /// list, approve, or reject (default: list)
+    #[serde(default)] pub action: Option<String>,
+    /// Entry ID (required for approve/reject)
+    #[serde(default)] pub id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct BootstrapParams {
+    /// Absolute path to the repo root
+    pub project: String,
+}
 
 // ── Schema ─────────────────────────────────────────────────────────
 
@@ -211,46 +319,17 @@ impl Knowledge {
 
     // ── CRUD ───────────────────────────────────────────────────────
 
-    pub fn learn(&mut self, args: &Value, from_agent: bool) -> Result<String> {
-        let content = args["content"]
-            .as_str()
-            .context("'content' is required")?
-            .to_string();
-        let category_str = args["category"]
-            .as_str()
-            .context("'category' is required")?;
-        let category =
-            Category::from_str(category_str).context("invalid category")?;
-        let title = args["title"]
-            .as_str()
-            .map(String::from)
-            .unwrap_or_else(|| {
-                // Generate title from first ~60 chars of content
-                let t = content.chars().take(60).collect::<String>();
-                if content.len() > 60 {
-                    format!("{}...", t)
-                } else {
-                    t
-                }
-            });
-        let scope = args["scope"].as_str().unwrap_or("global").to_string();
-        let project = args["project"].as_str().map(String::from);
-        let providers: Vec<String> = args["providers"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let priority = match args["priority"].as_str().unwrap_or("standard") {
+    pub fn learn(&mut self, p: &LearnParams, from_agent: bool) -> Result<String> {
+        let category = Category::from_str(&p.category).context("invalid category")?;
+        let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
+        let scope = p.scope.clone().unwrap_or_else(|| "global".to_string());
+        let providers = p.providers.clone().unwrap_or_default();
+        let priority = match p.priority.as_deref().unwrap_or("standard") {
             "critical" => Priority::Critical,
             "supplementary" => Priority::Supplementary,
             _ => Priority::Standard,
         };
-        let weight = args["weight"].as_u64().unwrap_or(100) as u32;
-        let expires_at = args["expires_at"].as_str().map(String::from);
-        let supersedes = args["supersedes"].as_str().map(String::from);
+        let weight = p.weight.unwrap_or(100);
 
         let now = Self::now_iso();
         let approval = if from_agent {
@@ -259,98 +338,50 @@ impl Knowledge {
             Approval::UserConfirmed
         };
 
-        // Update existing or create new
-        if let Some(id) = args["id"].as_str() {
+        // Update existing entry if id given and found
+        if let Some(id) = p.id.as_deref() {
             if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
-                entry.content = content;
+                entry.content = p.content.clone();
                 entry.title = title;
                 entry.category = category;
                 entry.priority = priority;
                 entry.weight = weight;
                 entry.providers = providers;
                 entry.updated_at = now;
-                if let Some(exp) = expires_at {
+                if let Some(exp) = p.expires_at.clone() {
                     entry.expires_at = Some(exp);
                 }
-                // Apply optional fields when explicitly provided
-                if args.get("scope").is_some() {
-                    entry.scope = args["scope"].as_str().unwrap_or("global").to_string();
+                if let Some(s) = p.scope.clone() {
+                    entry.scope = s;
                 }
-                if args.get("project").is_some() {
-                    entry.project = args["project"].as_str().map(String::from);
+                if let Some(proj) = p.project.clone() {
+                    entry.project = Some(proj);
                 }
-                if args.get("decay").is_some() {
-                    entry.decay = args["decay"].as_bool().unwrap_or(true);
-                }
-                if args.get("render").is_some() {
-                    entry.render = args["render"].as_bool().unwrap_or(true);
-                }
-                if args.get("review_at").is_some() {
-                    entry.review_at = args["review_at"].as_str().map(String::from);
-                }
-                if let Some(ref sup_id) = supersedes {
-                    entry.supersedes = Some(sup_id.clone());
-                }
-                let sup_target = supersedes.clone();
                 self.save()?;
-                // Supersede the old entry outside the mutable borrow
-                if let Some(sup_id) = sup_target {
-                    if let Some(old) = self.store.entries.iter_mut().find(|e| e.id == sup_id) {
-                        old.status = Status::Superseded;
-                        old.updated_at = Self::now_iso();
-                    }
-                    self.save()?;
-                }
-                return Ok(format!("Updated entry {}", id));
-            }
-        }
-
-        // Mark superseded entry
-        if let Some(ref sup_id) = supersedes {
-            if let Some(old) = self.store.entries.iter_mut().find(|e| e.id == *sup_id) {
-                old.status = Status::Superseded;
+                return Ok(format!("Updated entry {id}"));
             }
         }
 
         let id = Self::gen_id();
-        let variants: HashMap<String, String> = args["variants"]
-            .as_object()
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let decay = args["decay"].as_bool().unwrap_or(true);
-        let review_at = args["review_at"].as_str().map(String::from);
-
         let entry = KnowledgeEntry {
             id: id.clone(),
             title,
-            content,
-            variants,
+            content: p.content.clone(),
+            variants: HashMap::new(),
             category,
             scope,
-            project,
+            project: p.project.clone(),
             providers,
             priority,
             weight,
             render: true,
-            decay,
-            review_at,
+            decay: true,
+            review_at: None,
             status: Status::Active,
             approval,
-            supersedes,
-            expires_at,
-            source: if from_agent {
-                args["source"]
-                    .as_str()
-                    .unwrap_or("agent")
-                    .to_string()
-            } else {
-                "user".to_string()
-            },
+            supersedes: None,
+            expires_at: p.expires_at.clone(),
+            source: if from_agent { "agent".to_string() } else { "user".to_string() },
             created_at: now.clone(),
             updated_at: now,
             recall_count: 0,
@@ -359,40 +390,19 @@ impl Knowledge {
 
         self.store.entries.push(entry);
         self.save()?;
-        Ok(format!("Created entry {}", id))
+        Ok(format!("Created entry {id}"))
     }
 
-    /// Internal learn — used by absorption. No render trigger.
-    pub fn learn_internal(&mut self, args: &Value) -> Result<String> {
-        // Same as learn but always marks as imported
-        let mut args = args.clone();
-        if let Some(obj) = args.as_object_mut() {
-            obj.insert(
-                "source".to_string(),
-                serde_json::json!("imported"),
-            );
-        }
-        // Use the learn path but flag as imported
-        let content = args["content"]
-            .as_str()
-            .context("'content' is required")?
-            .to_string();
-        let category_str = args["category"]
-            .as_str()
-            .unwrap_or("memory");
-        let category =
-            Category::from_str(category_str).unwrap_or(Category::Memory);
-        let title = args["title"]
-            .as_str()
-            .map(String::from)
-            .unwrap_or_else(|| {
-                let t = content.chars().take(60).collect::<String>();
-                if content.len() > 60 {
-                    format!("{}...", t)
-                } else {
-                    t
-                }
-            });
+    /// Import a knowledge entry from external content. Used by absorb().
+    /// Always creates an Imported-approval entry; never updates in place.
+    fn import_entry(
+        &mut self,
+        content: String,
+        category: Category,
+        scope: String,
+        project: Option<String>,
+    ) -> Result<String> {
+        let title = derive_title(&content);
         let now = Self::now_iso();
         let id = Self::gen_id();
 
@@ -402,8 +412,8 @@ impl Knowledge {
             content,
             variants: HashMap::new(),
             category,
-            scope: args["scope"].as_str().unwrap_or("project").to_string(),
-            project: args["project"].as_str().map(String::from),
+            scope,
+            project,
             providers: Vec::new(),
             priority: Priority::Standard,
             weight: 100,
@@ -422,28 +432,15 @@ impl Knowledge {
         });
 
         self.save()?;
-        Ok(format!("Imported entry {}", id))
+        Ok(format!("Imported entry {id}"))
     }
 
     /// Remember — store for on-demand recall only, never rendered into markdown.
-    pub fn remember(&mut self, args: &Value, from_agent: bool) -> Result<String> {
-        let content = args["content"]
-            .as_str()
-            .context("'content' is required")?
-            .to_string();
-        let category_str = args["category"].as_str().unwrap_or("memory");
+    pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
+        let category_str = p.category.as_deref().unwrap_or("memory");
         let category = Category::from_str(category_str).unwrap_or(Category::Memory);
-        let title = args["title"]
-            .as_str()
-            .map(String::from)
-            .unwrap_or_else(|| {
-                let t = content.chars().take(60).collect::<String>();
-                if content.len() > 60 { format!("{}...", t) } else { t }
-            });
-        let scope = args["scope"].as_str().unwrap_or("global").to_string();
-        let project = args["project"].as_str().map(String::from);
-        let decay = args["decay"].as_bool().unwrap_or(true);
-        let review_at = args["review_at"].as_str().map(String::from);
+        let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
+        let scope = p.scope.clone().unwrap_or_else(|| "global".to_string());
 
         let now = Self::now_iso();
         let id = Self::gen_id();
@@ -451,21 +448,21 @@ impl Knowledge {
         self.store.entries.push(KnowledgeEntry {
             id: id.clone(),
             title,
-            content,
+            content: p.content.clone(),
             variants: HashMap::new(),
             category,
             scope,
-            project,
+            project: p.project.clone(),
             providers: Vec::new(),
             priority: Priority::Standard,
             weight: 100,
             render: false,
-            decay,
-            review_at,
+            decay: p.decay.unwrap_or(true),
+            review_at: p.review_at.clone(),
             status: Status::Active,
             approval: if from_agent { Approval::AgentInferred } else { Approval::UserConfirmed },
             supersedes: None,
-            expires_at: args["expires_at"].as_str().map(String::from),
+            expires_at: p.expires_at.clone(),
             source: if from_agent { "agent".to_string() } else { "user".to_string() },
             created_at: now.clone(),
             updated_at: now,
@@ -474,15 +471,14 @@ impl Knowledge {
         });
 
         self.save()?;
-        Ok(format!("Remembered entry {} (indexed only, not rendered)", id))
+        Ok(format!("Remembered entry {id} (indexed only, not rendered)"))
     }
 
-    pub fn forget(&mut self, args: &Value) -> Result<String> {
-        let id = args["id"].as_str().context("'id' is required")?;
-        let superseded_by = args["superseded_by"].as_str();
+    pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
+        let id = &p.id;
 
-        if let Some(entry) = self.store.entries.iter_mut().find(|e| e.id == id) {
-            if let Some(by) = superseded_by {
+        if let Some(entry) = self.store.entries.iter_mut().find(|e| &e.id == id) {
+            if let Some(by) = p.superseded_by.as_deref() {
                 entry.status = Status::Superseded;
                 entry.supersedes = Some(by.to_string());
             } else {
@@ -490,21 +486,21 @@ impl Knowledge {
             }
             entry.updated_at = Self::now_iso();
             self.save()?;
-            Ok(format!("Removed entry {}", id))
+            Ok(format!("Removed entry {id}"))
         } else {
-            Ok(format!("Entry {} not found", id))
+            Ok(format!("Entry {id} not found"))
         }
     }
 
-    pub fn list(&mut self, args: &Value) -> Result<String> {
-        let category_filter = args["category"].as_str();
-        let scope_filter = args["scope"].as_str();
-        let project_filter = args["project"].as_str();
-        let provider_filter = args["provider"].as_str();
-        let status_filter = args["status"].as_str().unwrap_or("active");
-        let approval_filter = args["approval"].as_str();
-        let query = args["query"].as_str();
-        let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+    pub fn list(&mut self, p: &KnowledgeListParams) -> Result<String> {
+        let category_filter = p.category.as_deref();
+        let scope_filter = p.scope.as_deref();
+        let project_filter = p.project.as_deref();
+        let provider_filter = p.provider.as_deref();
+        let status_filter = p.status.as_deref().unwrap_or("active");
+        let approval_filter = p.approval.as_deref();
+        let query = p.query.as_deref();
+        let limit = p.limit.unwrap_or(50) as usize;
 
         let mut results: Vec<&KnowledgeEntry> = self
             .store
@@ -638,12 +634,11 @@ impl Knowledge {
 
     // ── Render ─────────────────────────────────────────────────────
 
-    pub fn render(&self, args: &Value) -> Result<String> {
-        let provider = args["provider"].as_str();
-        let project_dir = args["project"].as_str();
-        let dry_run = args["dry_run"].as_bool().unwrap_or(false);
-        let scope_arg = args["scope"]
-            .as_str()
+    pub fn render(&self, p: &RenderParams) -> Result<String> {
+        let provider = p.provider.as_deref();
+        let project_dir = p.project.as_deref();
+        let dry_run = p.dry_run.unwrap_or(false);
+        let scope_arg = p.scope.as_deref()
             .unwrap_or(if project_dir.is_some() { "both" } else { "global" });
 
         let do_global = matches!(scope_arg, "global" | "both");
@@ -864,10 +859,8 @@ impl Knowledge {
 
     // ── Absorb ─────────────────────────────────────────────────────
 
-    pub fn absorb(&mut self, args: &Value) -> Result<String> {
-        let project_dir = args["project"]
-            .as_str()
-            .context("'project' is required for absorption")?;
+    pub fn absorb(&mut self, p: &AbsorbParams) -> Result<String> {
+        let project_dir = p.project.as_str();
 
         let files = vec![
             ("CLAUDE.md", "claude"),
@@ -926,13 +919,12 @@ impl Knowledge {
                     continue;
                 }
 
-                let entry_args = serde_json::json!({
-                    "content": section.trim(),
-                    "category": "memory",
-                    "scope": "project",
-                    "project": project_dir,
-                });
-                self.learn_internal(&entry_args)?;
+                self.import_entry(
+                    section.trim().to_string(),
+                    Category::Memory,
+                    "project".to_string(),
+                    Some(project_dir.to_string()),
+                )?;
                 absorbed += 1;
             }
         }
@@ -1056,11 +1048,11 @@ impl Knowledge {
 
     // ── Review ─────────────────────────────────────────────────────
 
-    pub fn review(&mut self, args: &Value) -> Result<String> {
-        let action = args["action"].as_str(); // "list", "approve", "reject"
-        let id = args["id"].as_str();
+    pub fn review(&mut self, p: &ReviewParams) -> Result<String> {
+        let action = p.action.as_deref().unwrap_or("list");
+        let id = p.id.as_deref();
 
-        match action.unwrap_or("list") {
+        match action {
             "list" => {
                 let unverified: Vec<&KnowledgeEntry> = self
                     .store
@@ -1121,6 +1113,17 @@ impl Knowledge {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+/// Derive a short display title from entry content: first ~60 chars,
+/// truncated at a UTF-8 boundary, with an ellipsis when we had to cut.
+fn derive_title(content: &str) -> String {
+    let t: String = content.chars().take(60).collect();
+    if content.len() > t.len() {
+        format!("{t}...")
+    } else {
+        t
+    }
+}
 
 fn entry_visible_to(entry: &KnowledgeEntry, provider: &str) -> bool {
     if entry.providers.is_empty() {
@@ -1267,13 +1270,11 @@ const BOOTSTRAP_CANDIDATES: &[&str] = &[
 impl Knowledge {
     /// Bootstrap: scan a project for existing instruction files and return their
     /// contents for the agent to decompose into PROJECT.md + knowledge entries.
-    pub fn bootstrap(&self, args: &Value) -> Result<String> {
-        let project_dir = args["project"]
-            .as_str()
-            .context("'project' is required — absolute path to the repo root")?;
+    pub fn bootstrap(&self, p: &BootstrapParams) -> Result<String> {
+        let project_dir = p.project.as_str();
         let dir = Path::new(project_dir);
         if !dir.exists() {
-            anyhow::bail!("project directory does not exist: {}", project_dir);
+            anyhow::bail!("project directory does not exist: {project_dir}");
         }
 
         let mut out = String::new();
