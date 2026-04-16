@@ -103,6 +103,39 @@ pub fn find_session_file(
         }
     }
 
+    // Copilot layout: ~/.copilot/session-state/<full-session-id>/events.jsonl
+    // Directory name IS the full session UUID.
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home
+            .join(".copilot")
+            .join("session-state")
+            .join(session_id)
+            .join("events.jsonl");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // Vibe layout: ~/.vibe/logs/session/session_<date>_<time>_<first8>/messages.jsonl
+    if let Some(home) = dirs::home_dir() {
+        let vibe_root = home.join(".vibe").join("logs").join("session");
+        if vibe_root.exists() && session_id.len() >= 8 {
+            let prefix = &session_id[..8];
+            let needle = format!("_{prefix}");
+            if let Ok(entries) = std::fs::read_dir(&vibe_root) {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("session_") && name.ends_with(&needle) {
+                        let msg_file = entry.path().join("messages.jsonl");
+                        if msg_file.exists() {
+                            return Some(msg_file);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     None
 }
 

@@ -23,8 +23,9 @@ use serde::Deserialize;
 #[path = "parser.rs"]
 mod parser;
 use parser::{
-    parse_codex_line_rich, parse_gemini_file_rich, parse_transcript_line_rich, EventDetail,
-    MessageRole, SystemSignalKind, TranscriptEvent,
+    parse_codex_line_rich, parse_copilot_line_rich, parse_gemini_file_rich,
+    parse_transcript_line_rich, parse_vibe_line_rich, EventDetail, MessageRole,
+    SystemSignalKind, TranscriptEvent,
 };
 
 // ── Roster fetch ────────────────────────────────────────────────────
@@ -181,10 +182,12 @@ impl Lane {
     }
 
     fn parse_jsonl_line(&self, line: &str) -> Vec<TranscriptEvent> {
-        if self.provider == "codex" {
-            parse_codex_line_rich(line, self.session_id.as_deref().unwrap_or(""))
-        } else {
-            parse_transcript_line_rich(line)
+        let sid = self.session_id.as_deref().unwrap_or("");
+        match self.provider.as_str() {
+            "codex" => parse_codex_line_rich(line, sid),
+            "copilot" => parse_copilot_line_rich(line, sid),
+            "vibe" => parse_vibe_line_rich(line, sid),
+            _ => parse_transcript_line_rich(line),
         }
     }
 
@@ -557,9 +560,23 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
     let body_h = body_area.height;
     let all_lines = render_events(&lane.events);
     let paragraph_all = Paragraph::new(all_lines).wrap(Wrap { trim: false });
-    let wrapped_total = paragraph_all.line_count(body_area.width) as u16;
-    let max_scroll = wrapped_total.saturating_sub(body_h);
-    // Clamp user's scroll request to actual scrollable range.
+    let wrapped_total = paragraph_all.line_count(body_area.width);
+    // Anchor preservation: when the user is scrolled up and new events
+    // have landed since the last draw, bump scroll_from_bottom by the
+    // wrapped-line delta so the visible content stays fixed in place.
+    // Width changes can still cause small jumps (wrap density shifts);
+    // that's rare enough to accept.
+    if lane.scroll_from_bottom > 0
+        && lane.cached_total_lines > 0
+        && wrapped_total > lane.cached_total_lines
+    {
+        let delta = wrapped_total - lane.cached_total_lines;
+        lane.scroll_from_bottom = lane.scroll_from_bottom.saturating_add(delta);
+    }
+    lane.cached_total_lines = wrapped_total;
+
+    let wrapped_total_u = wrapped_total as u16;
+    let max_scroll = wrapped_total_u.saturating_sub(body_h);
     let requested = lane.scroll_from_bottom.min(max_scroll as usize) as u16;
     lane.scroll_from_bottom = requested as usize;
     let scroll_y = max_scroll.saturating_sub(requested);

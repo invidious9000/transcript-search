@@ -536,6 +536,243 @@ fn parse_codex_content_rich(
     out
 }
 
+// ── Rich parser: Copilot events JSONL ───────────────────────────────
+
+/// Parse one line of `~/.copilot/session-state/<id>/events.jsonl`.
+/// Event shape: `{type, data, id, timestamp, parentId}` with types like
+/// `session.start`, `user.message`, `assistant.message`,
+/// `tool.execution_start`, `tool.execution_complete`, etc.
+pub fn parse_copilot_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent> {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let event_type = match v["type"].as_str() {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let timestamp = v["timestamp"].as_str().map(String::from);
+    let data = &v["data"];
+    let base = RichBase {
+        session_id: session_id.into(),
+        timestamp,
+        git_branch: None,
+        is_subagent: false,
+        agent_slug: None,
+        cwd: None,
+        parent_tool_use_id: v["parentId"].as_str().map(String::from),
+    };
+    match event_type {
+        "session.start" => {
+            let model = data["model"].as_str().unwrap_or("?");
+            let cwd = data["cwd"].as_str().unwrap_or("?");
+            vec![make_rich(
+                MessageRole::Developer,
+                EventDetail::SystemSignal {
+                    kind: SystemSignalKind::SessionInit,
+                    summary: format!("copilot session: {model} in {cwd}"),
+                },
+                &base,
+            )]
+        }
+        "session.model_change" => {
+            let from = data["fromModel"].as_str().unwrap_or("?");
+            let to = data["toModel"].as_str().unwrap_or("?");
+            vec![make_rich(
+                MessageRole::Developer,
+                EventDetail::SystemSignal {
+                    kind: SystemSignalKind::Other,
+                    summary: format!("model: {from} → {to}"),
+                },
+                &base,
+            )]
+        }
+        "user.message" => {
+            let content = data["content"].as_str().unwrap_or("");
+            if content.is_empty() {
+                return vec![];
+            }
+            if let Some(kind) = detect_user_signal(content) {
+                return vec![make_rich(
+                    MessageRole::User,
+                    EventDetail::SystemSignal { kind, summary: content.into() },
+                    &base,
+                )];
+            }
+            vec![make_rich(MessageRole::User, EventDetail::Text { text: content.into() }, &base)]
+        }
+        "assistant.message" => {
+            let mut out = Vec::new();
+            if let Some(r) = data["reasoningText"].as_str() {
+                if !r.is_empty() {
+                    out.push(make_rich(
+                        MessageRole::Thinking,
+                        EventDetail::Thinking { text: r.into() },
+                        &base,
+                    ));
+                }
+            }
+            let content = data["content"].as_str().unwrap_or("");
+            if !content.is_empty() {
+                out.push(make_rich(
+                    MessageRole::Assistant,
+                    EventDetail::Text { text: content.into() },
+                    &base,
+                ));
+            }
+            out
+        }
+        "tool.execution_start" => {
+            let name = data["toolName"].as_str().unwrap_or("unknown").to_string();
+            let tool_use_id = data["toolCallId"].as_str().map(String::from);
+            let input = data["arguments"].clone();
+            let target = extract_tool_target(&name, &input);
+            vec![make_rich(
+                MessageRole::ToolUse,
+                EventDetail::ToolUse { name, target, tool_use_id, input },
+                &base,
+            )]
+        }
+        "tool.execution_complete" => {
+            let tool_use_id = data["toolCallId"].as_str().unwrap_or("?").to_string();
+            let success = data["success"].as_bool().unwrap_or(true);
+            // result can be string OR { content, detailedContent }
+            let (preview, size) = match &data["result"] {
+                Value::String(s) => (oneline_snippet(s, 200), s.len()),
+                Value::Object(_) => {
+                    let s = data["result"]["content"].as_str().unwrap_or("");
+                    (oneline_snippet(s, 200), s.len())
+                }
+                _ => (String::new(), 0),
+            };
+            vec![make_rich(
+                MessageRole::ToolResult,
+                EventDetail::ToolResult {
+                    tool_use_id,
+                    is_error: !success,
+                    exit_code: None,
+                    size,
+                    preview,
+                },
+                &base,
+            )]
+        }
+        "session.warning" => {
+            let msg = data["message"].as_str().unwrap_or("warning");
+            vec![make_rich(
+                MessageRole::Developer,
+                EventDetail::SystemSignal {
+                    kind: SystemSignalKind::Other,
+                    summary: msg.into(),
+                },
+                &base,
+            )]
+        }
+        _ => vec![], // turn_start / turn_end / shutdown — no display value
+    }
+}
+
+// ── Rich parser: Vibe messages JSONL (OpenAI-style chat shape) ──────
+
+/// Parse one line of `~/.vibe/logs/session/.../messages.jsonl`.
+/// Shape follows OpenAI chat-completion: `{role, content, tool_calls?,
+/// name?, tool_call_id?, injected?, message_id}`.
+pub fn parse_vibe_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent> {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let role = v["role"].as_str().unwrap_or("");
+    let message_id = v["message_id"].as_str().map(String::from);
+    let injected = v["injected"].as_bool().unwrap_or(false);
+    let base = RichBase {
+        session_id: session_id.into(),
+        timestamp: None,
+        git_branch: None,
+        is_subagent: false,
+        agent_slug: None,
+        cwd: None,
+        parent_tool_use_id: message_id,
+    };
+
+    match role {
+        "user" => {
+            let content = v["content"].as_str().unwrap_or("");
+            if content.is_empty() {
+                return vec![];
+            }
+            if injected {
+                return vec![make_rich(
+                    MessageRole::User,
+                    EventDetail::SystemSignal {
+                        kind: SystemSignalKind::SystemReminder,
+                        summary: content.into(),
+                    },
+                    &base,
+                )];
+            }
+            if let Some(kind) = detect_user_signal(content) {
+                return vec![make_rich(
+                    MessageRole::User,
+                    EventDetail::SystemSignal { kind, summary: content.into() },
+                    &base,
+                )];
+            }
+            vec![make_rich(MessageRole::User, EventDetail::Text { text: content.into() }, &base)]
+        }
+        "assistant" => {
+            let mut out = Vec::new();
+            let content = v["content"].as_str().unwrap_or("");
+            if !content.is_empty() {
+                out.push(make_rich(
+                    MessageRole::Assistant,
+                    EventDetail::Text { text: content.into() },
+                    &base,
+                ));
+            }
+            if let Some(calls) = v["tool_calls"].as_array() {
+                for call in calls {
+                    let name = call["function"]["name"].as_str().unwrap_or("unknown").to_string();
+                    let tool_use_id = call["id"].as_str().map(String::from);
+                    let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
+                    let input: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
+                    let target = extract_tool_target(&name, &input);
+                    out.push(make_rich(
+                        MessageRole::ToolUse,
+                        EventDetail::ToolUse { name, target, tool_use_id, input },
+                        &base,
+                    ));
+                }
+            }
+            out
+        }
+        "tool" => {
+            let tool_use_id = v["tool_call_id"].as_str().unwrap_or("?").to_string();
+            let content = v["content"].as_str().unwrap_or("");
+            let size = content.len();
+            let preview = oneline_snippet(content, 200);
+            let exit_code = extract_exit_code(content);
+            // Vibe doesn't carry an explicit is_error flag — infer from common
+            // failure words; conservative default is success.
+            let lower = content.to_ascii_lowercase();
+            let is_error = lower.starts_with("error") || lower.contains("traceback")
+                || lower.starts_with("failed");
+            vec![make_rich(
+                MessageRole::ToolResult,
+                EventDetail::ToolResult {
+                    tool_use_id,
+                    is_error,
+                    exit_code,
+                    size,
+                    preview,
+                },
+                &base,
+            )]
+        }
+        _ => vec![],
+    }
+}
+
 // ── Rich parser: Gemini chat JSON (single-object, not JSONL) ────────
 
 /// Parse a full Gemini chat-session JSON file. Gemini stores sessions as
@@ -969,6 +1206,161 @@ fn truncate(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── Rich parser sanity ──────────────────────────────────────────
+
+    #[test]
+    fn test_rich_claude_tool_use_has_target() {
+        let line = json!({
+            "type": "assistant",
+            "sessionId": "s1",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Bash",
+                      "input": { "command": "git status --short" } }
+                ]
+            }
+        }).to_string();
+        let events = parse_transcript_line_rich(&line);
+        assert_eq!(events.len(), 1);
+        match &events[0].detail {
+            EventDetail::ToolUse { name, target, .. } => {
+                assert_eq!(name, "Bash");
+                assert_eq!(target, "git status --short");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_rich_claude_system_reminder_detected() {
+        let line = json!({
+            "type": "user",
+            "sessionId": "s1",
+            "message": { "role": "user",
+                "content": "<system-reminder>reset</system-reminder>" }
+        }).to_string();
+        let events = parse_transcript_line_rich(&line);
+        assert!(matches!(
+            events[0].detail,
+            EventDetail::SystemSignal { kind: SystemSignalKind::SystemReminder, .. }
+        ));
+    }
+
+    #[test]
+    fn test_rich_copilot_tool_execution() {
+        let line = json!({
+            "type": "tool.execution_start",
+            "timestamp": "2026-04-16T20:00:00Z",
+            "data": {
+                "toolCallId": "call_1",
+                "toolName": "Bash",
+                "arguments": { "command": "ls" }
+            }
+        }).to_string();
+        let events = parse_copilot_line_rich(&line, "sess-cop-1");
+        assert_eq!(events.len(), 1);
+        match &events[0].detail {
+            EventDetail::ToolUse { name, target, tool_use_id, .. } => {
+                assert_eq!(name, "Bash");
+                assert_eq!(target, "ls");
+                assert_eq!(tool_use_id.as_deref(), Some("call_1"));
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_rich_copilot_tool_complete_failure() {
+        let line = json!({
+            "type": "tool.execution_complete",
+            "data": {
+                "toolCallId": "call_1",
+                "success": false,
+                "result": { "content": "permission denied", "detailedContent": "x" }
+            }
+        }).to_string();
+        let events = parse_copilot_line_rich(&line, "s");
+        match &events[0].detail {
+            EventDetail::ToolResult { is_error, preview, .. } => {
+                assert!(*is_error);
+                assert_eq!(preview, "permission denied");
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_rich_vibe_assistant_with_tool_calls() {
+        let line = json!({
+            "role": "assistant",
+            "content": "Calling shell",
+            "message_id": "m1",
+            "tool_calls": [{
+                "id": "call_1",
+                "function": {
+                    "name": "shell",
+                    "arguments": "{\"command\": \"echo hi\"}"
+                }
+            }]
+        }).to_string();
+        let events = parse_vibe_line_rich(&line, "sess-vibe-1");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].detail, EventDetail::Text { .. }));
+        match &events[1].detail {
+            EventDetail::ToolUse { name, target, .. } => {
+                assert_eq!(name, "shell");
+                assert_eq!(target, "echo hi");
+            }
+            _ => panic!("expected ToolUse"),
+        }
+    }
+
+    #[test]
+    fn test_rich_vibe_tool_result_error_inference() {
+        let line = json!({
+            "role": "tool",
+            "content": "Error: something broke",
+            "tool_call_id": "call_1",
+            "name": "shell"
+        }).to_string();
+        let events = parse_vibe_line_rich(&line, "s");
+        match &events[0].detail {
+            EventDetail::ToolResult { is_error, .. } => assert!(*is_error),
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn test_rich_gemini_thoughts_to_thinking() {
+        let raw = json!({
+            "sessionId": "g1",
+            "messages": [
+                {
+                    "id": "m1",
+                    "timestamp": "t",
+                    "type": "gemini",
+                    "content": "final answer",
+                    "thoughts": [
+                        {"subject": "Step 1", "description": "Considering options"}
+                    ]
+                }
+            ]
+        }).to_string();
+        let events = parse_gemini_file_rich(&raw);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].detail, EventDetail::Thinking { .. }));
+        assert!(matches!(events[1].detail, EventDetail::Text { .. }));
+    }
+
+    #[test]
+    fn test_extract_tool_target_fallback() {
+        let v = json!({ "some_random_field": "meaningful value" });
+        assert_eq!(extract_tool_target("UnknownTool", &v), "meaningful value");
+    }
+
+    // ── Legacy ParsedEvent parser tests ─────────────────────────────
 
     #[test]
     fn test_parse_user_string_message() {
