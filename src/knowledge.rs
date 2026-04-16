@@ -675,25 +675,32 @@ impl Knowledge {
                 let plan = crate::render::plan_managed_patch(&target, &body)?;
 
                 if dry_run {
-                    use crate::render::PatchOutcome;
-                    let before_label = match plan.outcome {
-                        PatchOutcome::Created => "--- no existing file ---",
-                        PatchOutcome::Appended => "--- existing file (will be preserved, managed region appended) ---",
-                        PatchOutcome::Replaced => "--- existing managed region (will be replaced) ---",
-                        PatchOutcome::Unchanged => "--- existing managed region (identical, no change) ---",
-                    };
-                    let after_label = match plan.outcome {
-                        PatchOutcome::Unchanged => "--- no change ---",
-                        PatchOutcome::Appended => "--- managed region to append ---",
-                        _ => "--- proposed managed region ---",
+                    use crate::render::PatchPlan;
+                    let (before_label, after_label) = match &plan {
+                        PatchPlan::Create { .. } => (
+                            "--- no existing file ---",
+                            "--- proposed managed region ---",
+                        ),
+                        PatchPlan::Append { .. } => (
+                            "--- existing file (will be preserved, managed region appended) ---",
+                            "--- managed region to append ---",
+                        ),
+                        PatchPlan::Replace { .. } => (
+                            "--- existing managed region (will be replaced) ---",
+                            "--- proposed managed region ---",
+                        ),
+                        PatchPlan::Unchanged { .. } => (
+                            "--- existing managed region (identical, no change) ---",
+                            "--- no change ---",
+                        ),
                     };
                     results.push(format!(
                         "[DRY-RUN] {}\n{}\n{}\n{}\n{}",
                         plan.summary(),
                         before_label,
-                        plan.before.clone().unwrap_or_else(|| "<none>".into()),
+                        plan.before_text().unwrap_or("<none>"),
                         after_label,
-                        plan.after,
+                        plan.managed_block().unwrap_or("<no change>"),
                     ));
                 } else {
                     let backup = crate::render::apply_managed_patch(&plan)?;
