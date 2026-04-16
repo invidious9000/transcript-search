@@ -776,10 +776,14 @@ fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
     // headings — the marker is noise once the heading itself is visibly
     // styled; stripping matches what rendered markdown normally looks
     // like.
-    let line_style = convert_core_style(line.style);
+    let mut line_style = convert_core_style(line.style);
     let mut iter = line.spans.into_iter().peekable();
-    if iter.peek().is_some_and(|s| is_heading_marker_span(&s.content)) {
+    let is_heading = iter.peek().is_some_and(|s| is_heading_marker_span(&s.content));
+    if is_heading {
         let _ = iter.next();
+        // ANSI Cyan is often indistinct under dark terminal themes; add
+        // UNDERLINED so headings read unambiguously regardless of palette.
+        line_style = line_style.add_modifier(Modifier::UNDERLINED);
     }
     let spans: Vec<Span<'static>> = iter
         .map(|s| {
