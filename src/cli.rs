@@ -678,9 +678,9 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ))];
             let md = tui_markdown::from_str(text);
-            for line in md.lines {
-                lines.push(line_into_owned(line));
-            }
+            let owned: Vec<Line<'static>> =
+                md.lines.into_iter().map(line_into_owned).collect();
+            lines.extend(stitch_ordered_list_markers(owned));
             lines
         }
         EventDetail::Thinking { text } => {
@@ -766,12 +766,58 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
 /// ratatui-core's — structurally identical, nominally different — so we
 /// cross the boundary with a field-by-field copy.
 fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
+    // tui-markdown puts heading/list/emphasis styles on `Line.style` with
+    // default-styled spans inside. Relying on ratatui's Paragraph to patch
+    // line-level style into default spans has been flaky in practice, so
+    // we bake the line style into every span's style here — guarantees
+    // the styling survives all the way to the buffer.
+    let line_style = convert_core_style(line.style);
     let spans: Vec<Span<'static>> = line
         .spans
         .into_iter()
-        .map(|s| Span::styled(s.content.into_owned(), convert_core_style(s.style)))
+        .map(|s| {
+            let merged = line_style.patch(convert_core_style(s.style));
+            Span::styled(s.content.into_owned(), merged)
+        })
         .collect();
-    Line::from(spans).style(convert_core_style(line.style))
+    Line::from(spans)
+}
+
+/// True if the line is ONLY a numbered-list marker like "1. ", "42. "
+/// (optional trailing whitespace, no other content). tui-markdown emits
+/// such markers on their own line and puts the content on the next one,
+/// which looks like a bug to the eye.
+fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
+    let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let t = joined.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    let Some(dot_pos) = t.find('.') else { return false };
+    if dot_pos == 0 || dot_pos != t.len() - 1 {
+        return false;
+    }
+    t[..dot_pos].chars().all(|c| c.is_ascii_digit())
+}
+
+/// Merge lines emitted by tui-markdown where an ordered-list marker has
+/// been split from its content: `"1. "` on one line followed by the item
+/// text on the next. Returns the post-processed line vec.
+fn stitch_ordered_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    let mut iter = lines.into_iter().peekable();
+    while let Some(line) = iter.next() {
+        if is_ordered_list_marker_only(&line) {
+            if let Some(next) = iter.next() {
+                let mut spans = line.spans;
+                spans.extend(next.spans);
+                out.push(Line::from(spans));
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    out
 }
 
 fn convert_core_style(s: ratatui_core::style::Style) -> Style {
