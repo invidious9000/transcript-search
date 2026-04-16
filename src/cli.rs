@@ -663,6 +663,10 @@ fn render_events(events: &[TranscriptEvent]) -> Vec<Line<'static>> {
 fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
     match &ev.detail {
         EventDetail::Text { text } => {
+            // In orchestration, "user" is usually another agent sending
+            // markdown (broadcasts, cross-pollination prompts). Render the
+            // body through tui-markdown regardless of role; the prefix
+            // stripe still conveys who authored it.
             let (prefix, color) = match ev.role {
                 MessageRole::User => ("▶ user", Color::Blue),
                 MessageRole::Assistant => ("◀ asst", Color::White),
@@ -673,20 +677,9 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
                 prefix.to_string(),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ))];
-            if matches!(ev.role, MessageRole::Assistant) {
-                // Code-review and executor bros emit markdown-rich output —
-                // render through tui-markdown (syntect on code fences).
-                let md = tui_markdown::from_str(text);
-                for line in md.lines {
-                    lines.push(line_into_owned(line));
-                }
-            } else {
-                for l in text.lines() {
-                    lines.push(Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default().fg(color),
-                    )));
-                }
+            let md = tui_markdown::from_str(text);
+            for line in md.lines {
+                lines.push(line_into_owned(line));
             }
             lines
         }
