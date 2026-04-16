@@ -255,9 +255,18 @@ struct RenderParams {
     /// Render for specific provider or all
     #[serde(default)]
     provider: Option<String>,
-    /// Project directory path
+    /// Project directory path. Required when scope includes "project".
     #[serde(default)]
     project: Option<String>,
+    /// Which scope to render. "global" surgically patches each provider's
+    /// global-memory file (~/.claude-shared/CLAUDE.md, ~/.codex/AGENTS.md,
+    /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers and
+    /// snapshots the original to ~/.local/state/blackbox/backups/ first.
+    /// "project" writes <project>/{CLAUDE,AGENTS,GEMINI}.md from project-
+    /// scope entries + PROJECT.md only (no global content). "both" runs
+    /// both. Defaults to "both" if `project` is given, else "global".
+    #[serde(default)]
+    scope: Option<String>,
     /// Preview without writing (default: false)
     #[serde(default)]
     dry_run: Option<bool>,

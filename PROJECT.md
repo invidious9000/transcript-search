@@ -59,6 +59,46 @@ Maintained in `src/orchestration/providers.rs`:
 - `CLAUDE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` — override provider binary paths
 - `RUST_LOG` — tracing filter (default: `transcript_search=info`)
 
+## Deployment
+
+`blackboxd` is designed to run as a single long-lived user service, not a
+per-session stdio child. It exposes HTTP MCP on `127.0.0.1:${BBOX_PORT:-7264}/mcp`
+so every Claude/Codex/Gemini CLI on the host connects to one daemon with one
+shared knowledge store + tantivy index.
+
+Install template at `deploy/blackbox.service`:
+
+```bash
+cp deploy/blackbox.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now blackbox.service
+```
+
+Upgrades: build, `install -m 755 target/release/blackboxd ~/.claude-shared/bin/`,
+then `systemctl --user restart blackbox`. The `install` is atomic (unlink +
+write) so the running process keeps the old inode until systemd restarts it.
+
+Client config (all point to the same daemon):
+- Claude Code: `mcpServers.blackbox = { type: "http", url: "http://127.0.0.1:7264/mcp" }` in each `~/.claude*/.claude.json`
+- Codex: `[mcp_servers.blackbox] url = "http://127.0.0.1:7264/mcp"` in `~/.codex/config.toml`
+
+## Render Pipeline
+
+`bbox_render` has two scopes:
+
+- **`scope=global`** — surgical patch of each provider's global-memory file
+  (`~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`)
+  between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers.
+  Snapshots the original to `~/.local/state/blackbox/backups/<ISO-ts>/`
+  before writing. RTK `@imports` and user-authored content outside the
+  markers are preserved. Copilot (greedy reader of project files) and Vibe
+  (unsupported) are intentionally skipped — `global_target_path` returns
+  `None` for them.
+- **`scope=project`** — writes `<project>/{CLAUDE,AGENTS,GEMINI}.md` with
+  **only** project-scope entries + verbatim `PROJECT.md` content. No global
+  entries duplicated per project (use `scope=both` if you need first-time
+  install or a re-sync).
+
 ## Design Docs
 
 - `design/knowledge-store.md` — knowledge store v2: layer architecture, absorption, entry schema, rendering pipeline, migration path.

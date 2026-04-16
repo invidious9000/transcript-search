@@ -1,0 +1,20 @@
+[Unit]
+Description=blackbox MCP daemon — transcript search, knowledge store, orchestration
+After=network.target
+# Ensure blackbox starts cleanly — old bro.service occupied port 7263 (now retired).
+
+[Service]
+Type=simple
+ExecStart=/home/invidious/.claude-shared/bin/blackboxd
+Restart=on-failure
+RestartSec=3
+Environment=BBOX_PORT=7264
+Environment=RUST_LOG=transcript_search=info
+# bbox state lives under ~/.claude-shared; working dir is incidental.
+WorkingDirectory=%h
+# Keep stderr/stdout in journald.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
