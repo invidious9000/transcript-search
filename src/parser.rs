@@ -38,6 +38,595 @@ pub struct ParsedEvent {
 
 const MAX_CONTENT_LEN: usize = 12_000;
 
+// ═══════════════════════════════════════════════════════════════════════
+// Rich transcript event model — consumed by the `bro tail` TUI.
+// Indexing stays on ParsedEvent via TranscriptEvent::to_parsed().
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Richer, structured transcript event. Preserves tool-call structure,
+/// thinking/text separation, and out-of-band signals (compaction, hooks,
+/// system-reminders, etc.) that inform *why* the agent is reasoning.
+#[derive(Debug, Clone)]
+pub struct TranscriptEvent {
+    pub role: MessageRole,
+    pub session_id: String,
+    pub timestamp: Option<String>,
+    pub git_branch: Option<String>,
+    pub is_subagent: bool,
+    pub agent_slug: Option<String>,
+    pub cwd: Option<String>,
+    pub parent_tool_use_id: Option<String>,
+    pub detail: EventDetail,
+}
+
+#[derive(Debug, Clone)]
+pub enum EventDetail {
+    Text { text: String },
+    Thinking { text: String },
+    ToolUse {
+        name: String,
+        target: String,
+        tool_use_id: Option<String>,
+        input: Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        is_error: bool,
+        exit_code: Option<i32>,
+        size: usize,
+        preview: String,
+    },
+    SystemSignal {
+        kind: SystemSignalKind,
+        summary: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemSignalKind {
+    SessionInit,
+    SessionResumed,
+    Compaction,
+    HookFired,
+    SystemReminder,
+    PermissionDenied,
+    RateLimitHit,
+    UserCommand,
+    SubagentLaunched,
+    Other,
+}
+
+impl TranscriptEvent {
+    /// Project onto the flat ParsedEvent shape used by the tantivy indexer.
+    /// SystemSignal events are not indexed by default.
+    pub fn to_parsed(&self) -> Option<ParsedEvent> {
+        let content = match &self.detail {
+            EventDetail::Text { text } => truncate(text),
+            EventDetail::Thinking { text } => truncate(text),
+            EventDetail::ToolUse { name, input, .. } => {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                format!("tool:{} {}", name, truncate(&input_str))
+            }
+            EventDetail::ToolResult { tool_use_id, preview, .. } => {
+                format!("result:{} {}", tool_use_id, truncate(preview))
+            }
+            EventDetail::SystemSignal { .. } => return None,
+        };
+        Some(ParsedEvent {
+            role: self.role,
+            content,
+            session_id: self.session_id.clone(),
+            timestamp: self.timestamp.clone(),
+            git_branch: self.git_branch.clone(),
+            is_subagent: self.is_subagent,
+            agent_slug: self.agent_slug.clone(),
+            cwd: self.cwd.clone(),
+        })
+    }
+}
+
+/// Best-effort extraction of a human-readable "what is this tool doing"
+/// string from a tool-use input payload. Per-tool rules fall back to the
+/// first non-empty string-valued field.
+pub fn extract_tool_target(tool_name: &str, input: &Value) -> String {
+    let explicit: Option<&str> = match tool_name {
+        "Bash" | "bash" | "shell" => input.get("command").and_then(|v| v.as_str()),
+        "Read" | "Write" | "Edit" | "read" | "write" | "edit" => {
+            input.get("file_path").and_then(|v| v.as_str())
+        }
+        "NotebookEdit" => input.get("notebook_path").and_then(|v| v.as_str()),
+        "Grep" | "grep" => input.get("pattern").and_then(|v| v.as_str()),
+        "Glob" | "glob" => input.get("pattern").and_then(|v| v.as_str()),
+        "WebFetch" => input.get("url").and_then(|v| v.as_str()),
+        "WebSearch" => input.get("query").and_then(|v| v.as_str()),
+        "Task" | "TaskCreate" => input
+            .get("description")
+            .or_else(|| input.get("subject"))
+            .and_then(|v| v.as_str()),
+        "TaskUpdate" => input.get("taskId").and_then(|v| v.as_str()),
+        "ScheduleWakeup" => input.get("reason").and_then(|v| v.as_str()),
+        "Skill" => input.get("skill").and_then(|v| v.as_str()),
+        "ToolSearch" => input.get("query").and_then(|v| v.as_str()),
+        _ => None,
+    };
+    if let Some(s) = explicit {
+        return oneline_snippet(s, 160);
+    }
+    if let Some(obj) = input.as_object() {
+        for (_k, v) in obj {
+            if let Some(s) = v.as_str() {
+                if !s.is_empty() {
+                    return oneline_snippet(s, 160);
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn oneline_snippet(s: &str, max_chars: usize) -> String {
+    let one = s.replace('\n', " ");
+    let count = one.chars().count();
+    if count <= max_chars {
+        one
+    } else {
+        let mut out: String = one.chars().take(max_chars).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Best-effort exit code extraction from a Bash-style tool result.
+/// Returns None if not present or not parseable.
+fn extract_exit_code(text: &str) -> Option<i32> {
+    // Match "exit code <N>", "exit_code=<N>", "(exit code <N>)"
+    let lower = text.to_ascii_lowercase();
+    let marker = lower.find("exit code").or_else(|| lower.find("exit_code"))?;
+    let rest = &lower[marker..];
+    let digits: String = rest
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit() && *c != '-')
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect();
+    digits.parse().ok()
+}
+
+struct RichBase {
+    session_id: String,
+    timestamp: Option<String>,
+    git_branch: Option<String>,
+    is_subagent: bool,
+    agent_slug: Option<String>,
+    cwd: Option<String>,
+    parent_tool_use_id: Option<String>,
+}
+
+fn make_rich(role: MessageRole, detail: EventDetail, base: &RichBase) -> TranscriptEvent {
+    TranscriptEvent {
+        role,
+        session_id: base.session_id.clone(),
+        timestamp: base.timestamp.clone(),
+        git_branch: base.git_branch.clone(),
+        is_subagent: base.is_subagent,
+        agent_slug: base.agent_slug.clone(),
+        cwd: base.cwd.clone(),
+        parent_tool_use_id: base.parent_tool_use_id.clone(),
+        detail,
+    }
+}
+
+/// Detect steering signals buried inside a "user" text message:
+/// `<system-reminder>` injections and `<command-name>` slash commands.
+fn detect_user_signal(text: &str) -> Option<SystemSignalKind> {
+    if text.contains("<system-reminder>") {
+        return Some(SystemSignalKind::SystemReminder);
+    }
+    if text.contains("<command-name>") || text.contains("<local-command-stdout>") {
+        return Some(SystemSignalKind::UserCommand);
+    }
+    None
+}
+
+// ── Rich parser: Claude Code JSONL ──────────────────────────────────
+
+pub fn parse_transcript_line_rich(line: &str) -> Vec<TranscriptEvent> {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let event_type = match v["type"].as_str() {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let base = RichBase {
+        session_id: v["sessionId"].as_str().unwrap_or("").to_string(),
+        timestamp: v["timestamp"].as_str().map(String::from),
+        git_branch: v["gitBranch"].as_str().map(String::from),
+        is_subagent: v.get("isSidechain").and_then(|x| x.as_bool()).unwrap_or(false)
+            || v.get("agentId").is_some(),
+        agent_slug: v["slug"].as_str().map(String::from),
+        cwd: v["cwd"].as_str().map(String::from),
+        parent_tool_use_id: v["parentUuid"].as_str().map(String::from),
+    };
+    match event_type {
+        "user" => parse_user_message_rich(&v["message"], &base),
+        "assistant" => parse_assistant_message_rich(&v["message"], &base),
+        "system" => parse_system_event_rich(&v, &base),
+        "summary" => vec![make_rich(
+            MessageRole::Developer,
+            EventDetail::SystemSignal {
+                kind: SystemSignalKind::Compaction,
+                summary: v["summary"].as_str().unwrap_or("context compacted").to_string(),
+            },
+            &base,
+        )],
+        _ => vec![],
+    }
+}
+
+fn parse_user_message_rich(message: &Value, base: &RichBase) -> Vec<TranscriptEvent> {
+    match &message["content"] {
+        Value::String(s) if !s.is_empty() => {
+            if let Some(kind) = detect_user_signal(s) {
+                return vec![make_rich(
+                    MessageRole::User,
+                    EventDetail::SystemSignal { kind, summary: s.clone() },
+                    base,
+                )];
+            }
+            vec![make_rich(MessageRole::User, EventDetail::Text { text: s.clone() }, base)]
+        }
+        Value::Array(blocks) => {
+            let mut out = Vec::new();
+            for block in blocks {
+                match block["type"].as_str() {
+                    Some("text") => {
+                        if let Some(text) = block["text"].as_str() {
+                            if !text.is_empty() {
+                                if let Some(kind) = detect_user_signal(text) {
+                                    out.push(make_rich(
+                                        MessageRole::User,
+                                        EventDetail::SystemSignal { kind, summary: text.into() },
+                                        base,
+                                    ));
+                                } else {
+                                    out.push(make_rich(
+                                        MessageRole::User,
+                                        EventDetail::Text { text: text.into() },
+                                        base,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    Some("tool_result") => {
+                        let tool_use_id = block["tool_use_id"].as_str().unwrap_or("?").to_string();
+                        let is_error = block["is_error"].as_bool().unwrap_or(false);
+                        let text = extract_tool_result_text(block).unwrap_or_default();
+                        let size = text.len();
+                        let preview = oneline_snippet(&text, 200);
+                        let exit_code = extract_exit_code(&text);
+                        out.push(make_rich(
+                            MessageRole::ToolResult,
+                            EventDetail::ToolResult {
+                                tool_use_id, is_error, exit_code, size, preview,
+                            },
+                            base,
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            out
+        }
+        _ => vec![],
+    }
+}
+
+fn parse_assistant_message_rich(message: &Value, base: &RichBase) -> Vec<TranscriptEvent> {
+    let blocks = match message["content"].as_array() {
+        Some(b) => b,
+        None => return vec![],
+    };
+    let mut out = Vec::new();
+    for block in blocks {
+        let block_type = match block["type"].as_str() {
+            Some(t) => t,
+            None => continue,
+        };
+        match block_type {
+            "text" => {
+                if let Some(text) = block["text"].as_str() {
+                    if !text.is_empty() {
+                        out.push(make_rich(
+                            MessageRole::Assistant,
+                            EventDetail::Text { text: text.into() },
+                            base,
+                        ));
+                    }
+                }
+            }
+            "thinking" => {
+                if let Some(t) = block["thinking"].as_str() {
+                    if !t.is_empty() {
+                        out.push(make_rich(
+                            MessageRole::Thinking,
+                            EventDetail::Thinking { text: t.into() },
+                            base,
+                        ));
+                    }
+                }
+            }
+            "tool_use" => {
+                let name = block["name"].as_str().unwrap_or("unknown").to_string();
+                let tool_use_id = block["id"].as_str().map(String::from);
+                let input = block["input"].clone();
+                let target = extract_tool_target(&name, &input);
+                out.push(make_rich(
+                    MessageRole::ToolUse,
+                    EventDetail::ToolUse { name, target, tool_use_id, input },
+                    base,
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn parse_system_event_rich(v: &Value, base: &RichBase) -> Vec<TranscriptEvent> {
+    let subtype = v["subtype"].as_str().unwrap_or("");
+    match subtype {
+        "init" => {
+            let model = v["model"].as_str().unwrap_or("?");
+            let cwd = v["cwd"].as_str().unwrap_or("?");
+            let tools = v["tools"].as_array().map(|a| a.len()).unwrap_or(0);
+            vec![make_rich(
+                MessageRole::Developer,
+                EventDetail::SystemSignal {
+                    kind: SystemSignalKind::SessionInit,
+                    summary: format!("session init: {model} in {cwd} ({tools} tools)"),
+                },
+                base,
+            )]
+        }
+        "hook_started" | "hook_response" => {
+            let hook = v["hook_name"].as_str().unwrap_or("?");
+            let outcome = v["outcome"].as_str().unwrap_or("");
+            let summary = if outcome.is_empty() {
+                format!("hook {subtype}: {hook}")
+            } else {
+                format!("hook {hook}: {outcome}")
+            };
+            vec![make_rich(
+                MessageRole::Developer,
+                EventDetail::SystemSignal { kind: SystemSignalKind::HookFired, summary },
+                base,
+            )]
+        }
+        _ => vec![],
+    }
+}
+
+// ── Rich parser: Codex CLI JSONL ────────────────────────────────────
+
+pub fn parse_codex_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent> {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let event_type = match v["type"].as_str() {
+        Some(t) => t,
+        None => return vec![],
+    };
+    let timestamp = v["timestamp"].as_str().map(String::from);
+
+    match event_type {
+        "session_meta" => {
+            let cwd = v["payload"]["cwd"].as_str().map(String::from);
+            let model = v["payload"]["model"].as_str().unwrap_or("?");
+            let base = RichBase {
+                session_id: session_id.into(), timestamp,
+                git_branch: None, is_subagent: false, agent_slug: None, cwd,
+                parent_tool_use_id: None,
+            };
+            vec![make_rich(
+                MessageRole::Developer,
+                EventDetail::SystemSignal {
+                    kind: SystemSignalKind::SessionInit,
+                    summary: format!("codex session: {model}"),
+                },
+                &base,
+            )]
+        }
+        "response_item" => {
+            let payload = &v["payload"];
+            let role = payload["role"].as_str().unwrap_or("");
+            let base = RichBase {
+                session_id: session_id.into(), timestamp,
+                git_branch: None, is_subagent: false, agent_slug: None, cwd: None,
+                parent_tool_use_id: None,
+            };
+            match role {
+                "user" => parse_codex_content_rich(payload, MessageRole::User, &base),
+                "assistant" => parse_codex_content_rich(payload, MessageRole::Assistant, &base),
+                "developer" => parse_codex_content_rich(payload, MessageRole::Developer, &base),
+                _ => vec![],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+fn parse_codex_content_rich(
+    payload: &Value,
+    role: MessageRole,
+    base: &RichBase,
+) -> Vec<TranscriptEvent> {
+    let content = match payload["content"].as_array() {
+        Some(c) => c,
+        None => {
+            if let Some(s) = payload["content"].as_str() {
+                if !s.is_empty() {
+                    return vec![make_rich(role, EventDetail::Text { text: s.into() }, base)];
+                }
+            }
+            return vec![];
+        }
+    };
+    let mut out = Vec::new();
+    for block in content {
+        let block_type = block["type"].as_str().unwrap_or("");
+        match block_type {
+            "input_text" | "output_text" => {
+                if let Some(text) = block["text"].as_str() {
+                    if !text.is_empty() {
+                        if let Some(kind) = detect_user_signal(text) {
+                            out.push(make_rich(
+                                role,
+                                EventDetail::SystemSignal { kind, summary: text.into() },
+                                base,
+                            ));
+                        } else {
+                            out.push(make_rich(role, EventDetail::Text { text: text.into() }, base));
+                        }
+                    }
+                }
+            }
+            "function_call" => {
+                let name = block["name"].as_str().unwrap_or("unknown").to_string();
+                let tool_use_id = block["call_id"].as_str().map(String::from);
+                let args_str = block["arguments"].as_str().unwrap_or("{}");
+                let input: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
+                let target = extract_tool_target(&name, &input);
+                out.push(make_rich(
+                    MessageRole::ToolUse,
+                    EventDetail::ToolUse { name, target, tool_use_id, input },
+                    base,
+                ));
+            }
+            "function_call_output" => {
+                let tool_use_id = block["call_id"].as_str().unwrap_or("?").to_string();
+                let output = block["output"].as_str().unwrap_or("");
+                let size = output.len();
+                let preview = oneline_snippet(output, 200);
+                let exit_code = extract_exit_code(output);
+                out.push(make_rich(
+                    MessageRole::ToolResult,
+                    EventDetail::ToolResult {
+                        tool_use_id, is_error: false, exit_code, size, preview,
+                    },
+                    base,
+                ));
+            }
+            "reasoning" => {
+                if let Some(text) = block["text"].as_str() {
+                    if !text.is_empty() {
+                        out.push(make_rich(
+                            MessageRole::Thinking,
+                            EventDetail::Thinking { text: text.into() },
+                            base,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+// ── Rich parser: Gemini chat JSON (single-object, not JSONL) ────────
+
+/// Parse a full Gemini chat-session JSON file. Gemini stores sessions as
+/// pretty-printed JSON objects under `~/.gemini/tmp/<project>/chats/`
+/// rather than JSONL; callers re-invoke this on file mtime change and
+/// filter out already-rendered messages by `id`.
+pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
+    let v: Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let session_id = v["sessionId"].as_str().unwrap_or("").to_string();
+    let messages = match v["messages"].as_array() {
+        Some(m) => m,
+        None => return vec![],
+    };
+    let mut out = Vec::new();
+    for msg in messages {
+        let timestamp = msg["timestamp"].as_str().map(String::from);
+        let msg_id = msg["id"].as_str().unwrap_or("").to_string();
+        let base = RichBase {
+            session_id: session_id.clone(),
+            timestamp,
+            git_branch: None,
+            is_subagent: false,
+            agent_slug: None,
+            cwd: None,
+            parent_tool_use_id: Some(msg_id),
+        };
+        let msg_type = msg["type"].as_str().unwrap_or("");
+        match msg_type {
+            "user" => {
+                // content is either a string or an array of { text }
+                if let Some(s) = msg["content"].as_str() {
+                    if !s.is_empty() {
+                        out.push(make_rich(
+                            MessageRole::User,
+                            EventDetail::Text { text: s.into() },
+                            &base,
+                        ));
+                    }
+                } else if let Some(arr) = msg["content"].as_array() {
+                    for block in arr {
+                        if let Some(text) = block["text"].as_str() {
+                            if !text.is_empty() {
+                                out.push(make_rich(
+                                    MessageRole::User,
+                                    EventDetail::Text { text: text.into() },
+                                    &base,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            "gemini" => {
+                // Thoughts (reasoning) first, then content.
+                if let Some(thoughts) = msg["thoughts"].as_array() {
+                    for t in thoughts {
+                        let subject = t["subject"].as_str().unwrap_or("");
+                        let description = t["description"].as_str().unwrap_or("");
+                        let text = if subject.is_empty() {
+                            description.to_string()
+                        } else {
+                            format!("{subject}\n{description}")
+                        };
+                        if !text.is_empty() {
+                            out.push(make_rich(
+                                MessageRole::Thinking,
+                                EventDetail::Thinking { text },
+                                &base,
+                            ));
+                        }
+                    }
+                }
+                if let Some(s) = msg["content"].as_str() {
+                    if !s.is_empty() {
+                        out.push(make_rich(
+                            MessageRole::Assistant,
+                            EventDetail::Text { text: s.into() },
+                            &base,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Parse a single JSONL line into zero or more searchable events.
 pub fn parse_transcript_line(line: &str) -> Vec<ParsedEvent> {
     let v: Value = match serde_json::from_str(line) {

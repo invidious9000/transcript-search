@@ -109,6 +109,7 @@ impl Provider {
                     "-p".into(), prompt.into(),
                     "--output-format".into(), "stream-json".into(),
                     "--verbose".into(),
+                    "--include-partial-messages".into(),
                     "--session-id".into(), session_id.into(),
                     "--dangerously-skip-permissions".into(),
                 ];
@@ -178,6 +179,7 @@ impl Provider {
                     "-p".into(), prompt.into(),
                     "--output-format".into(), "stream-json".into(),
                     "--verbose".into(),
+                    "--include-partial-messages".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
                 if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
@@ -275,6 +277,26 @@ impl Provider {
 }
 
 fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
+    // Partial streaming chunks from --include-partial-messages. Each text_delta
+    // grows the in-flight message; a new message_start clears the buffer so we
+    // don't concatenate across turns / tool-use blocks.
+    if evt["type"].as_str() == Some("stream_event") {
+        let inner_ty = evt["event"]["type"].as_str().unwrap_or("");
+        match inner_ty {
+            "message_start" => {
+                sink.last_assistant_message = Some(String::new());
+            }
+            "content_block_delta" => {
+                if evt["event"]["delta"]["type"].as_str() == Some("text_delta") {
+                    if let Some(chunk) = evt["event"]["delta"]["text"].as_str() {
+                        let buf = sink.last_assistant_message.get_or_insert_with(String::new);
+                        buf.push_str(chunk);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
     if evt["type"].as_str() == Some("assistant") {
         if let Some(content) = evt["message"]["content"].as_array() {
             for block in content {

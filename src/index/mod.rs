@@ -137,6 +137,7 @@ mod helpers;
 mod reindex;
 mod search;
 
+pub use helpers::find_session_file;
 pub use reindex::spawn_reindex_thread;
 pub use search::{
     ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,

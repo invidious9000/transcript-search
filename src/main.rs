@@ -371,7 +371,7 @@ struct TeamMemberSlot {
 // token back; otherwise clients drop the notification as unknown. Servers MUST
 // NOT send progress notifications unless the caller asked for them.
 
-const PROGRESS_TICK_SECS: u64 = 3;
+const PROGRESS_TICK_SECS: u64 = 15;
 
 fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, bool) {
     let inner = task.inner.lock();
@@ -427,7 +427,7 @@ fn spawn_progress_notifier(
                 }),
             )).await;
             match send_result {
-                Ok(()) => tracing::info!(target: "blackbox::progress", tick, terminal = all_terminal, msg_len = msg.len(), "tick sent"),
+                Ok(()) => tracing::debug!(target: "blackbox::progress", tick, terminal = all_terminal, msg_len = msg.len(), "tick sent"),
                 Err(e) => tracing::warn!(target: "blackbox::progress", tick, error = %e, "tick send failed"),
             }
 
@@ -1196,6 +1196,101 @@ impl ServerHandler for BlackboxServer {
 }
 
 // ---------------------------------------------------------------------------
+// Bro roster endpoint — resolves selectors to concrete per-bro lane info
+// (provider, session_id, transcript file path). Consumed by `bro tail`
+// to know WHICH JSONL files to open and follow.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RosterQuery {
+    /// Comma-separated bro names
+    #[serde(default)]
+    bros: Option<String>,
+    /// Team name — resolves to all its members
+    #[serde(default)]
+    team: Option<String>,
+    /// Provider filter (claude/codex/etc)
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct BroRosterEntry {
+    bro: String,
+    team: String,
+    provider: String,
+    session_id: Option<String>,
+    jsonl_path: Option<String>,
+    brofile: String,
+    model: Option<String>,
+}
+
+async fn roster_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    Query(query): Query<RosterQuery>,
+) -> Result<axum::Json<Vec<BroRosterEntry>>, axum::http::StatusCode> {
+    let store_dir = state.store_dir.clone();
+    let config = state.idx.read().reindex_config();
+
+    let bros_filter: Option<Vec<String>> = query.bros.as_ref().map(|s| {
+        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+    });
+    let provider_filter: Option<Provider> = query.provider.as_ref()
+        .and_then(|p| p.parse::<Provider>().ok());
+
+    let teams = if let Some(ref tn) = query.team {
+        match orchestration::team::load_team(tn, &store_dir) {
+            Some(t) => vec![t],
+            None => return Err(axum::http::StatusCode::NOT_FOUND),
+        }
+    } else {
+        orchestration::team::load_all_teams(&store_dir)
+    };
+
+    let mut seen_bros = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+
+    for team in teams {
+        for member in &team.members {
+            if let Some(ref filter) = bros_filter {
+                if !filter.iter().any(|b| b == &member.name) { continue; }
+            }
+            // dedupe — same bro name might appear in multiple teams
+            let key = format!("{}::{}", team.name, member.name);
+            if !seen_bros.insert(key) { continue; }
+
+            let brofile = orchestration::brofile::resolve_brofile(
+                &member.brofile, &store_dir, team.project_dir.as_deref(),
+            );
+            let provider = brofile.as_ref().map(|b| b.provider);
+            if let Some(pf) = provider_filter {
+                if provider != Some(pf) { continue; }
+            }
+
+            let session_id = member.session_id.as_ref()
+                .filter(|s| s.as_str() != "pending")
+                .cloned();
+
+            let jsonl_path = session_id.as_deref()
+                .and_then(|sid| index::find_session_file(sid, &config.roots, config.codex_root.as_deref()))
+                .map(|p| p.to_string_lossy().into_owned());
+
+            entries.push(BroRosterEntry {
+                bro: member.name.clone(),
+                team: team.name.clone(),
+                provider: provider.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+                session_id,
+                jsonl_path,
+                brofile: member.brofile.clone(),
+                model: brofile.and_then(|b| b.model),
+            });
+        }
+    }
+
+    Ok(axum::Json(entries))
+}
+
+// ---------------------------------------------------------------------------
 // Tail SSE endpoint (outside MCP)
 // ---------------------------------------------------------------------------
 
@@ -1424,6 +1519,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = axum::Router::new()
         .route("/tail", axum::routing::get(tail_handler))
+        .route("/roster", axum::routing::get(roster_handler))
         .with_state(shared.clone())
         .nest_service("/mcp", mcp_service);
 

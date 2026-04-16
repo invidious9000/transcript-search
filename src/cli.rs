@@ -1,10 +1,614 @@
-use std::io::Write;
+//! `bro tail` — multi-lane transcript tail for agent orchestration.
+//!
+//! Selects one or more bros (by name, team, or provider), resolves their
+//! current session JSONL via the daemon's `/roster` endpoint, seeds each
+//! lane with recent history, then follows the files live. Tool calls,
+//! thinking blocks, text, and out-of-band system signals (compaction,
+//! hooks, system-reminders) are rendered in a ratatui split-pane layout.
 
-use crossterm::style::{Color, SetForegroundColor, ResetColor};
-use futures_util::StreamExt;
+use std::collections::HashSet;
+use std::io::{self, BufRead, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
-fn provider_color(provider: &str) -> Color {
-    match provider {
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::prelude::*;
+use ratatui::widgets::*;
+use serde::Deserialize;
+
+#[path = "parser.rs"]
+mod parser;
+use parser::{
+    parse_codex_line_rich, parse_gemini_file_rich, parse_transcript_line_rich, EventDetail,
+    MessageRole, SystemSignalKind, TranscriptEvent,
+};
+
+// ── Roster fetch ────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug, Clone)]
+struct RosterEntry {
+    bro: String,
+    team: String,
+    provider: String,
+    session_id: Option<String>,
+    jsonl_path: Option<String>,
+    #[allow(dead_code)] brofile: String,
+    model: Option<String>,
+}
+
+async fn fetch_roster(
+    bros: Vec<String>,
+    team: Option<String>,
+    provider: Option<String>,
+) -> anyhow::Result<Vec<RosterEntry>> {
+    let port = std::env::var("BBOX_PORT")
+        .or_else(|_| std::env::var("BRO_PORT"))
+        .unwrap_or_else(|_| "7264".into());
+    let mut url = format!("http://127.0.0.1:{port}/roster");
+    let mut params = Vec::new();
+    if !bros.is_empty() {
+        params.push(format!("bros={}", bros.join(",")));
+    }
+    if let Some(t) = team {
+        params.push(format!("team={t}"));
+    }
+    if let Some(p) = provider {
+        params.push(format!("provider={p}"));
+    }
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
+    }
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("/roster returned {}", resp.status());
+    }
+    Ok(resp.json().await?)
+}
+
+// ── App / Lane state ────────────────────────────────────────────────
+
+struct Lane {
+    bro: String,
+    team: String,
+    provider: String,
+    model: Option<String>,
+    session_id: Option<String>,
+    jsonl_path: Option<PathBuf>,
+    events: Vec<TranscriptEvent>,
+    /// JSONL tail cursor (Claude / Codex).
+    file_offset: u64,
+    /// mtime of last successful read (Gemini re-parse trigger).
+    file_mtime: Option<SystemTime>,
+    /// Dedupe key for full-file re-parsers (Gemini keys by message id).
+    seen_ids: HashSet<String>,
+    /// Scroll offset from bottom (0 = latest visible). Non-zero = user scrolled up.
+    scroll_from_bottom: usize,
+    cached_total_lines: usize,
+    status: LaneStatus,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LaneStatus {
+    Waiting, // no session_id yet
+    Tailing,
+    MissingFile,
+}
+
+impl Lane {
+    fn from_roster(e: RosterEntry) -> Self {
+        let status = if e.session_id.is_none() {
+            LaneStatus::Waiting
+        } else if e.jsonl_path.is_none() {
+            LaneStatus::MissingFile
+        } else {
+            LaneStatus::Tailing
+        };
+        let mut lane = Lane {
+            bro: e.bro,
+            team: e.team,
+            provider: e.provider,
+            model: e.model,
+            session_id: e.session_id,
+            jsonl_path: e.jsonl_path.map(PathBuf::from),
+            events: Vec::new(),
+            file_offset: 0,
+            file_mtime: None,
+            seen_ids: HashSet::new(),
+            scroll_from_bottom: 0,
+            cached_total_lines: 0,
+            status,
+        };
+        lane.seed();
+        lane
+    }
+
+    fn seed(&mut self) {
+        let Some(path) = self.jsonl_path.clone() else { return };
+        if self.provider == "gemini" {
+            self.seed_gemini(&path);
+        } else {
+            self.seed_jsonl(&path);
+        }
+    }
+
+    fn seed_jsonl(&mut self, path: &Path) {
+        const SEED_EVENTS: usize = 50;
+        let Ok(content) = std::fs::read_to_string(path) else {
+            self.status = LaneStatus::MissingFile;
+            return;
+        };
+        self.file_offset = content.len() as u64;
+        let lines: Vec<&str> = content.lines().collect();
+        let start = lines.len().saturating_sub(SEED_EVENTS * 3);
+        let mut events = Vec::new();
+        for line in &lines[start..] {
+            events.extend(self.parse_jsonl_line(line));
+        }
+        if events.len() > SEED_EVENTS {
+            let drop = events.len() - SEED_EVENTS;
+            events.drain(..drop);
+        }
+        self.events = events;
+    }
+
+    fn seed_gemini(&mut self, path: &Path) {
+        const SEED_EVENTS: usize = 50;
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            self.status = LaneStatus::MissingFile;
+            return;
+        };
+        if let Ok(meta) = std::fs::metadata(path) {
+            self.file_mtime = meta.modified().ok();
+        }
+        let mut events = parse_gemini_file_rich(&raw);
+        // Tag every seen id so future polls only pick up new ones.
+        for ev in &events {
+            if let Some(ref id) = ev.parent_tool_use_id {
+                self.seen_ids.insert(id.clone());
+            }
+        }
+        if events.len() > SEED_EVENTS {
+            let drop = events.len() - SEED_EVENTS;
+            events.drain(..drop);
+        }
+        self.events = events;
+    }
+
+    fn parse_jsonl_line(&self, line: &str) -> Vec<TranscriptEvent> {
+        if self.provider == "codex" {
+            parse_codex_line_rich(line, self.session_id.as_deref().unwrap_or(""))
+        } else {
+            parse_transcript_line_rich(line)
+        }
+    }
+
+    fn poll(&mut self) -> bool {
+        let Some(path) = self.jsonl_path.clone() else { return false };
+        if self.provider == "gemini" {
+            self.poll_gemini(&path)
+        } else {
+            self.poll_jsonl(&path)
+        }
+    }
+
+    fn poll_jsonl(&mut self, path: &Path) -> bool {
+        let Ok(meta) = std::fs::metadata(path) else { return false };
+        if meta.len() <= self.file_offset {
+            return false;
+        }
+        if meta.len() < self.file_offset {
+            // Truncation / rotation.
+            self.file_offset = 0;
+        }
+        let Ok(mut file) = std::fs::File::open(path) else { return false };
+        if file.seek(SeekFrom::Start(self.file_offset)).is_err() {
+            return false;
+        }
+        let mut reader = io::BufReader::new(&mut file);
+        let mut added = false;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if line.ends_with('\n') {
+                        let trimmed = line.trim_end_matches('\n').trim_end_matches('\r');
+                        for ev in self.parse_jsonl_line(trimmed) {
+                            self.events.push(ev);
+                            added = true;
+                        }
+                        self.file_offset += n as u64;
+                    } else {
+                        // mid-flush; leave for next poll
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.cap_events();
+        added
+    }
+
+    fn poll_gemini(&mut self, path: &Path) -> bool {
+        let Ok(meta) = std::fs::metadata(path) else { return false };
+        let mtime = meta.modified().ok();
+        if mtime == self.file_mtime {
+            return false;
+        }
+        let Ok(raw) = std::fs::read_to_string(path) else { return false };
+        self.file_mtime = mtime;
+        let parsed = parse_gemini_file_rich(&raw);
+        let mut added = false;
+        for ev in parsed {
+            let Some(id) = ev.parent_tool_use_id.as_ref() else { continue };
+            if self.seen_ids.insert(id.clone()) {
+                self.events.push(ev);
+                added = true;
+            }
+        }
+        self.cap_events();
+        added
+    }
+
+    fn cap_events(&mut self) {
+        const MAX_EVENTS: usize = 2000;
+        if self.events.len() > MAX_EVENTS {
+            let drop = self.events.len() - MAX_EVENTS;
+            self.events.drain(..drop);
+        }
+    }
+}
+
+struct App {
+    lanes: Vec<Lane>,
+    /// Lane targeted by key commands (scroll, etc). Always valid.
+    selected: usize,
+    /// Whether to fullscreen the selected lane.
+    fullscreen: bool,
+    /// Last rendered body height — used for page-scroll step size.
+    last_body_h: u16,
+    quit: bool,
+}
+
+// ── Arg parsing ─────────────────────────────────────────────────────
+
+fn parse_tail_args(args: &[String]) -> (Vec<String>, Option<String>, Option<String>) {
+    let mut bros = Vec::new();
+    let mut team = None;
+    let mut provider = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--team" if i + 1 < args.len() => {
+                team = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--provider" if i + 1 < args.len() => {
+                provider = Some(args[i + 1].clone());
+                i += 2;
+            }
+            s if !s.starts_with("--") => {
+                bros.push(s.to_string());
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    (bros, team, provider)
+}
+
+// ── Entry point ─────────────────────────────────────────────────────
+
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 || args[1] != "tail" {
+        eprintln!("Usage: bro tail [BROS...] [--team NAME] [--provider PROVIDER]");
+        eprintln!();
+        eprintln!("Examples:");
+        eprintln!("  bro tail alice bob             Two specific bros");
+        eprintln!("  bro tail --team review-panel   All members of a team");
+        eprintln!("  bro tail --provider codex      All codex bros");
+        std::process::exit(1);
+    }
+    let (bros, team, provider) = parse_tail_args(&args[2..]);
+
+    // One-shot async fetch for roster, then run TUI synchronously.
+    let rt = tokio::runtime::Runtime::new()?;
+    let roster = match rt.block_on(fetch_roster(bros, team, provider)) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to fetch roster: {e}");
+            eprintln!("Is blackboxd running? (port 7264)");
+            std::process::exit(1);
+        }
+    };
+    if roster.is_empty() {
+        eprintln!("No bros matched. Try `bro tail` with no args or --team NAME.");
+        std::process::exit(1);
+    }
+
+    let lanes: Vec<Lane> = roster.into_iter().map(Lane::from_roster).collect();
+    let app = App {
+        lanes,
+        selected: 0,
+        fullscreen: false,
+        last_body_h: 0,
+        quit: false,
+    };
+    run_tui(app)
+}
+
+// ── TUI main loop ───────────────────────────────────────────────────
+
+fn run_tui(mut app: App) -> anyhow::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut last_poll = Instant::now();
+    let poll_interval = Duration::from_millis(250);
+
+    let result = (|| -> anyhow::Result<()> {
+        loop {
+            terminal.draw(|f| draw(f, &mut app))?;
+
+            // Handle input with short timeout so file polling stays timely.
+            if event::poll(Duration::from_millis(100))? {
+                if let Event::Key(key) = event::read()? {
+                    handle_key(&mut app, key);
+                    if app.quit {
+                        break;
+                    }
+                }
+            }
+
+            if last_poll.elapsed() >= poll_interval {
+                for lane in &mut app.lanes {
+                    lane.poll();
+                }
+                last_poll = Instant::now();
+            }
+        }
+        Ok(())
+    })();
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    result
+}
+
+fn handle_key(app: &mut App, key: KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+        app.quit = true;
+        return;
+    }
+    let n = app.lanes.len();
+    // Page step is ~body height; fall back to 10 if we haven't drawn yet.
+    let page_step = app.last_body_h.max(10);
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+        KeyCode::Tab => app.selected = (app.selected + 1) % n,
+        KeyCode::BackTab => {
+            app.selected = if app.selected == 0 { n - 1 } else { app.selected - 1 };
+        }
+        KeyCode::Char('f') => app.fullscreen = !app.fullscreen,
+        KeyCode::Char('a') => app.fullscreen = false,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(l) = app.lanes.get_mut(app.selected) {
+                l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(l) = app.lanes.get_mut(app.selected) {
+                l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(1);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(l) = app.lanes.get_mut(app.selected) {
+                l.scroll_from_bottom = l.scroll_from_bottom.saturating_add(page_step as usize);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(l) = app.lanes.get_mut(app.selected) {
+                l.scroll_from_bottom = l.scroll_from_bottom.saturating_sub(page_step as usize);
+            }
+        }
+        // Home / 'g' — jump far up (clamped on draw).
+        KeyCode::Home | KeyCode::Char('g') => {
+            if let Some(l) = app.lanes.get_mut(app.selected) {
+                l.scroll_from_bottom = usize::MAX / 2;
+            }
+        }
+        // End / 'G' — follow mode (bottom).
+        KeyCode::End | KeyCode::Char('G') => {
+            if let Some(l) = app.lanes.get_mut(app.selected) {
+                l.scroll_from_bottom = 0;
+            }
+        }
+        _ => {}
+    }
+}
+
+// ── Rendering ───────────────────────────────────────────────────────
+
+fn draw(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+    draw_tab_strip(f, chunks[0], app);
+    draw_body(f, chunks[1], app);
+    draw_status(f, chunks[2], app);
+}
+
+fn draw_tab_strip(f: &mut Frame, area: Rect, app: &App) {
+    let spans: Vec<Span> = app
+        .lanes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, l)| {
+            let selected = i == app.selected;
+            let bg = if selected { Color::DarkGray } else { Color::Reset };
+            let fg = provider_color(&l.provider);
+            let marker = if selected { "▸" } else { " " };
+            vec![
+                Span::styled(
+                    format!("{marker}{} ", l.bro),
+                    Style::default().fg(fg).bg(bg).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::raw(" "),
+            ]
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
+    let indexes: Vec<usize> = if app.fullscreen {
+        vec![app.selected]
+    } else {
+        (0..app.lanes.len()).collect()
+    };
+    if indexes.is_empty() {
+        return;
+    }
+    let n = indexes.len() as u32;
+    let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Ratio(1, n)).collect();
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+    let mut max_body_h = 0u16;
+    for (slot, &lane_idx) in indexes.iter().enumerate() {
+        let is_selected = lane_idx == app.selected;
+        let body_h = draw_lane(f, cols[slot], &mut app.lanes[lane_idx], is_selected);
+        if is_selected {
+            max_body_h = max_body_h.max(body_h);
+        }
+    }
+    app.last_body_h = max_body_h;
+}
+
+/// Draw one lane. Returns the body height (in rows) so the caller can
+/// use it to size page-scroll steps.
+fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u16 {
+    let border_style = if is_selected {
+        Style::default().fg(provider_color(&lane.provider))
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let outer = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(border_style);
+    let inner = outer.inner(area);
+    f.render_widget(outer, area);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    // Header
+    let sid = lane
+        .session_id
+        .as_deref()
+        .map(|s| &s[..s.len().min(8)])
+        .unwrap_or("-");
+    let model = lane.model.as_deref().unwrap_or("?");
+    let header_line1 = Line::from(vec![
+        Span::styled(
+            lane.bro.clone(),
+            Style::default()
+                .fg(provider_color(&lane.provider))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" • "),
+        Span::styled(model.to_string(), Style::default().fg(Color::White)),
+    ]);
+    let header_line2 = Line::from(vec![
+        Span::styled(format!("team {}", lane.team), Style::default().fg(Color::DarkGray)),
+        Span::raw(" • "),
+        Span::styled(format!("session {sid}"), Style::default().fg(Color::DarkGray)),
+    ]);
+    let header_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(Color::DarkGray));
+    f.render_widget(
+        Paragraph::new(vec![header_line1, header_line2]).block(header_block),
+        rows[0],
+    );
+
+    // Body — render via Paragraph with proper wrapped-line scroll math.
+    let body_area = rows[1];
+    let body_h = body_area.height;
+    let all_lines = render_events(&lane.events);
+    let paragraph_all = Paragraph::new(all_lines).wrap(Wrap { trim: false });
+    let wrapped_total = paragraph_all.line_count(body_area.width) as u16;
+    let max_scroll = wrapped_total.saturating_sub(body_h);
+    // Clamp user's scroll request to actual scrollable range.
+    let requested = lane.scroll_from_bottom.min(max_scroll as usize) as u16;
+    lane.scroll_from_bottom = requested as usize;
+    let scroll_y = max_scroll.saturating_sub(requested);
+    f.render_widget(paragraph_all.scroll((scroll_y, 0)), body_area);
+
+    // Footer
+    let (text_events, tool_events, thinking_events, signal_events) = count_events(&lane.events);
+    let follow_badge = if lane.scroll_from_bottom == 0 {
+        Span::styled(" ● LIVE ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled(
+            format!(" ⏸ -{} ", lane.scroll_from_bottom),
+            Style::default().fg(Color::Yellow),
+        )
+    };
+    let status_badge = match lane.status {
+        LaneStatus::Waiting => Span::styled(" waiting ", Style::default().fg(Color::Yellow)),
+        LaneStatus::MissingFile => Span::styled(" no-file ", Style::default().fg(Color::Red)),
+        LaneStatus::Tailing => Span::raw(""),
+    };
+    let footer = Line::from(vec![
+        follow_badge,
+        status_badge,
+        Span::styled(
+            format!(
+                " {} txt • {} tool • {} thk • {} sig",
+                text_events, tool_events, thinking_events, signal_events
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(footer), rows[2]);
+    body_h
+}
+
+fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    let n = app.lanes.len();
+    let selected = app.lanes.get(app.selected).map(|l| l.bro.as_str()).unwrap_or("-");
+    let mode = if app.fullscreen { "FULL" } else { "SPLIT" };
+    let help = "Tab cycle • f full • ↑↓/j/k scroll • PgUp/PgDn page • G live • g top • q quit";
+    let line = format!(" bro tail • {n} lanes • {mode}:{selected}   {help}");
+    f.render_widget(
+        Paragraph::new(line).style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
+}
+
+fn provider_color(p: &str) -> Color {
+    match p {
         "claude" => Color::Magenta,
         "codex" => Color::Cyan,
         "copilot" => Color::Blue,
@@ -14,154 +618,186 @@ fn provider_color(provider: &str) -> Color {
     }
 }
 
-fn status_color(event_type: &str) -> Color {
-    match event_type {
-        "task_completed" => Color::Green,
-        "task_failed" => Color::Red,
-        "task_cancelled" => Color::DarkYellow,
-        "task_started" => Color::White,
-        _ => Color::DarkGrey,
+fn count_events(events: &[TranscriptEvent]) -> (usize, usize, usize, usize) {
+    let (mut t, mut tool, mut th, mut s) = (0, 0, 0, 0);
+    for ev in events {
+        match &ev.detail {
+            EventDetail::Text { .. } => t += 1,
+            EventDetail::ToolUse { .. } | EventDetail::ToolResult { .. } => tool += 1,
+            EventDetail::Thinking { .. } => th += 1,
+            EventDetail::SystemSignal { .. } => s += 1,
+        }
     }
+    (t, tool, th, s)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+// ── Per-event rendering → Line(s) ──────────────────────────────────
 
-    if args.len() < 2 || args[1] != "tail" {
-        eprintln!("Usage: bro tail [--team NAME] [--bro NAME] [--provider NAME]");
-        std::process::exit(1);
+fn render_events(events: &[TranscriptEvent]) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for ev in events {
+        out.extend(render_event(ev));
+        // Blank separator between events for breathing room.
+        out.push(Line::from(""));
     }
+    out
+}
 
-    let port = std::env::var("BBOX_PORT")
-        .or_else(|_| std::env::var("BRO_PORT"))
-        .unwrap_or_else(|_| "7264".into());
-
-    // Parse filter flags
-    let mut team_filter: Option<String> = None;
-    let mut bro_filter: Option<String> = None;
-    let mut provider_filter: Option<String> = None;
-
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--team" if i + 1 < args.len() => { team_filter = Some(args[i + 1].clone()); i += 2; }
-            "--bro" if i + 1 < args.len() => { bro_filter = Some(args[i + 1].clone()); i += 2; }
-            "--provider" if i + 1 < args.len() => { provider_filter = Some(args[i + 1].clone()); i += 2; }
-            _ => { i += 1; }
-        }
-    }
-
-    let mut url = format!("http://127.0.0.1:{port}/tail");
-    let mut params = Vec::new();
-    if let Some(ref t) = team_filter { params.push(format!("team={t}")); }
-    if let Some(ref b) = bro_filter { params.push(format!("bro={b}")); }
-    if let Some(ref p) = provider_filter { params.push(format!("provider={p}")); }
-    if !params.is_empty() {
-        url = format!("{url}?{}", params.join("&"));
-    }
-
-    eprintln!("Connecting to {url}...");
-
-    let client = reqwest::Client::new();
-    let response = match client.get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to connect to blackboxd: {e}");
-            eprintln!("Is the daemon running? Start with: blackboxd");
-            std::process::exit(1);
-        }
-    };
-
-    if !response.status().is_success() {
-        eprintln!("Server returned {}", response.status());
-        std::process::exit(1);
-    }
-
-    eprintln!("Connected. Streaming events...\n");
-
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    let mut stdout = std::io::stdout();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        // Parse SSE events (data: {...}\n\n)
-        while let Some(pos) = buffer.find("\n\n") {
-            let event_text = buffer[..pos].to_string();
-            buffer = buffer[pos + 2..].to_string();
-
-            for line in event_text.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(evt) = serde_json::from_str::<serde_json::Value>(data) {
-                        render_event(&mut stdout, &evt);
-                    }
+fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
+    match &ev.detail {
+        EventDetail::Text { text } => {
+            let (prefix, color) = match ev.role {
+                MessageRole::User => ("▶ user", Color::Blue),
+                MessageRole::Assistant => ("◀ asst", Color::White),
+                MessageRole::Developer => ("· dev ", Color::DarkGray),
+                _ => ("  msg ", Color::White),
+            };
+            let mut lines = vec![Line::from(Span::styled(
+                prefix.to_string(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))];
+            if matches!(ev.role, MessageRole::Assistant) {
+                // Code-review and executor bros emit markdown-rich output —
+                // render through tui-markdown (syntect on code fences).
+                let md = tui_markdown::from_str(text);
+                for line in md.lines {
+                    lines.push(line_into_owned(line));
+                }
+            } else {
+                for l in text.lines() {
+                    lines.push(Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default().fg(color),
+                    )));
                 }
             }
+            lines
+        }
+        EventDetail::Thinking { text } => {
+            let style = Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::ITALIC);
+            let mut lines = vec![Line::from(Span::styled(
+                "◦ thinking".to_string(),
+                style.add_modifier(Modifier::BOLD),
+            ))];
+            for l in text.lines() {
+                lines.push(Line::from(Span::styled(l.to_string(), style)));
+            }
+            lines
+        }
+        EventDetail::ToolUse { name, target, .. } => {
+            vec![Line::from(vec![
+                Span::styled(
+                    "⚙ ",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    name.clone(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(target.clone(), Style::default().fg(Color::White)),
+            ])]
+        }
+        EventDetail::ToolResult {
+            exit_code,
+            is_error,
+            size,
+            preview,
+            ..
+        } => {
+            let bad = *is_error || exit_code.is_some_and(|c| c != 0);
+            let color = if bad { Color::Red } else { Color::Green };
+            let exit_str = exit_code
+                .map(|c| format!(" exit={c}"))
+                .unwrap_or_default();
+            vec![Line::from(vec![
+                Span::styled(
+                    "↳ ",
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}B{}", size, exit_str),
+                    Style::default().fg(color),
+                ),
+                Span::raw("  "),
+                Span::styled(preview.clone(), Style::default().fg(Color::DarkGray)),
+            ])]
+        }
+        EventDetail::SystemSignal { kind, summary } => {
+            let label = match kind {
+                SystemSignalKind::SessionInit => "session-start",
+                SystemSignalKind::SessionResumed => "session-resumed",
+                SystemSignalKind::Compaction => "compaction",
+                SystemSignalKind::HookFired => "hook",
+                SystemSignalKind::SystemReminder => "system-reminder",
+                SystemSignalKind::PermissionDenied => "permission-denied",
+                SystemSignalKind::RateLimitHit => "rate-limit",
+                SystemSignalKind::UserCommand => "user-command",
+                SystemSignalKind::SubagentLaunched => "subagent",
+                SystemSignalKind::Other => "signal",
+            };
+            let head = summary.lines().next().unwrap_or("");
+            vec![Line::from(vec![
+                Span::styled(
+                    format!("── {} ── ", label),
+                    Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(head.to_string(), Style::default().fg(Color::LightYellow)),
+            ])]
         }
     }
-
-    eprintln!("\nConnection closed.");
-    Ok(())
 }
 
-fn render_event(out: &mut impl Write, evt: &serde_json::Value) {
-    let event_type = evt["type"].as_str().unwrap_or("unknown");
-    let task_id = evt["task_id"].as_str().unwrap_or("?");
-    let short_id = if task_id.len() > 8 { &task_id[..8] } else { task_id };
+/// Convert a `ratatui_core` Line (from tui-markdown output) into a
+/// `'static`-lived `ratatui` Line that our widgets consume. ratatui 0.29
+/// still carries its own Line/Span/Style/Color types distinct from
+/// ratatui-core's — structurally identical, nominally different — so we
+/// cross the boundary with a field-by-field copy.
+fn line_into_owned<'a>(line: ratatui_core::text::Line<'a>) -> Line<'static> {
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|s| Span::styled(s.content.into_owned(), convert_core_style(s.style)))
+        .collect();
+    Line::from(spans).style(convert_core_style(line.style))
+}
 
-    let bro_name = evt["bro_name"].as_str();
-    let provider = evt["provider"].as_str().unwrap_or("");
-    let label = bro_name.unwrap_or(short_id);
+fn convert_core_style(s: ratatui_core::style::Style) -> Style {
+    let mut out = Style::default();
+    if let Some(fg) = s.fg { out = out.fg(convert_core_color(fg)); }
+    if let Some(bg) = s.bg { out = out.bg(convert_core_color(bg)); }
+    out = out.add_modifier(Modifier::from_bits_truncate(s.add_modifier.bits()));
+    out = out.remove_modifier(Modifier::from_bits_truncate(s.sub_modifier.bits()));
+    out
+}
 
-    let color = if !provider.is_empty() {
-        provider_color(provider)
-    } else {
-        status_color(event_type)
-    };
-
-    match event_type {
-        "task_started" => {
-            let _ = write!(out, "{}", SetForegroundColor(color));
-            let _ = write!(out, "[{label}/{provider}]");
-            let _ = write!(out, "{}", ResetColor);
-            let _ = writeln!(out, " started");
-        }
-        "task_progress" => {
-            let activity = evt["activity"].as_str().unwrap_or("...");
-            let _ = write!(out, "{}", SetForegroundColor(color));
-            let _ = write!(out, "[{label}]");
-            let _ = write!(out, "{}", ResetColor);
-            let _ = writeln!(out, " {activity}");
-        }
-        "task_completed" => {
-            let elapsed = evt["elapsed"].as_str().unwrap_or("?");
-            let cost = evt["cost"].as_f64();
-            let cost_str = cost.map(|c| format!(", ${c:.3}")).unwrap_or_default();
-            let _ = write!(out, "{}", SetForegroundColor(Color::Green));
-            let _ = write!(out, "[{label}] completed");
-            let _ = write!(out, "{}", ResetColor);
-            let _ = writeln!(out, " ({elapsed}{cost_str})");
-        }
-        "task_failed" => {
-            let elapsed = evt["elapsed"].as_str().unwrap_or("?");
-            let error = evt["error"].as_str().unwrap_or("");
-            let _ = write!(out, "{}", SetForegroundColor(Color::Red));
-            let _ = write!(out, "[{label}] failed");
-            let _ = write!(out, "{}", ResetColor);
-            let _ = writeln!(out, " ({elapsed}) {error}");
-        }
-        "task_cancelled" => {
-            let elapsed = evt["elapsed"].as_str().unwrap_or("?");
-            let _ = write!(out, "{}", SetForegroundColor(Color::DarkYellow));
-            let _ = writeln!(out, "[{label}] cancelled ({elapsed})");
-            let _ = write!(out, "{}", ResetColor);
-        }
-        _ => {
-            let _ = writeln!(out, "[{label}] {event_type}");
-        }
+fn convert_core_color(c: ratatui_core::style::Color) -> Color {
+    use ratatui_core::style::Color as Rc;
+    match c {
+        Rc::Reset => Color::Reset,
+        Rc::Black => Color::Black,
+        Rc::Red => Color::Red,
+        Rc::Green => Color::Green,
+        Rc::Yellow => Color::Yellow,
+        Rc::Blue => Color::Blue,
+        Rc::Magenta => Color::Magenta,
+        Rc::Cyan => Color::Cyan,
+        Rc::Gray => Color::Gray,
+        Rc::DarkGray => Color::DarkGray,
+        Rc::LightRed => Color::LightRed,
+        Rc::LightGreen => Color::LightGreen,
+        Rc::LightYellow => Color::LightYellow,
+        Rc::LightBlue => Color::LightBlue,
+        Rc::LightMagenta => Color::LightMagenta,
+        Rc::LightCyan => Color::LightCyan,
+        Rc::White => Color::White,
+        Rc::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        Rc::Indexed(i) => Color::Indexed(i),
     }
-    let _ = out.flush();
 }
+
+// Suppress dead-code warning on Path import when only used via PathBuf methods.
+#[allow(dead_code)]
+const _PATH: Option<&Path> = None;

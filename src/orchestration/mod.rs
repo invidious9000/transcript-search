@@ -354,7 +354,15 @@ pub fn spawn_task(
                             }
                         }
                         inner.last_assistant_message.as_ref().map(|msg| {
-                            if msg.len() > 80 { msg[..80].to_string() } else { msg.clone() }
+                            const TAIL_CHARS: usize = 160;
+                            let count = msg.chars().count();
+                            if count > TAIL_CHARS {
+                                let skip = count - TAIL_CHARS;
+                                let tail: String = msg.chars().skip(skip).collect();
+                                format!("…{tail}")
+                            } else {
+                                msg.clone()
+                            }
                         })
                     };
 

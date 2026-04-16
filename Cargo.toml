@@ -56,12 +56,19 @@ axum = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
 # CLI HTTP client
-reqwest = { version = "0.12", features = ["stream", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 futures-util = "0.3"
 futures = "0.3"
 
 # Terminal
 crossterm = "0.28"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+# tui-markdown returns ratatui-core types; declared explicitly here so we
+# can name them when converting into ratatui's parallel Line/Span/Style.
+# (ratatui 0.29 still carries its own copies of these types rather than
+# re-exporting from ratatui-core.)
+ratatui-core = "0.1"
+tui-markdown = "0.3"
 
 # SSE stream construction
 async-stream = "0.3"

@@ -29,6 +29,83 @@ pub(super) fn extract_project_from_path(file_path: &Path, projects_root: &Path) 
     "unknown".to_string()
 }
 
+/// Locate the on-disk JSONL transcript file for a given session ID.
+/// Scans Claude account roots (`<root>/projects/*/<session_id>.jsonl`) and
+/// the Codex sessions tree (`<codex_root>/sessions/**/rollout-*<session_id>*.jsonl`).
+/// Bounded WalkDir depth keeps the scan cheap enough to run per-request.
+pub fn find_session_file(
+    session_id: &str,
+    roots: &[(String, PathBuf)],
+    codex_root: Option<&Path>,
+) -> Option<PathBuf> {
+    if session_id.is_empty() || session_id == "pending" {
+        return None;
+    }
+
+    // Claude layout: <root>/projects/<encoded-project>/<session-id>.jsonl
+    let claude_filename = format!("{session_id}.jsonl");
+    for (_account, root) in roots {
+        let projects_dir = root.join("projects");
+        if !projects_dir.exists() { continue; }
+        for entry in WalkDir::new(&projects_dir)
+            .follow_links(true)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            if p.file_name().is_some_and(|n| n == claude_filename.as_str()) {
+                return Some(p.to_path_buf());
+            }
+        }
+    }
+
+    // Codex layout: <codex_root>/sessions/YYYY/MM/DD/rollout-<ts>-<session-id>.jsonl
+    if let Some(cr) = codex_root {
+        let sessions_dir = cr.join("sessions");
+        if sessions_dir.exists() {
+            for entry in WalkDir::new(&sessions_dir)
+                .follow_links(true)
+                .max_depth(5)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let p = entry.path();
+                if p.extension().map(|e| e != "jsonl").unwrap_or(true) { continue; }
+                let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                if name.contains(session_id) {
+                    return Some(p.to_path_buf());
+                }
+            }
+        }
+    }
+
+    // Gemini layout: ~/.gemini/tmp/<project>/chats/session-<ts>-<first8>.json
+    // Filename carries only the first 8 chars of the session UUID.
+    if let Some(home) = dirs::home_dir() {
+        let gemini_tmp = home.join(".gemini").join("tmp");
+        if gemini_tmp.exists() && session_id.len() >= 8 {
+            let prefix = &session_id[..8];
+            let needle = format!("-{prefix}.json");
+            for entry in WalkDir::new(&gemini_tmp)
+                .follow_links(true)
+                .max_depth(4)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let p = entry.path();
+                if p.extension().map(|e| e != "json").unwrap_or(true) { continue; }
+                let name = p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                if name.starts_with("session-") && name.ends_with(&needle) {
+                    return Some(p.to_path_buf());
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Extract session ID from Codex filename: rollout-YYYY-MM-DDTHH-MM-SS-UUID.jsonl
 pub(super) fn extract_codex_session_id(path: &Path) -> String {
     let stem = path
