@@ -938,64 +938,62 @@ impl TranscriptIndex {
     // ── Stats ───────────────────────────────────────────────────────
 
     pub fn stats(&self) -> Result<String> {
+        // TTL cache: stats is dominated by the projects-dir walk (100+ ms
+        // on warm page cache). The numbers barely move between calls in
+        // normal use, so a minute of staleness is a fair trade.
+        const STATS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+        if let Some((at, cached)) = self.stats_cache.lock().as_ref() {
+            if at.elapsed() < STATS_TTL {
+                return Ok(cached.clone());
+            }
+        }
+
+        let computed = self.compute_stats();
+        *self.stats_cache.lock() = Some((std::time::Instant::now(), computed.clone()));
+        Ok(computed)
+    }
+
+    fn compute_stats(&self) -> String {
         let searcher = self.reader.searcher();
         let total_docs = searcher.num_docs();
 
-        // Count JSONL files per root
         let mut per_account: Vec<String> = Vec::new();
         for (name, root) in &self.config.roots {
             let projects_dir = root.join("projects");
             if !projects_dir.exists() {
-                per_account.push(format!("  {}: (no projects dir)", name));
+                per_account.push(format!("  {name}: (no projects dir)"));
                 continue;
             }
-            let count = WalkDir::new(&projects_dir)
-                .into_iter()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path()
-                        .extension()
-                        .map(|ext| ext == "jsonl")
-                        .unwrap_or(false)
-                })
-                .count();
-            per_account.push(format!("  {}: {} files", name, count));
+            let count = count_jsonl_files(&projects_dir);
+            per_account.push(format!("  {name}: {count} files"));
         }
 
         if let Some(ref codex_root) = self.config.codex_root {
             let sessions_dir = codex_root.join("sessions");
             if sessions_dir.exists() {
-                let count = WalkDir::new(&sessions_dir)
-                    .into_iter()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.path()
-                            .extension()
-                            .map(|ext| ext == "jsonl")
-                            .unwrap_or(false)
-                    })
-                    .count();
-                per_account.push(format!("  codex: {} files", count));
+                per_account.push(format!("  codex: {} files", count_jsonl_files(&sessions_dir)));
             }
         }
 
-        // Index size on disk
-        let index_size = dir_size(&self.config.meta_path.parent().unwrap_or(Path::new(".")));
+        let index_size = dir_size(self.config.meta_path.parent().unwrap_or(Path::new(".")));
 
-        Ok(format!(
-            "Index documents: {}\n\
+        format!(
+            "Index documents: {total_docs}\n\
              Index size: {}\n\
              Source files:\n\
              {}",
-            total_docs,
             human_bytes(index_size),
             per_account.join("\n")
-        ))
+        )
     }
 
     // ── Reindex ─────────────────────────────────────────────────────
 
     pub fn reindex(&mut self, p: &ReindexParams) -> Result<String> {
+        // New docs may have arrived; force the stats call after this to
+        // recompute rather than return a stale cache.
+        *self.stats_cache.lock() = None;
         self.build_index(p.full.unwrap_or(false))
     }
 

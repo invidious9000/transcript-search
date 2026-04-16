@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Result;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tantivy::schema::*;
 use tantivy::{Index, IndexReader, ReloadPolicy};
@@ -45,6 +47,12 @@ pub struct TranscriptIndex {
     schema: Schema,
     fields: FieldHandles,
     config: ReindexConfig,
+    /// TTL cache for `stats()` output. The expensive part of stats is
+    /// walking every account's `projects/` tree — dominates the call
+    /// time for a corpus of any size. Wrapped in an inner Mutex so
+    /// stats() can mutate it through a shared `&TranscriptIndex`
+    /// (the whole struct is already behind RwLock in SharedState).
+    pub(super) stats_cache: Mutex<Option<(Instant, String)>>,
 }
 
 impl TranscriptIndex {
@@ -93,7 +101,14 @@ impl TranscriptIndex {
             meta_path,
         };
 
-        Ok(Self { index, reader, schema, fields, config })
+        Ok(Self {
+            index,
+            reader,
+            schema,
+            fields,
+            config,
+            stats_cache: Mutex::new(None),
+        })
     }
 
     /// Get a clone of the Index handle for the background thread.

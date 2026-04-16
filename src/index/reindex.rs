@@ -42,6 +42,14 @@ pub(super) fn dir_size(path: &Path) -> u64 {
         .sum()
 }
 
+pub(super) fn count_jsonl_files(dir: &Path) -> usize {
+    WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .count()
+}
+
 // ── Background auto-reindex ────────────────────────────────────────
 
 /// Collect (path, mtime, size) for all JSONL files in a directory tree.
