@@ -252,9 +252,20 @@ impl Lane {
         self.file_mtime = mtime;
         let parsed = parse_gemini_file_rich(&raw);
         let mut added = false;
+        // Dedupe at the message-group level: every event parsed from a gemini
+        // message shares the same parent_tool_use_id, so per-event dedupe
+        // would keep only the first (thoughts-only, dropping content +
+        // toolCalls). Group-level means: if the message id is new, keep all
+        // of its events; otherwise skip the whole group.
+        let mut current_id: Option<String> = None;
+        let mut keep_group = false;
         for ev in parsed {
-            let Some(id) = ev.parent_tool_use_id.as_ref() else { continue };
-            if self.seen_ids.insert(id.clone()) {
+            let Some(id) = ev.parent_tool_use_id.as_ref().cloned() else { continue };
+            if current_id.as_ref() != Some(&id) {
+                current_id = Some(id.clone());
+                keep_group = self.seen_ids.insert(id);
+            }
+            if keep_group {
                 self.events.push(ev);
                 added = true;
             }

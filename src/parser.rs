@@ -164,6 +164,25 @@ pub fn extract_tool_target(tool_name: &str, input: &Value) -> String {
     String::new()
 }
 
+/// Split Gemini assistant content on inlined `[Thought: true]` / `[Thought:true]`
+/// reasoning markers. Each segment before a marker is a thought; the final
+/// segment (after the last marker, or the whole string if no markers) is the
+/// answer. Returns at least one segment.
+fn split_gemini_thought_segments(content: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("[Thought:") {
+        if let Some(close_rel) = rest[start..].find(']') {
+            parts.push(&rest[..start]);
+            rest = &rest[start + close_rel + 1..];
+        } else {
+            break;
+        }
+    }
+    parts.push(rest);
+    parts
+}
+
 fn oneline_snippet(s: &str, max_chars: usize) -> String {
     let one = s.replace('\n', " ");
     let count = one.chars().count();
@@ -441,16 +460,67 @@ pub fn parse_codex_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEven
         }
         "response_item" => {
             let payload = &v["payload"];
-            let role = payload["role"].as_str().unwrap_or("");
             let base = RichBase {
                 session_id: session_id.into(), timestamp,
                 git_branch: None, is_subagent: false, agent_slug: None, cwd: None,
                 parent_tool_use_id: None,
             };
-            match role {
-                "user" => parse_codex_content_rich(payload, MessageRole::User, &base),
-                "assistant" => parse_codex_content_rich(payload, MessageRole::Assistant, &base),
-                "developer" => parse_codex_content_rich(payload, MessageRole::Developer, &base),
+            // Codex response items dispatch on payload.type: `message` carries
+            // role+content, while `function_call`, `function_call_output`, and
+            // `reasoning` are top-level items with no role field.
+            match payload["type"].as_str().unwrap_or("") {
+                "message" => {
+                    let role = match payload["role"].as_str() {
+                        Some("user") => MessageRole::User,
+                        Some("assistant") => MessageRole::Assistant,
+                        Some("developer") => MessageRole::Developer,
+                        _ => return vec![],
+                    };
+                    parse_codex_content_rich(payload, role, &base)
+                }
+                "function_call" => {
+                    let name = payload["name"].as_str().unwrap_or("unknown").to_string();
+                    let tool_use_id = payload["call_id"].as_str().map(String::from);
+                    let args_str = payload["arguments"].as_str().unwrap_or("{}");
+                    let input: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
+                    let target = extract_tool_target(&name, &input);
+                    vec![make_rich(
+                        MessageRole::ToolUse,
+                        EventDetail::ToolUse { name, target, tool_use_id, input },
+                        &base,
+                    )]
+                }
+                "function_call_output" => {
+                    let tool_use_id = payload["call_id"].as_str().unwrap_or("?").to_string();
+                    let output = payload["output"].as_str().unwrap_or("");
+                    let size = output.len();
+                    let preview = oneline_snippet(output, 200);
+                    let exit_code = extract_exit_code(output);
+                    vec![make_rich(
+                        MessageRole::ToolResult,
+                        EventDetail::ToolResult {
+                            tool_use_id, is_error: false, exit_code, size, preview,
+                        },
+                        &base,
+                    )]
+                }
+                "reasoning" => {
+                    // Codex reasoning content is usually encrypted; surface
+                    // readable text when summary/content carries it.
+                    let text = payload["summary"][0]["text"].as_str()
+                        .or_else(|| payload["content"][0]["text"].as_str())
+                        .or_else(|| payload["text"].as_str())
+                        .unwrap_or("");
+                    if text.is_empty() {
+                        vec![]
+                    } else {
+                        vec![make_rich(
+                            MessageRole::Thinking,
+                            EventDetail::Thinking { text: text.into() },
+                            &base,
+                        )]
+                    }
+                }
                 _ => vec![],
             }
         }
@@ -829,7 +899,7 @@ pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
                 }
             }
             "gemini" => {
-                // Thoughts (reasoning) first, then content.
+                // Thoughts (reasoning) first, then content, then any tool calls.
                 if let Some(thoughts) = msg["thoughts"].as_array() {
                     for t in thoughts {
                         let subject = t["subject"].as_str().unwrap_or("");
@@ -850,9 +920,76 @@ pub fn parse_gemini_file_rich(raw: &str) -> Vec<TranscriptEvent> {
                 }
                 if let Some(s) = msg["content"].as_str() {
                     if !s.is_empty() {
+                        // Gemini sometimes inlines reasoning into `content`
+                        // delimited by `[Thought: true]` markers: each
+                        // segment before a marker is a thought, and anything
+                        // after the final marker is the assistant's answer.
+                        let segments = split_gemini_thought_segments(s);
+                        let last = segments.len().saturating_sub(1);
+                        for (i, seg) in segments.iter().enumerate() {
+                            let trimmed = seg.trim();
+                            if trimmed.is_empty() { continue; }
+                            if i == last {
+                                out.push(make_rich(
+                                    MessageRole::Assistant,
+                                    EventDetail::Text { text: trimmed.into() },
+                                    &base,
+                                ));
+                            } else {
+                                out.push(make_rich(
+                                    MessageRole::Thinking,
+                                    EventDetail::Thinking { text: trimmed.into() },
+                                    &base,
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Gemini packs call + result together: each toolCalls entry has
+                // id/name/args plus a result[].functionResponse.response blob
+                // and a status (success|error|cancelled). Emit a ToolUse/
+                // ToolResult pair per call so counters and tail rendering match
+                // the other providers.
+                if let Some(calls) = msg["toolCalls"].as_array() {
+                    for call in calls {
+                        let name = call["name"].as_str().unwrap_or("unknown").to_string();
+                        let tool_use_id = call["id"].as_str().map(String::from);
+                        let input = call["args"].clone();
+                        let target = extract_tool_target(&name, &input);
                         out.push(make_rich(
-                            MessageRole::Assistant,
-                            EventDetail::Text { text: s.into() },
+                            MessageRole::ToolUse,
+                            EventDetail::ToolUse {
+                                name: name.clone(),
+                                target,
+                                tool_use_id: tool_use_id.clone(),
+                                input,
+                            },
+                            &base,
+                        ));
+                        let status = call["status"].as_str().unwrap_or("success");
+                        let is_error = status != "success";
+                        let response = call["result"][0]["functionResponse"]["response"].clone();
+                        let output = if let Some(s) = response["output"].as_str() {
+                            s.to_string()
+                        } else if let Some(s) = response["error"].as_str() {
+                            s.to_string()
+                        } else if response.is_null() {
+                            String::new()
+                        } else {
+                            response.to_string()
+                        };
+                        let size = output.len();
+                        let preview = oneline_snippet(&output, 200);
+                        let exit_code = extract_exit_code(&output);
+                        out.push(make_rich(
+                            MessageRole::ToolResult,
+                            EventDetail::ToolResult {
+                                tool_use_id: tool_use_id.unwrap_or_else(|| "?".into()),
+                                is_error,
+                                exit_code,
+                                size,
+                                preview,
+                            },
                             &base,
                         ));
                     }
@@ -1075,22 +1212,51 @@ pub fn parse_codex_line(line: &str, session_id: &str) -> Vec<ParsedEvent> {
         }
         "response_item" => {
             let payload = &v["payload"];
-            let role = payload["role"].as_str().unwrap_or("");
-            let cwd = None; // Not per-message in Codex
-
             let base = EventBase {
                 session_id: session_id.to_string(),
                 timestamp,
                 git_branch: None,
                 is_subagent: false,
                 agent_slug: None,
-                cwd,
+                cwd: None,
             };
-
-            match role {
-                "user" => parse_codex_content_blocks(payload, MessageRole::User, &base),
-                "assistant" => parse_codex_content_blocks(payload, MessageRole::Assistant, &base),
-                "developer" => parse_codex_content_blocks(payload, MessageRole::Developer, &base),
+            // Codex response items dispatch on payload.type: `message` carries
+            // role+content, while `function_call`, `function_call_output`, and
+            // `reasoning` are top-level items with no role field.
+            match payload["type"].as_str().unwrap_or("") {
+                "message" => {
+                    let role = match payload["role"].as_str() {
+                        Some("user") => MessageRole::User,
+                        Some("assistant") => MessageRole::Assistant,
+                        Some("developer") => MessageRole::Developer,
+                        _ => return vec![],
+                    };
+                    parse_codex_content_blocks(payload, role, &base)
+                }
+                "function_call" => {
+                    let name = payload["name"].as_str().unwrap_or("unknown");
+                    let args = payload["arguments"].as_str().unwrap_or("{}");
+                    vec![make_event(MessageRole::ToolUse, &truncate(&format!("tool:{} {}", name, args)), &base)]
+                }
+                "function_call_output" => {
+                    let output = payload["output"].as_str().unwrap_or("");
+                    if output.is_empty() {
+                        vec![]
+                    } else {
+                        vec![make_event(MessageRole::ToolResult, &truncate(&format!("result: {}", output)), &base)]
+                    }
+                }
+                "reasoning" => {
+                    let text = payload["summary"][0]["text"].as_str()
+                        .or_else(|| payload["content"][0]["text"].as_str())
+                        .or_else(|| payload["text"].as_str())
+                        .unwrap_or("");
+                    if text.is_empty() {
+                        vec![]
+                    } else {
+                        vec![make_event(MessageRole::Thinking, &truncate(text), &base)]
+                    }
+                }
                 _ => vec![],
             }
         }
@@ -1355,6 +1521,96 @@ mod tests {
     }
 
     #[test]
+    fn test_rich_gemini_inline_thoughts() {
+        let raw = json!({
+            "sessionId": "g1",
+            "messages": [{
+                "id": "m1",
+                "timestamp": "t",
+                "type": "gemini",
+                "content": "**Step 1** thinking about problem[Thought: true]**Step 2** more thinking[Thought:true]Here is the final answer."
+            }]
+        }).to_string();
+        let events = parse_gemini_file_rich(&raw);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0].detail, EventDetail::Thinking { .. }));
+        assert!(matches!(events[1].detail, EventDetail::Thinking { .. }));
+        match &events[2].detail {
+            EventDetail::Text { text } => assert_eq!(text, "Here is the final answer."),
+            _ => panic!("expected trailing Text"),
+        }
+    }
+
+    #[test]
+    fn test_rich_gemini_no_inline_thoughts() {
+        // Plain content with no markers should still produce a single Text event.
+        let raw = json!({
+            "sessionId": "g1",
+            "messages": [{
+                "id": "m1", "timestamp": "t", "type": "gemini",
+                "content": "just the answer"
+            }]
+        }).to_string();
+        let events = parse_gemini_file_rich(&raw);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0].detail, EventDetail::Text { .. }));
+    }
+
+    #[test]
+    fn test_rich_gemini_tool_calls() {
+        let raw = json!({
+            "sessionId": "g1",
+            "messages": [{
+                "id": "m1",
+                "timestamp": "t",
+                "type": "gemini",
+                "content": "",
+                "toolCalls": [
+                    {
+                        "id": "c1",
+                        "name": "read_file",
+                        "args": {"path": "foo.rs"},
+                        "status": "success",
+                        "result": [{"functionResponse": {"response": {"output": "file contents"}}}]
+                    },
+                    {
+                        "id": "c2",
+                        "name": "read_file",
+                        "args": {"path": "nope.rs"},
+                        "status": "error",
+                        "result": [{"functionResponse": {"response": {"error": "File not found"}}}]
+                    }
+                ]
+            }]
+        }).to_string();
+        let events = parse_gemini_file_rich(&raw);
+        assert_eq!(events.len(), 4);
+        match &events[0].detail {
+            EventDetail::ToolUse { name, target, tool_use_id, .. } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(target, "foo.rs");
+                assert_eq!(tool_use_id.as_deref(), Some("c1"));
+            }
+            _ => panic!("expected ToolUse"),
+        }
+        match &events[1].detail {
+            EventDetail::ToolResult { is_error, preview, tool_use_id, .. } => {
+                assert!(!is_error);
+                assert_eq!(preview, "file contents");
+                assert_eq!(tool_use_id, "c1");
+            }
+            _ => panic!("expected ToolResult"),
+        }
+        match &events[3].detail {
+            EventDetail::ToolResult { is_error, preview, .. } => {
+                assert!(is_error);
+                assert_eq!(preview, "File not found");
+            }
+            _ => panic!("expected error ToolResult"),
+        }
+    }
+
+    #[test]
     fn test_extract_tool_target_fallback() {
         let v = json!({ "some_random_field": "meaningful value" });
         assert_eq!(extract_tool_target("UnknownTool", &v), "meaningful value");
@@ -1496,21 +1752,33 @@ mod tests {
         assert_eq!(ev1[0].role, MessageRole::Developer);
         assert_eq!(ev1[0].content, "Be helpful");
 
-        let resp = json!({
+        // assistant text message
+        let msg = json!({
             "type": "response_item",
             "payload": {
+                "type": "message",
                 "role": "assistant",
-                "content": [
-                    { "type": "output_text", "text": "Done" },
-                    { "type": "function_call", "name": "ls", "arguments": "{\"path\": \".\"}" }
-                ]
+                "content": [{ "type": "output_text", "text": "Done" }]
             }
         }).to_string();
-        let ev2 = parse_codex_line(&resp, "s1");
-        assert_eq!(ev2.len(), 2);
-        assert_eq!(ev2[0].role, MessageRole::Assistant);
-        assert_eq!(ev2[1].role, MessageRole::ToolUse);
-        assert!(ev2[1].content.contains("tool:ls"));
+        let ev_msg = parse_codex_line(&msg, "s1");
+        assert_eq!(ev_msg.len(), 1);
+        assert_eq!(ev_msg[0].role, MessageRole::Assistant);
+
+        // function_call is a top-level response_item with no role
+        let call = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "ls",
+                "arguments": "{\"path\": \".\"}",
+                "call_id": "c1"
+            }
+        }).to_string();
+        let ev_call = parse_codex_line(&call, "s1");
+        assert_eq!(ev_call.len(), 1);
+        assert_eq!(ev_call[0].role, MessageRole::ToolUse);
+        assert!(ev_call[0].content.contains("tool:ls"));
     }
 
     #[test]
@@ -1561,6 +1829,7 @@ mod tests {
         let line = json!({
             "type": "response_item",
             "payload": {
+                "type": "message",
                 "role": "user",
                 "content": "direct text"
             }
@@ -1572,19 +1841,31 @@ mod tests {
 
     #[test]
     fn test_parse_codex_reasoning() {
-        let line = json!({
+        // Codex reasoning is a top-level response_item. Live sessions usually
+        // carry encrypted content with empty summary/content; we surface
+        // readable text only when it exists.
+        let with_text = json!({
             "type": "response_item",
             "payload": {
-                "role": "assistant",
-                "content": [
-                    { "type": "reasoning", "text": "Thinking hard" }
-                ]
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "Thinking hard" }]
             }
         }).to_string();
-        let events = parse_codex_line(&line, "s1");
+        let events = parse_codex_line(&with_text, "s1");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].role, MessageRole::Thinking);
         assert_eq!(events[0].content, "Thinking hard");
+
+        let encrypted_only = json!({
+            "type": "response_item",
+            "payload": {
+                "type": "reasoning",
+                "summary": [],
+                "content": null,
+                "encrypted_content": "gAAAAA..."
+            }
+        }).to_string();
+        assert!(parse_codex_line(&encrypted_only, "s1").is_empty());
     }
 
     #[test]
@@ -1592,10 +1873,9 @@ mod tests {
         let line = json!({
             "type": "response_item",
             "payload": {
-                "role": "assistant",
-                "content": [
-                    { "type": "function_call_output", "output": "Tool result" }
-                ]
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": "Tool result"
             }
         }).to_string();
         let events = parse_codex_line(&line, "s1");
