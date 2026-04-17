@@ -32,6 +32,8 @@ pub struct ThreadParams {
     #[serde(default)] pub target_type: Option<String>,
     #[serde(default)] pub edge: Option<String>,
     #[serde(default)] pub promoted_to: Option<String>,
+    /// Thread kind (e.g. "work_item"). Optional; defaults to general.
+    #[serde(default)] pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -41,6 +43,8 @@ pub struct ThreadListParams {
     #[serde(default)] pub name: Option<String>,
     #[serde(default)] pub stale_days: Option<u64>,
     #[serde(default)] pub include_resolved: Option<bool>,
+    /// Filter by thread kind (e.g. "work_item")
+    #[serde(default)] pub kind: Option<String>,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -55,6 +59,16 @@ pub enum ThreadStatus {
     Resolved,
     /// graduated to graph (finding/inquiry/task)
     Promoted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ThreadKind {
+    /// Orchestrator-led propose → execute → review → refine loop
+    WorkItem,
+    /// Investigation or QC walk
+    Investigation,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
@@ -113,6 +127,8 @@ pub struct Thread {
     pub topic: String,
     pub project: String,
     pub status: ThreadStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ThreadKind>,
     pub sessions: Vec<SessionLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handoff_doc: Option<String>,
@@ -193,6 +209,12 @@ impl Threads {
         format!("thread-{:08x}", hash as u32)
     }
 
+    /// Immutable slice of all stored threads — used by cross-store
+    /// aggregators (inbox) that can't go through the MCP layer.
+    pub fn all(&self) -> &[Thread] {
+        &self.store.threads
+    }
+
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
 
     pub fn thread(&mut self, p: &ThreadParams) -> Result<String> {
@@ -227,12 +249,20 @@ impl Threads {
 
         let notes = p.note.clone().into_iter().collect();
 
+        let kind = p
+            .kind
+            .as_deref()
+            .map(ThreadKind::from_str)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Unknown thread kind: {:?}. Use: work_item, investigation", p.kind))?;
+
         let thread = Thread {
             id: id.clone(),
             name: p.name.clone(),
             topic: topic.to_string(),
             project: project.to_string(),
             status: ThreadStatus::Open,
+            kind,
             sessions,
             handoff_doc: p.handoff_doc.clone(),
             notes,
@@ -271,6 +301,9 @@ impl Threads {
             out.push_str(&format!("Name: {}\n", name));
         }
         out.push_str(&format!("Status: {}\n", thread.status.as_ref()));
+        if let Some(k) = thread.kind {
+            out.push_str(&format!("Kind: {}\n", k.as_ref()));
+        }
         out.push_str(&format!("Project: {}\n", if thread.project.is_empty() { "-" } else { &thread.project }));
         out.push_str(&format!("Created: {}\n", thread.created_at));
         out.push_str(&format!("Last activity: {}\n", thread.last_activity));
@@ -518,6 +551,12 @@ impl Threads {
         let name_filter = p.name.as_deref();
         let stale_days = p.stale_days;
         let include_resolved = p.include_resolved.unwrap_or(false);
+        let kind_filter = p
+            .kind
+            .as_deref()
+            .map(ThreadKind::from_str)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Unknown thread kind: {:?}", p.kind))?;
 
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -564,6 +603,13 @@ impl Threads {
             if let Some(days) = stale_days {
                 let age = self.thread_age_days(thread, now_secs);
                 if age < days {
+                    continue;
+                }
+            }
+
+            // Kind filter
+            if let Some(k) = kind_filter {
+                if thread.kind != Some(k) {
                     continue;
                 }
             }

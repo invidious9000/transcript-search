@@ -79,6 +79,20 @@ pub struct TopicsParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct CiteParams {
+    /// The claim, rule, or phrase to trace back to its origin
+    pub claim: String,
+    /// Filter to account
+    #[serde(default)] pub account: Option<String>,
+    /// Filter by project path keywords
+    #[serde(default)] pub project: Option<String>,
+    /// Role to cite (default: "user" — who said it originally)
+    #[serde(default)] pub role: Option<String>,
+    /// Max citations (default: 5, max: 20)
+    #[serde(default)] pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionsListParams {
     #[serde(default)] pub account: Option<String>,
     #[serde(default)] pub project: Option<String>,
@@ -205,6 +219,109 @@ impl TranscriptIndex {
             results.len(),
             results.join("\n\n---\n\n")
         ))
+    }
+
+    // ── Cite ────────────────────────────────────────────────────────
+
+    /// Trace a claim back to the transcript turn where it was established.
+    /// Defaults to role=user (the origin of most rules/preferences),
+    /// auto-wraps the claim in quotes for phrase matching unless it
+    /// already contains quoted segments, and returns citation-shaped
+    /// output sorted oldest-first so the earliest mention surfaces first.
+    pub fn cite(&self, p: &CiteParams) -> Result<String> {
+        let limit = p.limit.unwrap_or(5).min(20) as usize;
+        let role = p.role.as_deref().unwrap_or("user");
+
+        if self.is_empty() {
+            return Ok("Index is empty. Run bbox_reindex first.".to_string());
+        }
+
+        let claim = p.claim.trim();
+        if claim.is_empty() {
+            anyhow::bail!("'claim' is required");
+        }
+        let query_str = if claim.contains('"') {
+            claim.to_string()
+        } else {
+            format!("\"{claim}\"")
+        };
+
+        let searcher = self.reader.searcher();
+        let mut qp = QueryParser::for_index(&self.index, vec![self.fields.content]);
+        qp.set_conjunction_by_default();
+        let text_query = qp.parse_query(&query_str)?;
+
+        let mut clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = vec![
+            (Occur::Must, text_query.box_clone()),
+            (Occur::Must, Box::new(TermQuery::new(
+                Term::from_field_text(self.fields.role, role),
+                IndexRecordOption::Basic,
+            ))),
+        ];
+
+        if let Some(account) = p.account.as_deref() {
+            clauses.push((
+                Occur::Must,
+                Box::new(TermQuery::new(
+                    Term::from_field_text(self.fields.account, account),
+                    IndexRecordOption::Basic,
+                )),
+            ));
+        }
+
+        if let Some(project) = p.project.as_deref() {
+            let mut pqp = QueryParser::for_index(&self.index, vec![self.fields.project]);
+            pqp.set_conjunction_by_default();
+            if let Ok(pq) = pqp.parse_query(project) {
+                clauses.push((Occur::Must, pq));
+            }
+        }
+
+        let query = BooleanQuery::new(clauses);
+        // Pull a generous top-N by score, then resort by timestamp ascending
+        // so the oldest citation (most likely the origin) shows first.
+        let fetch = (limit * 4).max(20);
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(fetch))?;
+
+        if top_docs.is_empty() {
+            return Ok(format!("No citations found for: {claim}"));
+        }
+
+        let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
+
+        let mut rows: Vec<(String, String, String, String, String, String, String)> = Vec::new();
+        for (_score, addr) in &top_docs {
+            let doc: TantivyDocument = searcher.doc(*addr)?;
+            let snippet = snippet_gen.snippet_from_doc(&doc);
+            let excerpt = snippet
+                .to_html()
+                .replace("<b>", "**")
+                .replace("</b>", "**");
+
+            rows.push((
+                self.doc_text(&doc, self.fields.timestamp),
+                self.doc_text(&doc, self.fields.account),
+                self.doc_text(&doc, self.fields.project),
+                self.doc_text(&doc, self.fields.session_id),
+                self.doc_text(&doc, self.fields.role),
+                self.doc_text(&doc, self.fields.file_path),
+                excerpt,
+            ));
+        }
+
+        // Oldest first — origin of the claim
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows.truncate(limit);
+
+        let mut out = String::new();
+        out.push_str(&format!("{} citation(s) for: {claim}\n\n", rows.len()));
+        for (ts, account, project, sid, r, file, excerpt) in &rows {
+            out.push_str(&format!(
+                "[{ts}] {account}/{r} — {project}\n  session: {sid}\n  file: {file}\n  > {excerpt}\n\n"
+            ));
+        }
+
+        Ok(out)
     }
 
     // ── Context ─────────────────────────────────────────────────────

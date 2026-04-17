@@ -117,6 +117,27 @@ pub struct BootstrapParams {
     pub project: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DecideParams {
+    /// The decision itself — the commitment being made
+    pub content: String,
+    /// Why — the justification for this decision (required)
+    pub rationale: String,
+    /// ID of the decision this one replaces (optional). Marks the old
+    /// entry as superseded and links it to this one.
+    #[serde(default)] pub supersedes: Option<String>,
+    /// Short title (auto-generated from content if omitted)
+    #[serde(default)] pub title: Option<String>,
+    /// global or project (default: global)
+    #[serde(default)] pub scope: Option<String>,
+    /// Project path for project-scoped decisions
+    #[serde(default)] pub project: Option<String>,
+    /// Priority: critical, standard, supplementary (default: standard)
+    #[serde(default)] pub priority: Option<String>,
+    /// Render into provider markdown files (default: true)
+    #[serde(default)] pub render: Option<bool>,
+}
+
 // ── Schema ─────────────────────────────────────────────────────────
 
 #[derive(
@@ -150,6 +171,7 @@ pub enum Category {
     Tool,
     Memory,
     Workflow,
+    Decision,
 }
 
 impl Category {
@@ -165,6 +187,7 @@ impl Category {
             Self::Tool => "Tools",
             Self::Memory => "Memory",
             Self::Workflow => "Workflow",
+            Self::Decision => "Decisions",
         }
     }
 }
@@ -221,6 +244,9 @@ pub struct KnowledgeEntry {
     pub review_at: Option<String>, // soft staleness checkpoint (ISO 8601)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<String>,
+    /// For `decision` entries: the rationale behind this commitment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
     pub source: String,
@@ -324,6 +350,26 @@ impl Knowledge {
         })
     }
 
+    /// Immutable slice of all stored entries (any status) — used by
+    /// cross-store aggregators (inbox) that can't go through the MCP
+    /// layer.
+    pub fn all_entries(&self) -> &[KnowledgeEntry] {
+        &self.store.entries
+    }
+
+    /// Insert-or-replace a code-generated entry by its stable ID.
+    /// Bypasses the normal `learn` flow (no ID generation, no approval
+    /// defaulting). Used by `tool_docs::sync_into_knowledge` to keep
+    /// the auto-generated tool reference in sync with the binary.
+    pub fn upsert_generated(&mut self, entry: KnowledgeEntry) -> Result<()> {
+        if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
+            *existing = entry;
+        } else {
+            self.store.entries.push(entry);
+        }
+        self.save()
+    }
+
     /// Active entries that should be rendered into markdown (excludes indexed-only).
     fn renderable_entries(&self) -> impl Iterator<Item = &KnowledgeEntry> {
         self.active_entries().filter(|e| e.render)
@@ -395,6 +441,7 @@ impl Knowledge {
             status: Status::Active,
             approval,
             supersedes: None,
+            rationale: None,
             expires_at: p.expires_at.clone(),
             source: if from_agent { "agent".to_string() } else { "user".to_string() },
             created_at: now.clone(),
@@ -438,6 +485,7 @@ impl Knowledge {
             status: Status::Active,
             approval: Approval::Imported,
             supersedes: None,
+            rationale: None,
             expires_at: None,
             source: "imported".to_string(),
             created_at: now.clone(),
@@ -479,6 +527,7 @@ impl Knowledge {
             status: Status::Active,
             approval: if from_agent { Approval::AgentInferred } else { Approval::UserConfirmed },
             supersedes: None,
+            rationale: None,
             expires_at: p.expires_at.clone(),
             source: if from_agent { "agent".to_string() } else { "user".to_string() },
             created_at: now.clone(),
@@ -489,6 +538,79 @@ impl Knowledge {
 
         self.save()?;
         Ok(format!("Remembered entry {id} (indexed only, not rendered)"))
+    }
+
+    /// Decide — a durable commitment with rationale. When `supersedes`
+    /// is set, marks the prior entry as superseded and records a link
+    /// from the old to the new (via the existing `supersedes` field).
+    pub fn decide(&mut self, p: &DecideParams, from_agent: bool) -> Result<String> {
+        if p.content.trim().is_empty() {
+            anyhow::bail!("'content' is required");
+        }
+        if p.rationale.trim().is_empty() {
+            anyhow::bail!("'rationale' is required — a decision without justification is just a command");
+        }
+
+        let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
+        let scope = Scope::parse_or_global(p.scope.as_deref());
+        let priority = match p.priority.as_deref().unwrap_or("standard") {
+            "critical" => Priority::Critical,
+            "supplementary" => Priority::Supplementary,
+            _ => Priority::Standard,
+        };
+        let render_flag = p.render.unwrap_or(true);
+
+        // Validate supersedes target exists before we create anything.
+        if let Some(old_id) = p.supersedes.as_deref() {
+            if !self.store.entries.iter().any(|e| e.id == old_id) {
+                anyhow::bail!("Supersedes target not found: {old_id}");
+            }
+        }
+
+        let now = Self::now_iso();
+        let id = Self::gen_id();
+
+        self.store.entries.push(KnowledgeEntry {
+            id: id.clone(),
+            title,
+            content: p.content.clone(),
+            variants: HashMap::new(),
+            category: Category::Decision,
+            scope,
+            project: p.project.clone(),
+            providers: Vec::new(),
+            priority,
+            weight: 100,
+            render: render_flag,
+            decay: false, // decisions are durable by default; invariants until explicitly superseded
+            review_at: None,
+            status: Status::Active,
+            approval: if from_agent { Approval::AgentInferred } else { Approval::UserConfirmed },
+            supersedes: None,
+            rationale: Some(p.rationale.clone()),
+            expires_at: None,
+            source: if from_agent { "agent".to_string() } else { "user".to_string() },
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            recall_count: 0,
+            last_recalled: None,
+        });
+
+        // If this decision supersedes a prior entry, mark it.
+        if let Some(old_id) = p.supersedes.as_deref() {
+            if let Some(old) = self.store.entries.iter_mut().find(|e| e.id == old_id) {
+                old.status = Status::Superseded;
+                old.supersedes = Some(id.clone());
+                old.updated_at = now;
+            }
+        }
+
+        self.save()?;
+        if let Some(old_id) = p.supersedes.as_deref() {
+            Ok(format!("Decided entry {id} (supersedes {old_id})"))
+        } else {
+            Ok(format!("Decided entry {id}"))
+        }
     }
 
     pub fn forget(&mut self, p: &ForgetParams) -> Result<String> {
@@ -772,12 +894,13 @@ impl Knowledge {
         Ok(results.join("\n\n"))
     }
 
-    /// Body for a global-memory file: built-in preamble + global steerage +
-    /// global shared memory. No PROJECT.md (that's project-scope).
+    /// Body for a global-memory file: global steerage + global shared
+    /// memory (including the auto-generated `bb-tool-reference` entry).
+    /// No hand-authored preamble — `tool_docs.rs` is the source of
+    /// truth for the tool surface and flows through the normal entry
+    /// render path.
     fn render_global_body(&self, provider: &str) -> Result<String> {
         let mut md = String::new();
-        md.push_str(&crate::render::builtin_preamble(provider));
-        md.push_str("\n\n");
         self.render_steerage(provider, ScopeFilter::Global, &mut md);
         self.render_memory(provider, ScopeFilter::Global, &mut md);
         Ok(md)
@@ -1503,6 +1626,89 @@ body
                 "all extracted sections should be structural-only in this shape: {s:?}"
             );
         }
+    }
+
+    fn mk_kb() -> (tempfile::TempDir, Knowledge) {
+        let dir = tempfile::tempdir().unwrap();
+        let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
+        (dir, kb)
+    }
+
+    #[test]
+    fn decide_requires_rationale() {
+        let (_t, mut kb) = mk_kb();
+        let e = kb.decide(
+            &DecideParams {
+                content: "use Tokio runtime everywhere".into(),
+                rationale: "  ".into(),
+                supersedes: None,
+                title: None,
+                scope: None,
+                project: None,
+                priority: None,
+                render: None,
+            },
+            false,
+        ).unwrap_err();
+        assert!(e.to_string().contains("rationale"));
+    }
+
+    #[test]
+    fn decide_supersedes_marks_prior() {
+        let (_t, mut kb) = mk_kb();
+        let r1 = kb.decide(
+            &DecideParams {
+                content: "use SQLite for the cache".into(),
+                rationale: "zero ops, fits in proc".into(),
+                supersedes: None,
+                title: None,
+                scope: None,
+                project: None,
+                priority: None,
+                render: None,
+            },
+            false,
+        ).unwrap();
+        // "Decided entry <id>"
+        let old_id = r1.trim_start_matches("Decided entry ").to_string();
+
+        let r2 = kb.decide(
+            &DecideParams {
+                content: "use RocksDB for the cache".into(),
+                rationale: "SQLite locking conflicted with concurrent writers".into(),
+                supersedes: Some(old_id.clone()),
+                title: None,
+                scope: None,
+                project: None,
+                priority: None,
+                render: None,
+            },
+            false,
+        ).unwrap();
+        assert!(r2.contains(&format!("supersedes {old_id}")));
+
+        let old = kb.store.entries.iter().find(|e| e.id == old_id).unwrap();
+        assert_eq!(old.status, Status::Superseded);
+        assert!(old.supersedes.is_some(), "old entry should now point at successor");
+    }
+
+    #[test]
+    fn decide_supersedes_missing_rejected() {
+        let (_t, mut kb) = mk_kb();
+        let e = kb.decide(
+            &DecideParams {
+                content: "x".into(),
+                rationale: "y".into(),
+                supersedes: Some("no-such-id".into()),
+                title: None,
+                scope: None,
+                project: None,
+                priority: None,
+                render: None,
+            },
+            false,
+        ).unwrap_err();
+        assert!(e.to_string().contains("not found"));
     }
 }
 

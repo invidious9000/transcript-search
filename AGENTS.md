@@ -17,23 +17,26 @@ MCP tools are prefixed `bbox_*` (transcript/knowledge/threads) and `bro_*` (orch
 ```bash
 cargo build --release    # release binaries at target/release/{blackboxd,bro}
 cargo build              # debug build
-cargo test               # unit tests (72 tests, ~0.1s)
+cargo test               # unit tests (139 tests, ~0.1s)
 cargo clippy             # lint
 ```
 
-`blackboxd` communicates via JSON-RPC 2.0 over stdin/stdout. Stderr is reserved for tracing logs — never write to stdout except MCP responses.
+`blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7263}/mcp`. Stderr carries tracing logs; stdout is unused.
 
 ## Architecture
 
 Source layout (`src/`):
 
-- **main.rs** — JSON-RPC message loop, MCP tool dispatcher (`#[tool]`-annotated handlers), signal handling (SIGUSR1 triggers reindex), HTTP `/tail` SSE endpoint for `bro tail`.
+- **main.rs** — HTTP server bootstrap (`axum`), MCP tool dispatcher (`#[tool]`-annotated handlers), HTTP routes: `/mcp` (streamable MCP), `/tail` (SSE for `bro tail`), `/roster` (team/bro snapshot). Transcript tools include `bbox_cite` (trace a claim back to its origin turn, role=user default, citations returned oldest-first).
 - **cli.rs** — `bro` binary. Connects to `blackboxd`'s `/tail` endpoint and renders colorized live task events.
 - **index/** — Tantivy index lifecycle, schema (account, project, role, session_id, content, timestamps, git_branch, agent_slug, is_subagent, cwd), search/browse handlers, incremental reindex thread.
 - **parser.rs** — Multi-format transcript parsing: Claude Code (`message.content` array), Codex CLI (`payload.content`), history.jsonl (`display`). Extracts roles, tool use/results, thinking blocks. Caps content at 12KB per document.
-- **knowledge.rs** — Knowledge entry CRUD (`~/.claude-shared/blackbox-knowledge.json`). Render pipeline emits provider-specific markdown (CLAUDE.md, AGENTS.md, GEMINI.md) with three layers: steerage → shared memory → PROJECT.md. Git-based absorption imports external edits to rendered files as unverified entries.
-- **threads.rs** — Work thread tracker for non-dispatchable, multi-session efforts. Friendly names with rename support; typed graph edges between threads/sessions.
-- **orchestration/** — Multi-provider agent dispatch (Claude, Codex, Copilot, Vibe, Gemini). Provider catalogs (models, effort tiers), exec/resume arg builders, brofile/team management, task lifecycle, tail event stream.
+- **knowledge.rs** — Knowledge entry CRUD (`~/.claude-shared/blackbox-knowledge.json`). Three write verbs: `bbox_learn` (rendered rules/conventions), `bbox_remember` (indexed-only notes), `bbox_decide` (durable commitments with required rationale + supersession chain). Render pipeline emits provider-specific markdown (CLAUDE.md, AGENTS.md, GEMINI.md) with three layers: steerage → shared memory → PROJECT.md. Git-based absorption imports external edits to rendered files as unverified entries.
+- **threads.rs** — Work thread tracker for non-dispatchable, multi-session efforts. Friendly names with rename support; typed graph edges between threads/sessions. Thread `kind` distinguishes `work_item` (propose→execute→review→refine loops) from `investigation`.
+- **notes.rs** — Side-channel note store (`bbox_note`). Structured records executors emit during work — kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Scan-friendly trail so the orchestrator can query instead of re-parsing prose. Filterable by kind/project/session/thread/resolution.
+- **inbox.rs** — Attention layer (`bbox_inbox`). Cross-store aggregator that surfaces unresolved notes (disputes/blocked/surprises), deferred followups, stale threads, unverified knowledge, and failed bro tasks in one ranked view.
+- **tool_docs.rs** — Single source of truth for the agent-facing tool reference. Per-tool stanzas (`name`, `summary`, `when_to_use`, `example`) grouped by category plus cross-tool `WORKFLOW_NOTES`. Rendered into a fixed-ID global knowledge entry (`bb-tool-reference`) by `sync_into_knowledge`, which runs automatically on every daemon startup. A compile-time unit test asserts every `#[tool]`-registered name has a matching stanza — adding a tool without docs fails the build.
+- **orchestration/** — Multi-provider agent dispatch (Claude, Codex, Copilot, Vibe, Gemini). Provider catalogs (models, effort tiers), exec/resume arg builders, brofile/team management, task lifecycle, tail event stream. Two orthogonal prompt layers: **ambient** (`apply_ambient`, per-turn) prepends the recursion guard and a scope block with pre-bound `session`/`project`/`bro`/`thread`/`work_item` IDs + optional `completion_contract`; **brofile lens** (`apply_brofile_lens`, persona/system-prompt layer) composes on top. Only the ambient layer is gated by `allow_recursion`.
 - **render.rs** — Markdown emitter shared by knowledge render and other tooling.
 
 ## Provider Catalog
@@ -59,16 +62,18 @@ Maintained in `src/orchestration/providers.rs`:
 - `TRANSCRIPT_SEARCH_CODEX_ROOT` — override Codex data dir
 - `TRANSCRIPT_SEARCH_INDEX_PATH` — override tantivy index location
 - `BLACKBOX_REINDEX_INTERVAL_SECS` — background reindex interval (default: 120)
-- `BBOX_PORT` / `BRO_PORT` — HTTP port for `/tail` endpoint (default: 7263)
+- `BBOX_PORT` / `BRO_PORT` — HTTP listener port for `/mcp`, `/tail`, `/roster` (default: 7263)
 - `CLAUDE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` — override provider binary paths
 - `RUST_LOG` — tracing filter (default: `transcript_search=info`)
 
 ## Deployment
 
 `blackboxd` is designed to run as a single long-lived user service, not a
-per-session stdio child. It exposes HTTP MCP on `127.0.0.1:${BBOX_PORT:-7264}/mcp`
+per-session stdio child. It exposes HTTP MCP on `127.0.0.1:${BBOX_PORT:-7263}/mcp`
 so every Claude/Codex/Gemini CLI on the host connects to one daemon with one
-shared knowledge store + tantivy index.
+shared knowledge store + tantivy index. The bundled `deploy/blackbox.service`
+unit pins `BBOX_PORT=7264` — 7263 is avoided to prevent clashing with an
+older retired `bro.service`. Client config examples below use 7264 accordingly.
 
 Install template at `deploy/blackbox.service`:
 

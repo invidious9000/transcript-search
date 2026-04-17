@@ -196,19 +196,106 @@ impl TaskStore {
 // Spawn + lifecycle
 // ---------------------------------------------------------------------------
 
-const RECURSION_GUARD: &str =
-    "IMPORTANT: Do not call tools from the bro MCP server (recursion guard).\n\n";
+// ── Ambient prompt layer (per-turn, scoping + guardrails) ───────────
+//
+// The per-turn injection carries only what the agent cannot otherwise
+// derive: guardrails (recursion guard) and pre-bound scoping IDs
+// (session, project, bro, thread, work-item). It does NOT carry tool
+// vocabulary or protocol definitions — those belong to the start-of-
+// session layer rendered from `tool_docs` into the global memory files.
+//
+// This is deliberately separate from the brofile lens (persona / role
+// system-prompt). `apply_ambient` and `apply_brofile_lens` compose
+// freely but have distinct responsibilities:
+//   - ambient  = guardrail + scope (daemon-controlled, every dispatch)
+//   - lens     = persona / system-prompt (user-authored, per brofile)
 
-pub fn apply_lens(prompt: &str, lens: Option<&str>, allow_recursion: bool) -> String {
-    let mut result = if allow_recursion {
-        prompt.to_string()
-    } else {
-        format!("{RECURSION_GUARD}{prompt}")
-    };
-    if let Some(l) = lens {
-        result = format!("{l}\n\n{result}");
+const RECURSION_GUARD: &str =
+    "IMPORTANT: Do not call tools from the bro MCP server (recursion guard).";
+
+/// Pre-bound context the daemon has at dispatch time but the executor
+/// would otherwise have to infer by reaching back through the prompt.
+/// Emitting these into the prefix lets notes, thread links, and work-
+/// item attribution land correctly on the first attempt.
+#[derive(Debug, Clone, Default)]
+pub struct AmbientContext {
+    pub session_id: Option<String>,
+    pub project_dir: Option<String>,
+    pub bro_name: Option<String>,
+    pub thread_id: Option<String>,
+    pub work_item_id: Option<String>,
+    /// Per-dispatch expectation, e.g. "call bbox_note(kind='done', body='…') before returning".
+    pub completion_contract: Option<String>,
+    pub allow_recursion: bool,
+}
+
+impl AmbientContext {
+    /// Pending session IDs (non-Claude providers before the CLI emits
+    /// one) carry no useful linkage — omit rather than leak the literal
+    /// "pending" into the prefix.
+    fn session_field(&self) -> Option<&str> {
+        match self.session_id.as_deref() {
+            Some("pending") | Some("") | None => None,
+            Some(s) => Some(s),
+        }
     }
-    result
+
+    fn scope_fields(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if let Some(s) = self.session_field() {
+            parts.push(format!("session: {s}"));
+        }
+        if let Some(p) = &self.project_dir {
+            parts.push(format!("project: {p}"));
+        }
+        if let Some(b) = &self.bro_name {
+            parts.push(format!("bro: {b}"));
+        }
+        if let Some(t) = &self.thread_id {
+            parts.push(format!("thread: {t}"));
+        }
+        if let Some(w) = &self.work_item_id {
+            parts.push(format!("work_item: {w}"));
+        }
+        parts
+    }
+}
+
+/// Wrap a prompt with the per-turn ambient prefix (guardrail + scope +
+/// optional completion contract). Skipped entirely when
+/// `allow_recursion` is set. Does NOT touch the brofile lens.
+pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
+    if ctx.allow_recursion {
+        return prompt.to_string();
+    }
+    let mut prefix = String::new();
+    prefix.push_str(RECURSION_GUARD);
+    prefix.push_str("\n\n");
+
+    let fields = ctx.scope_fields();
+    if !fields.is_empty() {
+        prefix.push_str("[scope] ");
+        prefix.push_str(&fields.join(" · "));
+        prefix.push_str("\n\n");
+    }
+
+    if let Some(contract) = &ctx.completion_contract {
+        prefix.push_str("[completion contract]\n");
+        prefix.push_str(contract.trim_end());
+        prefix.push_str("\n\n");
+    }
+
+    format!("{prefix}{prompt}")
+}
+
+/// Prepend the brofile lens (persona / system prompt) to a prompt.
+/// Kept deliberately separate from `apply_ambient` — they're orthogonal
+/// layers. Compose: `apply_brofile_lens(&apply_ambient(p, &ctx), lens)`.
+pub fn apply_brofile_lens(prompt: &str, lens: Option<&str>) -> String {
+    match lens {
+        Some(l) if !l.trim().is_empty() => format!("{l}\n\n{prompt}"),
+        _ => prompt.to_string(),
+    }
 }
 
 /// Spawn a provider CLI process and return a tracked Task.
@@ -690,18 +777,83 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_lens() {
-        let result = apply_lens("do stuff", None, false);
-        assert!(result.starts_with("IMPORTANT:"));
-        assert!(result.contains("do stuff"));
+    fn ambient_wraps_with_guard_and_scope() {
+        let ctx = AmbientContext {
+            session_id: Some("sess-abc".into()),
+            project_dir: Some("/repo/x".into()),
+            bro_name: Some("executor".into()),
+            thread_id: None,
+            work_item_id: None,
+            completion_contract: None,
+            allow_recursion: false,
+        };
+        let out = apply_ambient("do stuff", &ctx);
+        assert!(out.starts_with("IMPORTANT:"));
+        assert!(out.contains("[scope]"));
+        assert!(out.contains("session: sess-abc"));
+        assert!(out.contains("project: /repo/x"));
+        assert!(out.contains("bro: executor"));
+        assert!(out.contains("do stuff"));
+        // Protocol text must NOT leak into per-turn anymore.
+        assert!(!out.contains("STRUCTURED SIDE CHANNEL"));
+    }
 
-        let result = apply_lens("do stuff", Some("You are a reviewer"), false);
-        assert!(result.starts_with("You are a reviewer"));
-        assert!(result.contains("IMPORTANT:"));
-        assert!(result.contains("do stuff"));
+    #[test]
+    fn ambient_skips_pending_session() {
+        let ctx = AmbientContext {
+            session_id: Some("pending".into()),
+            project_dir: Some("/repo/x".into()),
+            ..Default::default()
+        };
+        let out = apply_ambient("x", &ctx);
+        assert!(!out.contains("session:"), "pending session should be elided");
+        assert!(out.contains("project: /repo/x"));
+    }
 
-        let result = apply_lens("do stuff", None, true);
-        assert_eq!(result, "do stuff");
+    #[test]
+    fn ambient_allow_recursion_skips_everything() {
+        let ctx = AmbientContext {
+            allow_recursion: true,
+            ..Default::default()
+        };
+        assert_eq!(apply_ambient("raw", &ctx), "raw");
+    }
+
+    #[test]
+    fn ambient_emits_completion_contract_when_present() {
+        let ctx = AmbientContext {
+            completion_contract: Some(
+                "call bbox_note(kind=\"done\", body=\"summary\") before returning".into(),
+            ),
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        assert!(out.contains("[completion contract]"));
+        assert!(out.contains("bbox_note"));
+    }
+
+    #[test]
+    fn brofile_lens_prepends_persona() {
+        assert_eq!(
+            apply_brofile_lens("work", Some("You are a reviewer")),
+            "You are a reviewer\n\nwork"
+        );
+        assert_eq!(apply_brofile_lens("work", None), "work");
+        assert_eq!(apply_brofile_lens("work", Some("   ")), "work");
+    }
+
+    #[test]
+    fn ambient_and_lens_compose_cleanly() {
+        let ctx = AmbientContext {
+            session_id: Some("sess-xyz".into()),
+            allow_recursion: false,
+            ..Default::default()
+        };
+        let wrapped = apply_brofile_lens(&apply_ambient("work", &ctx), Some("You are a reviewer"));
+        assert!(wrapped.starts_with("You are a reviewer"));
+        assert!(wrapped.contains("IMPORTANT:"));
+        assert!(wrapped.contains("sess-xyz"));
+        assert!(wrapped.contains("work"));
     }
 
     #[test]

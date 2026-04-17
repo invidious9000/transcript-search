@@ -1,9 +1,12 @@
+mod inbox;
 mod index;
 mod knowledge;
+mod notes;
 mod orchestration;
 mod parser;
 mod render;
 mod threads;
+mod tool_docs;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use index::TranscriptIndex;
 use knowledge::Knowledge;
+use notes::Notes;
 use orchestration::providers::{ExecOpts, Provider};
 use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
@@ -44,6 +48,7 @@ struct SharedState {
     idx: RwLock<TranscriptIndex>,
     kb: RwLock<Knowledge>,
     threads: RwLock<Threads>,
+    notes: RwLock<Notes>,
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf, // ~/.bro
@@ -111,14 +116,16 @@ impl BlackboxServer {
 // Bbox tools (search, knowledge, threads)
 // ---------------------------------------------------------------------------
 
+use inbox::InboxParams;
 use index::{
-    ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
+    CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
     SessionsListParams, TopicsParams,
 };
 use knowledge::{
-    AbsorbParams, BootstrapParams, ForgetParams, KnowledgeListParams, LearnParams,
+    AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeListParams, LearnParams,
     RememberParams, RenderParams, ReviewParams,
 };
+use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
@@ -133,6 +140,11 @@ impl BlackboxServer {
             drop(idx);
             self.state.idx.read().search(&p)
         })
+    }
+
+    #[tool(name = "bbox_cite", description = "Trace a claim, rule, or phrase back to the transcript turn that established it. Defaults to role=user (origin of most rules); returns citations oldest-first.")]
+    fn bbox_cite(&self, Parameters(p): Parameters<CiteParams>) -> CallToolResult {
+        Self::run("bbox_cite", || self.state.idx.read().cite(&p))
     }
 
     #[tool(name = "bbox_context", description = "Get conversation context around a specific point in a transcript. Use after bbox_search.")]
@@ -180,6 +192,11 @@ impl BlackboxServer {
         Self::run("bbox_remember", || self.state.kb.write().remember(&p, false))
     }
 
+    #[tool(name = "bbox_decide", description = "Record a durable decision with required rationale. If 'supersedes' is given, marks the prior entry as superseded and links it to this one.")]
+    fn bbox_decide(&self, Parameters(p): Parameters<DecideParams>) -> CallToolResult {
+        Self::run("bbox_decide", || self.state.kb.write().decide(&p, false))
+    }
+
     #[tool(name = "bbox_knowledge", description = "List/search knowledge entries with filters.")]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
         Self::run("bbox_knowledge", || self.state.kb.write().list(&p))
@@ -223,6 +240,32 @@ impl BlackboxServer {
     #[tool(name = "bbox_thread_list", description = "List and scan work threads. Shows open/active/stale threads by default.")]
     fn bbox_thread_list(&self, Parameters(p): Parameters<ThreadListParams>) -> CallToolResult {
         Self::run("bbox_thread_list", || self.state.threads.read().thread_list(&p))
+    }
+
+    #[tool(name = "bbox_note", description = "Record a structured side-channel note (dispute, assumption, surprise, followup, blocked, learned, done). Executors should emit these during work so the orchestrator can scan a compact trail instead of re-parsing prose.")]
+    fn bbox_note(&self, Parameters(p): Parameters<NoteParams>) -> CallToolResult {
+        Self::run("bbox_note", || self.state.notes.write().create(&p))
+    }
+
+    #[tool(name = "bbox_notes", description = "List/filter notes by kind, project, session, thread, or resolution.")]
+    fn bbox_notes(&self, Parameters(p): Parameters<NoteListParams>) -> CallToolResult {
+        Self::run("bbox_notes", || self.state.notes.read().list(&p))
+    }
+
+    #[tool(name = "bbox_note_resolve", description = "Mark a note as acknowledged or addressed. Optional resolution note.")]
+    fn bbox_note_resolve(&self, Parameters(p): Parameters<NoteResolveParams>) -> CallToolResult {
+        Self::run("bbox_note_resolve", || self.state.notes.write().resolve(&p))
+    }
+
+    #[tool(name = "bbox_inbox", description = "Attention layer: aggregates unresolved notes (disputes/blocked/surprises), deferred followups, stale threads, unverified knowledge, and failed bro tasks. Morning-brief / pre-round scan.")]
+    fn bbox_inbox(&self, Parameters(p): Parameters<InboxParams>) -> CallToolResult {
+        Self::run("bbox_inbox", || {
+            let kb = self.state.kb.read();
+            let threads = self.state.threads.read();
+            let notes = self.state.notes.read();
+            let task_store = self.state.task_store.read();
+            inbox::compute_inbox(&kb, &threads, &notes, &task_store, &p)
+        })
     }
 }
 
@@ -449,12 +492,25 @@ impl BlackboxServer {
                 Err(e) => return Self::err_text(&e),
             };
 
-        let final_prompt = orch::apply_lens(&p.prompt, lens.as_deref(), allow_recursion);
+        // Generate session_id first so it can land in the ambient scope block.
         let session_id = if provider == Provider::Claude {
             uuid::Uuid::new_v4().to_string()
         } else {
             "pending".to_string()
         };
+        let ambient_ctx = orch::AmbientContext {
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: p.bro.clone(),
+            thread_id: None,
+            work_item_id: None,
+            completion_contract: None,
+            allow_recursion,
+        };
+        let final_prompt = orch::apply_brofile_lens(
+            &orch::apply_ambient(&p.prompt, &ambient_ctx),
+            lens.as_deref(),
+        );
         let args = provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
 
         let task = orch::spawn_task(
@@ -699,9 +755,6 @@ impl BlackboxServer {
                 }
             };
 
-            // Lens + guard go in the first user turn only; resumes use the raw
-            // prompt so the lens isn't re-injected on every follow-up.
-            let exec_prompt = orch::apply_lens(&p.prompt, brofile.lens.as_deref(), allow_recursion);
             let mut env_overrides = None;
             if let Some(ref acct_name) = brofile.account {
                 if let Some(acct) = orchestration::brofile::load_account(acct_name, &store_dir) {
@@ -714,6 +767,25 @@ impl BlackboxServer {
                 None
             };
 
+            // Build first-turn prompt with ambient scope + brofile lens.
+            // Only applies on fresh-session exec paths; resumes use the
+            // raw prompt so ambient/lens aren't re-injected each turn.
+            let build_exec_prompt = |session_id: &str| -> String {
+                let ctx = orch::AmbientContext {
+                    session_id: Some(session_id.to_string()),
+                    project_dir: cwd.clone(),
+                    bro_name: Some(member.name.clone()),
+                    thread_id: None,
+                    work_item_id: None,
+                    completion_contract: None,
+                    allow_recursion,
+                };
+                orch::apply_brofile_lens(
+                    &orch::apply_ambient(&p.prompt, &ctx),
+                    brofile.lens.as_deref(),
+                )
+            };
+
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
                     let args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
@@ -724,6 +796,7 @@ impl BlackboxServer {
                     )
                 } else {
                     let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
+                    let exec_prompt = build_exec_prompt(&session_id);
                     let args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
                     let t = orch::spawn_task(
                         brofile.provider, args, session_id,
@@ -735,6 +808,7 @@ impl BlackboxServer {
                 }
             } else {
                 let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
+                let exec_prompt = build_exec_prompt(&session_id);
                 let args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
                 let t = orch::spawn_task(
                     brofile.provider, args, session_id,
@@ -1462,12 +1536,25 @@ async fn main() -> anyhow::Result<()> {
     let idx = TranscriptIndex::open_or_create(&index_path, roots, codex_root)?;
 
     let kb_path = home.join(".claude-shared").join("blackbox-knowledge.json");
-    let kb = Knowledge::open(&kb_path)?;
+    let mut kb = Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
+
+    // Sync the auto-generated tool reference into the knowledge store
+    // so every agent's global memory picks up the current tool surface
+    // on the next render. Idempotent: no-op when content is unchanged.
+    match tool_docs::sync_into_knowledge(&mut kb) {
+        Ok(r) if r.wrote => tracing::info!("Tool reference synced ({} bytes)", r.bytes),
+        Ok(_) => tracing::debug!("Tool reference already up to date"),
+        Err(e) => tracing::warn!("Tool reference sync failed: {e:#}"),
+    }
 
     let th_path = home.join(".claude-shared").join("blackbox-threads.json");
     let th = Threads::open(&th_path)?;
     tracing::info!("Thread store: {}", th_path.display());
+
+    let notes_path = home.join(".claude-shared").join("blackbox-notes.json");
+    let notes_store = Notes::open(&notes_path)?;
+    tracing::info!("Notes store: {}", notes_path.display());
 
     // Orchestration state
     let store_dir = PathBuf::from(
@@ -1495,6 +1582,7 @@ async fn main() -> anyhow::Result<()> {
         idx: RwLock::new(idx),
         kb: RwLock::new(kb),
         threads: RwLock::new(th),
+        notes: RwLock::new(notes_store),
         task_store: Arc::new(RwLock::new(task_store)),
         tail_tx: tail_tx.clone(),
         store_dir: store_dir.clone(),
