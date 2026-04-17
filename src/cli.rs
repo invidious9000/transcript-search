@@ -44,31 +44,36 @@ struct RosterEntry {
     model: Option<String>,
 }
 
-async fn fetch_roster(
+#[derive(Default, Debug)]
+struct TailSelectors {
     bros: Vec<String>,
-    team: Option<String>,
-    provider: Option<String>,
-) -> anyhow::Result<Vec<RosterEntry>> {
+    teams: Vec<String>,
+    sessions: Vec<String>,
+    providers: Vec<String>,
+}
+
+async fn fetch_roster(sel: TailSelectors) -> anyhow::Result<Vec<RosterEntry>> {
     let port = std::env::var("BBOX_PORT")
         .or_else(|_| std::env::var("BRO_PORT"))
         .unwrap_or_else(|_| "7264".into());
     let mut url = format!("http://127.0.0.1:{port}/roster");
     let mut params = Vec::new();
-    if !bros.is_empty() {
-        params.push(format!("bros={}", bros.join(",")));
-    }
-    if let Some(t) = team {
-        params.push(format!("team={t}"));
-    }
-    if let Some(p) = provider {
-        params.push(format!("provider={p}"));
-    }
+    if !sel.bros.is_empty()      { params.push(format!("bros={}",      sel.bros.join(","))); }
+    if !sel.teams.is_empty()     { params.push(format!("teams={}",     sel.teams.join(","))); }
+    if !sel.sessions.is_empty()  { params.push(format!("sessions={}",  sel.sessions.join(","))); }
+    if !sel.providers.is_empty() { params.push(format!("providers={}", sel.providers.join(","))); }
     if !params.is_empty() {
         url.push('?');
         url.push_str(&params.join("&"));
     }
     let client = reqwest::Client::new();
-    let resp = client.get(&url).send().await?;
+    let resp = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // Connection-level failure — daemon almost certainly down.
+            anyhow::bail!("cannot reach blackboxd on port {port}: {e}");
+        }
+    };
     if !resp.status().is_success() {
         anyhow::bail!("/roster returned {}", resp.status());
     }
@@ -306,29 +311,35 @@ struct App {
 
 // ── Arg parsing ─────────────────────────────────────────────────────
 
-fn parse_tail_args(args: &[String]) -> (Vec<String>, Option<String>, Option<String>) {
-    let mut bros = Vec::new();
-    let mut team = None;
-    let mut provider = None;
+fn parse_tail_args(args: &[String]) -> TailSelectors {
+    let mut sel = TailSelectors::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--team" if i + 1 < args.len() => {
-                team = Some(args[i + 1].clone());
+                sel.teams.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--bro" if i + 1 < args.len() => {
+                sel.bros.push(args[i + 1].clone());
+                i += 2;
+            }
+            "--session" if i + 1 < args.len() => {
+                sel.sessions.push(args[i + 1].clone());
                 i += 2;
             }
             "--provider" if i + 1 < args.len() => {
-                provider = Some(args[i + 1].clone());
+                sel.providers.push(args[i + 1].clone());
                 i += 2;
             }
             s if !s.starts_with("--") => {
-                bros.push(s.to_string());
+                sel.bros.push(s.to_string());
                 i += 1;
             }
             _ => i += 1,
         }
     }
-    (bros, team, provider)
+    sel
 }
 
 // ── Entry point ─────────────────────────────────────────────────────
@@ -336,28 +347,32 @@ fn parse_tail_args(args: &[String]) -> (Vec<String>, Option<String>, Option<Stri
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args[1] != "tail" {
-        eprintln!("Usage: bro tail [BROS...] [--team NAME] [--provider PROVIDER]");
+        eprintln!("Usage: bro tail [BROS...] [--team NAME]... [--bro NAME]... [--session ID]... [--provider NAME]...");
+        eprintln!();
+        eprintln!("Selectors are unioned. Each flag is repeatable.");
         eprintln!();
         eprintln!("Examples:");
-        eprintln!("  bro tail alice bob             Two specific bros");
-        eprintln!("  bro tail --team review-panel   All members of a team");
-        eprintln!("  bro tail --provider codex      All codex bros");
+        eprintln!("  bro tail alice bob                           Two specific bros (positional)");
+        eprintln!("  bro tail --team review-panel                 All members of a team");
+        eprintln!("  bro tail --team A --team B                   All members of two teams");
+        eprintln!("  bro tail --team A --bro solo --bro qa        Team A plus two named bros");
+        eprintln!("  bro tail --session <uuid>                    Adhoc lane on a raw session ID");
+        eprintln!("  bro tail --provider codex                    Filter: only codex bros");
         std::process::exit(1);
     }
-    let (bros, team, provider) = parse_tail_args(&args[2..]);
+    let sel = parse_tail_args(&args[2..]);
 
     // One-shot async fetch for roster, then run TUI synchronously.
     let rt = tokio::runtime::Runtime::new()?;
-    let roster = match rt.block_on(fetch_roster(bros, team, provider)) {
+    let roster = match rt.block_on(fetch_roster(sel)) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to fetch roster: {e}");
-            eprintln!("Is blackboxd running? (port 7264)");
             std::process::exit(1);
         }
     };
     if roster.is_empty() {
-        eprintln!("No bros matched. Try `bro tail` with no args or --team NAME.");
+        eprintln!("No bros matched. Try `bro tail` with no args, or check team/bro/session names.");
         std::process::exit(1);
     }
 

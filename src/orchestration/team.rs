@@ -208,11 +208,12 @@ pub fn propagate_session_id(task_id: &str, session_id: &str, store_dir: &Path) {
     for mut team in load_all_teams(store_dir) {
         let mut dirty = false;
         for member in &mut team.members {
-            if member.task_history.contains(&task_id.to_string())
-                && member.session_id.as_deref().unwrap_or("pending") == "pending" {
-                    member.session_id = Some(session_id.to_string());
-                    dirty = true;
-                }
+            // Only update if this task is the most recent launch — a
+            // late-completing older task must not clobber a newer session.
+            if member.task_history.last().map(String::as_str) == Some(task_id) {
+                member.session_id = Some(session_id.to_string());
+                dirty = true;
+            }
         }
         if dirty {
             save_team(&team, store_dir);

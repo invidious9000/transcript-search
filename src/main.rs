@@ -1349,8 +1349,11 @@ impl BlackboxServer {
             for member in &mut team.members {
                 if member.name == bro_name {
                     member.task_history.push(tid.clone());
-                    if member.session_id.as_deref().unwrap_or("pending") == "pending" {
-                        member.session_id = Some(task.inner.lock().session_id.clone());
+                    // Track the latest launch. Skip "pending" — late propagation
+                    // will fill it in once the provider discovers its session.
+                    let task_sid = task.inner.lock().session_id.clone();
+                    if task_sid != "pending" {
+                        member.session_id = Some(task_sid);
                     }
                     dirty = true;
                 }
@@ -1382,15 +1385,19 @@ impl ServerHandler for BlackboxServer {
 
 #[derive(Debug, Deserialize)]
 struct RosterQuery {
-    /// Comma-separated bro names
+    /// Comma-separated bro names (union of matches across all teams)
     #[serde(default)]
     bros: Option<String>,
-    /// Team name — resolves to all its members
-    #[serde(default)]
-    team: Option<String>,
-    /// Provider filter (claude/codex/etc)
-    #[serde(default)]
-    provider: Option<String>,
+    /// Comma-separated team names (each contributes all members). Accepts
+    /// legacy `team=` singular form as an alias.
+    #[serde(default, alias = "team")]
+    teams: Option<String>,
+    /// Comma-separated session IDs — synthetic adhoc lanes bypassing team membership.
+    #[serde(default, alias = "session")]
+    sessions: Option<String>,
+    /// Comma-separated provider names (claude/codex/gemini/copilot/vibe) — final filter.
+    #[serde(default, alias = "provider")]
+    providers: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1404,6 +1411,50 @@ struct BroRosterEntry {
     model: Option<String>,
 }
 
+fn split_csv(s: &Option<String>) -> Vec<String> {
+    s.as_deref().unwrap_or("").split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+fn infer_provider_from_path(path: &Path) -> Option<Provider> {
+    let s = path.to_string_lossy();
+    if s.contains("/.codex/sessions/") { Some(Provider::Codex) }
+    else if s.contains("/.gemini/tmp/") { Some(Provider::Gemini) }
+    else if s.contains("/.copilot/session-state/") { Some(Provider::Copilot) }
+    else if s.contains("/.vibe/logs/session/") { Some(Provider::Vibe) }
+    else if s.contains("/projects/") { Some(Provider::Claude) }
+    else { None }
+}
+
+fn build_member_entry(
+    team: &orchestration::team::Team,
+    member: &orchestration::team::TeamMember,
+    store_dir: &Path,
+    config: &index::ReindexConfig,
+) -> BroRosterEntry {
+    let brofile = orchestration::brofile::resolve_brofile(
+        &member.brofile, store_dir, team.project_dir.as_deref(),
+    );
+    let provider = brofile.as_ref().map(|b| b.provider);
+    let session_id = member.session_id.as_ref()
+        .filter(|s| s.as_str() != "pending")
+        .cloned();
+    let jsonl_path = session_id.as_deref()
+        .and_then(|sid| index::find_session_file(sid, &config.roots, config.codex_root.as_deref()))
+        .map(|p| p.to_string_lossy().into_owned());
+    BroRosterEntry {
+        bro: member.name.clone(),
+        team: team.name.clone(),
+        provider: provider.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+        session_id,
+        jsonl_path,
+        brofile: member.brofile.clone(),
+        model: brofile.and_then(|b| b.model),
+    }
+}
+
 async fn roster_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(query): Query<RosterQuery>,
@@ -1411,59 +1462,78 @@ async fn roster_handler(
     let store_dir = state.store_dir.clone();
     let config = state.idx.read().reindex_config();
 
-    let bros_filter: Option<Vec<String>> = query.bros.as_ref().map(|s| {
-        s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
-    });
-    let provider_filter: Option<Provider> = query.provider.as_ref()
-        .and_then(|p| p.parse::<Provider>().ok());
+    let wanted_teams = split_csv(&query.teams);
+    let wanted_bros = split_csv(&query.bros);
+    let wanted_sessions = split_csv(&query.sessions);
+    let wanted_providers: Vec<Provider> = split_csv(&query.providers).iter()
+        .filter_map(|p| p.parse::<Provider>().ok())
+        .collect();
 
-    let teams = if let Some(ref tn) = query.team {
-        match orchestration::team::load_team(tn, &store_dir) {
-            Some(t) => vec![t],
-            None => return Err(axum::http::StatusCode::NOT_FOUND),
-        }
-    } else {
-        orchestration::team::load_all_teams(&store_dir)
-    };
+    let no_selectors = wanted_teams.is_empty()
+        && wanted_bros.is_empty()
+        && wanted_sessions.is_empty();
 
-    let mut seen_bros = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut entries = Vec::new();
 
-    for team in teams {
-        for member in &team.members {
-            if let Some(ref filter) = bros_filter {
-                if !filter.iter().any(|b| b == &member.name) { continue; }
+    // Team selectors — each contributes all members. Unknown teams are
+    // skipped silently; the empty roster speaks for itself at the CLI layer.
+    for tn in &wanted_teams {
+        if let Some(team) = orchestration::team::load_team(tn, &store_dir) {
+            for member in &team.members {
+                let key = format!("{}::{}", team.name, member.name);
+                if !seen.insert(key) { continue; }
+                entries.push(build_member_entry(&team, member, &store_dir, &config));
             }
-            // dedupe — same bro name might appear in multiple teams
-            let key = format!("{}::{}", team.name, member.name);
-            if !seen_bros.insert(key) { continue; }
-
-            let brofile = orchestration::brofile::resolve_brofile(
-                &member.brofile, &store_dir, team.project_dir.as_deref(),
-            );
-            let provider = brofile.as_ref().map(|b| b.provider);
-            if let Some(pf) = provider_filter {
-                if provider != Some(pf) { continue; }
-            }
-
-            let session_id = member.session_id.as_ref()
-                .filter(|s| s.as_str() != "pending")
-                .cloned();
-
-            let jsonl_path = session_id.as_deref()
-                .and_then(|sid| index::find_session_file(sid, &config.roots, config.codex_root.as_deref()))
-                .map(|p| p.to_string_lossy().into_owned());
-
-            entries.push(BroRosterEntry {
-                bro: member.name.clone(),
-                team: team.name.clone(),
-                provider: provider.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
-                session_id,
-                jsonl_path,
-                brofile: member.brofile.clone(),
-                model: brofile.and_then(|b| b.model),
-            });
         }
+    }
+
+    // Bro selectors — include every match across all teams (deduped by team::bro).
+    if !wanted_bros.is_empty() {
+        for team in orchestration::team::load_all_teams(&store_dir) {
+            for member in &team.members {
+                if !wanted_bros.iter().any(|b| b == &member.name) { continue; }
+                let key = format!("{}::{}", team.name, member.name);
+                if !seen.insert(key) { continue; }
+                entries.push(build_member_entry(&team, member, &store_dir, &config));
+            }
+        }
+    }
+
+    // Session selectors — synthetic adhoc lanes.
+    for sid in &wanted_sessions {
+        let key = format!("adhoc::{sid}");
+        if !seen.insert(key) { continue; }
+        let path = index::find_session_file(sid, &config.roots, config.codex_root.as_deref());
+        let provider = path.as_deref().and_then(infer_provider_from_path);
+        entries.push(BroRosterEntry {
+            bro: sid.chars().take(8).collect(),
+            team: "adhoc".into(),
+            provider: provider.map(|p| p.to_string()).unwrap_or_else(|| "unknown".into()),
+            session_id: Some(sid.clone()),
+            jsonl_path: path.map(|p| p.to_string_lossy().into_owned()),
+            brofile: String::new(),
+            model: None,
+        });
+    }
+
+    // No selectors → full roster across every team (legacy default).
+    if no_selectors {
+        for team in orchestration::team::load_all_teams(&store_dir) {
+            for member in &team.members {
+                let key = format!("{}::{}", team.name, member.name);
+                if !seen.insert(key) { continue; }
+                entries.push(build_member_entry(&team, member, &store_dir, &config));
+            }
+        }
+    }
+
+    if !wanted_providers.is_empty() {
+        entries.retain(|e| {
+            e.provider.parse::<Provider>().ok()
+                .map(|p| wanted_providers.contains(&p))
+                .unwrap_or(false)
+        });
     }
 
     Ok(axum::Json(entries))
