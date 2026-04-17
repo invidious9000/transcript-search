@@ -287,7 +287,8 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
         return SelfRegisterOutcome::Unsupported;
     };
 
-    let bin = provider.bin();
+    let raw_bin = provider.bin();
+    let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
     let list_out = match Command::new(&bin).args(&list_args).output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
@@ -332,7 +333,8 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
 }
 
 fn run_cli(provider: &Provider, args: &[String]) -> Result<()> {
-    let bin = provider.bin();
+    let raw_bin = provider.bin();
+    let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
     let out = Command::new(&bin)
         .args(args)
         .output()

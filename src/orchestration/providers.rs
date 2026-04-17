@@ -79,6 +79,51 @@ impl std::fmt::Display for Provider {
 }
 
 // ---------------------------------------------------------------------------
+// Binary resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve a provider binary name to an absolute path using a login shell.
+///
+/// The daemon is typically launched from `launchctl` / `systemd` with a
+/// narrow, static `PATH` — it does not source `.bashrc`, `.zshrc`, `nvm.sh`,
+/// or other rc files. CLIs installed under a version manager (nvm, asdf,
+/// rbenv, etc.) live in per-version directories that only get added to
+/// PATH by shell rc init. Running `bash -lc "command -v <bin>"` invokes a
+/// login shell so those additions fire, giving us the same resolution a
+/// user would get in an interactive terminal.
+///
+/// If `bin` already contains a path separator it is returned as-is, which
+/// preserves explicit `CODEX_BIN=/custom/path/codex` overrides.
+///
+/// Returns `None` if the binary cannot be resolved. Callers should fall
+/// back to the bare name so `Command::new` produces the familiar
+/// `No such file or directory` error at spawn time instead of a silent
+/// nothing.
+pub fn resolve_bin(bin: &str) -> Option<String> {
+    if bin.contains('/') {
+        return Some(bin.to_string());
+    }
+    let extra_path = std::env::var("BRO_EXTRA_PATH").unwrap_or_else(|_| {
+        dirs::home_dir()
+            .unwrap_or_default()
+            .join(".local/bin")
+            .to_string_lossy()
+            .to_string()
+    });
+    let augmented_path = format!("{}:{}", extra_path, std::env::var("PATH").unwrap_or_default());
+    let output = std::process::Command::new("bash")
+        .args(["-lc", &format!("command -v '{bin}'")])
+        .env("PATH", &augmented_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
+}
+
+// ---------------------------------------------------------------------------
 // Exec options
 // ---------------------------------------------------------------------------
 
@@ -1311,5 +1356,24 @@ mod tests {
             format_toml_string_array(&[r#"with"quote"#.into()]),
             r#"["with\"quote"]"#
         );
+    }
+
+    #[test]
+    fn resolve_bin_passes_through_paths_with_separators() {
+        assert_eq!(resolve_bin("/usr/local/bin/codex").as_deref(), Some("/usr/local/bin/codex"));
+        assert_eq!(resolve_bin("./relative/bin").as_deref(), Some("./relative/bin"));
+    }
+
+    #[test]
+    fn resolve_bin_returns_none_for_unknown_binary() {
+        assert!(resolve_bin("definitely_not_a_real_binary_ahdgshfkjahsdfkh").is_none());
+    }
+
+    #[test]
+    fn resolve_bin_finds_sh_in_standard_path() {
+        // `sh` is guaranteed to exist on any Unix system the daemon runs on.
+        let path = resolve_bin("sh").expect("sh should resolve");
+        assert!(path.starts_with('/'), "expected absolute path, got {path}");
+        assert!(path.ends_with("/sh") || path.ends_with("/sh\n"));
     }
 }

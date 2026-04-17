@@ -389,7 +389,13 @@ pub fn spawn_task(
         .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/bin").to_string_lossy().to_string());
     let path_env = format!("{}:{}", extra_path, std::env::var("PATH").unwrap_or_default());
 
-    let mut cmd = Command::new(provider.bin());
+    // Resolve binary through a login shell so nvm/asdf/rbenv-installed CLIs
+    // work even when the daemon was launched by launchctl/systemd with a
+    // narrow PATH. Falls back to the bare name, which preserves the
+    // existing error surface when the binary genuinely is not installed.
+    let raw_bin = provider.bin();
+    let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
+    let mut cmd = Command::new(&bin);
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

@@ -1011,24 +1011,18 @@ impl BlackboxServer {
 
     #[tool(name = "bro_providers", description = "List configured providers, binary paths, and available models.")]
     fn bro_providers(&self) -> CallToolResult {
-        let extra_path = std::env::var("BRO_EXTRA_PATH")
-            .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/bin").to_string_lossy().to_string());
-        let augmented_path = format!("{}:{}", extra_path, std::env::var("PATH").unwrap_or_default());
-
         let mut info = serde_json::Map::new();
         for p in Provider::ALL {
             let bin = p.bin();
-            let found = std::process::Command::new("bash")
-                .args(["-lc", &format!("command -v '{bin}'")])
-                .env("PATH", &augmented_path)
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            let resolved = orch::providers::resolve_bin(&bin);
             let mut entry = json!({
                 "bin": bin,
-                "found": found,
+                "found": resolved.is_some(),
                 "supportsResume": p.supports_resume(),
             });
+            if let Some(ref path) = resolved {
+                entry["path"] = json!(path);
+            }
             if !p.models().is_empty() {
                 entry["models"] = serde_json::to_value(p.models()).unwrap_or_default();
             }
