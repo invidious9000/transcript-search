@@ -23,6 +23,28 @@ Workflow definitions for Claude Code, invocable as `/user:<name>` (user-scoped) 
 |---|---|
 | [`skills/crucible.md`](skills/crucible.md) | Orchestrator-led implementation workflow. Main-session Claude drives; a durable implementer bro (Opus 4.7 xhigh, held across rounds via `bro_resume`) carries mechanical code context the main session would otherwise lose to compaction; a continuous red-team ensemble (codex + gemini via `red_team` teamplate by default) reviews plan and work product with sustained per-member context. All coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals (`dispute` / `surprise` / `blocked` / `followup` / `done`) so the orchestrator scans a signal trail instead of parsing prose. Use when context compartmentalization is the primary benefit and cross-provider consensus at bookends is worth the ceremony. |
 | [`skills/takeover.md`](skills/takeover.md) | Take over driving an existing agent session. Composes **thread init** (find-or-open a `bbox_thread` with full scope context — handoff docs, source docs, prior takeover notes) and **thread run** (resume the target session via `bro_resume`, drive it iteratively against an authoritative scope checklist until halt conditions are met). Pairs well with the `session-searcher` agent for transcript recon. Use when an agent session stalled, got handed off, or was interrupted mid-work and you need to pick it up without losing scope. |
+| [`skills/overmind.md`](skills/overmind.md) | Meta-orchestration — strategic Advisor layer one level above crucible. Main-session Claude holds the arc's charter and a durable **spine doc** (markdown + `bbox_decide` entries); a dispatched orchestrator bro runs crucible internally; ensemble + implementer sit under the orchestrator. Phase 0 is a takeover-style charter dialogue with the user — scope, halt conditions, exit conditions locked upfront. Orchestrator reports at phase boundaries only; Advisor updates the spine doc, records decisions, and steers via `bro_resume`. When the orchestrator compacts or drifts, Advisor retires it and spins a fresh one bootstrapped solely from the spine doc. Use on multi-phase arcs where strategic continuity needs to survive orchestrator compaction. See the recursion note below. |
+
+### Recursion nuance (overmind)
+
+Overmind is one of the rare legitimate uses of `bro_exec(..., allow_recursion=true)`.
+
+By default, the daemon applies a mechanical recursion guard to every dispatched bro: the provider CLI gets filter args at argv construction (`--disallowedTools mcp__blackbox__bro_*` for Claude, equivalent for the other providers) so dispatched bros cannot call `bro_*` tools and can't recurse into nested dispatches. This is on for every `bro_exec` and `bro_resume` unless you explicitly opt out.
+
+Overmind's orchestrator is itself a dispatcher — it runs crucible, which fans out an ensemble via `bro_broadcast` and manages a durable implementer via `bro_exec`/`bro_resume`. It needs the `bro_*` surface available. So the **orchestrator dispatch** uses `allow_recursion=true`:
+
+```
+bro_exec(
+  bro="overmind-orchestrator",
+  prompt=<brief>,
+  project_dir=<cwd>,
+  allow_recursion=true     // legitimate meta-orchestration exception
+)
+```
+
+Everything *inside* the orchestrator — the ensemble members it broadcasts to, the implementer it exec's and resumes — gets the default guard like any other bro. Only the single orchestrator dispatch bypasses it.
+
+If you adapt this pattern to your own skill, keep `allow_recursion=true` narrowly scoped — only to the one bro that legitimately needs to dispatch further. Apply it to ensemble members or implementers and you've given a code-writing or review-writing bro the ability to fan out uncontrolled; that's not the pattern.
 
 ## Adding your own
 

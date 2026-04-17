@@ -358,7 +358,7 @@ Source layout (`src/`):
 Drop-in configs for wiring blackbox into agent CLIs live in [`examples/`](examples/README.md):
 
 - **Agents** — [`session-searcher`](examples/agents/session-searcher.md): read-only subagent that keeps transcript digging off your main context window.
-- **Skills / slash commands** — [`crucible`](examples/skills/crucible.md) (orchestrator + durable implementer + continuous red-team ensemble, coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals) and [`takeover`](examples/skills/takeover.md) (pick up a stalled or handed-off agent session without losing scope).
+- **Skills / slash commands** — [`crucible`](examples/skills/crucible.md) (orchestrator + durable implementer + continuous red-team ensemble, coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals), [`takeover`](examples/skills/takeover.md) (pick up a stalled or handed-off agent session without losing scope), and [`overmind`](examples/skills/overmind.md) (meta-orchestration — strategic Advisor above crucible, with a durable spine doc that survives orchestrator compaction; demonstrates the legitimate `allow_recursion=true` pattern).
 
 ---
 
