@@ -1653,6 +1653,10 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(7263);
     let bbox_url = format!("http://127.0.0.1:{bbox_port}/mcp");
+    // Export for provider arg-builders so they can inject `--mcp-config`
+    // etc. at dispatch time — ensures dispatched subprocesses see
+    // blackbox regardless of which config file their CLI inherits.
+    std::env::set_var("BLACKBOX_MCP_URL", &bbox_url);
     let report = orchestration::mcp::self_register_blackbox(&bbox_url);
     tracing::info!("blackbox MCP self-registration: {}", report.summary());
     for (p, outcome) in &report.per_provider {

@@ -115,6 +115,14 @@ impl Provider {
                 ];
                 if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
                 if let Some(e) = effort { args.extend(["--effort".into(), e.into()]); }
+                // Transient MCP inject — ensures dispatched subprocesses
+                // see blackbox regardless of which config file the bare
+                // `claude` CLI happens to load ($HOME/.claude.json vs
+                // account-specific). Augments whatever user config the
+                // subprocess would otherwise inherit.
+                if let Some(url) = transient_blackbox_url() {
+                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&url)]);
+                }
                 args
             }
             Provider::Codex => {
@@ -184,6 +192,9 @@ impl Provider {
                 ];
                 if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
                 if let Some(e) = effort { args.extend(["--effort".into(), e.into()]); }
+                if let Some(url) = transient_blackbox_url() {
+                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&url)]);
+                }
                 args
             }
             Provider::Codex => {
@@ -257,11 +268,18 @@ impl Provider {
         match self {
             Provider::Claude => Some(vec![
                 "mcp".into(), "add".into(),
+                // Default scope is `local` which writes to a project-
+                // scoped block in `~/.claude.json` — bad for us because
+                // dispatched subprocesses in other cwds won't see it.
+                // Force user-global so blackbox is visible everywhere.
+                "-s".into(), "user".into(),
                 "--transport".into(), "http".into(),
                 name.into(), url.into(),
             ]),
             Provider::Copilot => Some(vec![
                 "copilot".into(), "--".into(),
+                // Copilot defaults to user scope per `mcp add --help`
+                // ("Add a new MCP server to the user configuration.").
                 "mcp".into(), "add".into(),
                 "--transport".into(), "http".into(),
                 name.into(), url.into(),
@@ -286,16 +304,26 @@ impl Provider {
         }
     }
 
-    /// Argv for `{provider} mcp remove <name>`.
+    /// Argv for `{provider} mcp remove <name>`. Scope-qualified so we
+    /// only ever delete entries we wrote — never touch user-installed
+    /// entries in other scopes.
     pub fn build_mcp_remove_args(&self, name: &str) -> Option<Vec<String>> {
         match self {
-            Provider::Claude => Some(vec!["mcp".into(), "remove".into(), name.into()]),
+            Provider::Claude => Some(vec![
+                "mcp".into(), "remove".into(),
+                "-s".into(), "user".into(),
+                name.into(),
+            ]),
             Provider::Copilot => Some(vec![
                 "copilot".into(), "--".into(),
                 "mcp".into(), "remove".into(), name.into(),
             ]),
             Provider::Codex => Some(vec!["mcp".into(), "remove".into(), name.into()]),
-            Provider::Gemini => Some(vec!["mcp".into(), "remove".into(), name.into()]),
+            Provider::Gemini => Some(vec![
+                "mcp".into(), "remove".into(),
+                "-s".into(), "user".into(),
+                name.into(),
+            ]),
             Provider::Vibe => None,
         }
     }
@@ -354,20 +382,27 @@ impl Provider {
         let mut args = Vec::new();
         match self {
             Provider::Claude => {
-                if !filters.disallow.is_empty() {
+                // Claude's --disallowedTools matches tool names exactly
+                // (or applies Bash-specific argument patterns inside
+                // parentheses). It does NOT accept glob patterns on the
+                // tool name itself. Expand `mcp__blackbox__bro_*` into
+                // the concrete list of tool names so the filter fires.
+                let expanded = expand_filter_patterns(&filters.disallow);
+                if !expanded.is_empty() {
                     args.push("--disallowedTools".into());
-                    args.push(filters.disallow.join(" "));
+                    args.push(expanded.join(" "));
                 }
-                if !filters.allow.is_empty() {
+                let expanded_allow = expand_filter_patterns(&filters.allow);
+                if !expanded_allow.is_empty() {
                     args.push("--allowedTools".into());
-                    args.push(filters.allow.join(" "));
+                    args.push(expanded_allow.join(" "));
                 }
             }
             Provider::Copilot => {
-                for p in &filters.disallow {
+                for p in expand_filter_patterns(&filters.disallow) {
                     args.push(format!("--deny-tool={p}"));
                 }
-                for p in &filters.allow {
+                for p in expand_filter_patterns(&filters.allow) {
                     args.push(format!("--allow-tool={p}"));
                 }
             }
@@ -428,6 +463,30 @@ fn codex_expand_blackbox_patterns(patterns: &[String]) -> Vec<String> {
     out
 }
 
+/// Expand filter patterns for providers that accept full MCP tool
+/// names (Claude, Copilot). `mcp__blackbox__bro_*` style globs become
+/// concrete `mcp__blackbox__bro_exec`, `mcp__blackbox__bro_resume`, …
+/// entries. Non-blackbox patterns pass through unchanged — they're
+/// likely already in a valid native form like `Bash(git push *)`.
+fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
+    let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
+    let prefix = crate::tool_docs::BLACKBOX_MCP_PREFIX;
+    let mut out = Vec::new();
+    for p in patterns {
+        if let Some(stripped) = p.strip_prefix(prefix) {
+            for bare in super::mcp::expand_pattern(stripped, &universe) {
+                let full = format!("{prefix}{bare}");
+                if !out.contains(&full) {
+                    out.push(full);
+                }
+            }
+        } else if !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
 /// Format a slice of strings as a TOML array literal (`["a", "b"]`)
 /// for use inside `-c key=value` overrides. Each element is quoted
 /// with double-quote escape rules sufficient for tool names.
@@ -437,6 +496,28 @@ fn format_toml_string_array(items: &[String]) -> String {
         .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
         .collect();
     format!("[{}]", quoted.join(","))
+}
+
+/// The daemon's own blackbox HTTP MCP URL, for transient injection
+/// into dispatched provider CLIs. The daemon sets this once at startup
+/// via `std::env::set_var("BLACKBOX_MCP_URL", ...)`. Using an env var
+/// (vs threading through every arg-builder signature) keeps call-site
+/// surface unchanged and stays consistent across exec/resume/broadcast
+/// paths.
+pub fn transient_blackbox_url() -> Option<String> {
+    std::env::var("BLACKBOX_MCP_URL").ok().filter(|s| !s.is_empty())
+}
+
+/// Render the JSON payload for Claude's `--mcp-config` arg pointing at
+/// the daemon's blackbox endpoint. Single entry — user's own MCP
+/// servers are inherited additively (we don't pass `--strict-mcp-config`).
+pub fn claude_mcp_config_json(url: &str) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "blackbox": { "type": "http", "url": url }
+        }
+    })
+    .to_string()
 }
 
 /// Result of scanning a `mcp list` output for a specific entry.
@@ -1038,7 +1119,9 @@ mod tests {
     fn test_mcp_add_args_shape_per_provider() {
         let u = "http://127.0.0.1:7264/mcp";
         let c = Provider::Claude.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
-        assert_eq!(&c[..4], &["mcp", "add", "--transport", "http"]);
+        assert_eq!(&c[..4], &["mcp", "add", "-s", "user"]);
+        assert!(c.contains(&"--transport".to_string()));
+        assert!(c.contains(&"http".to_string()));
         assert!(c.contains(&"blackbox".to_string()));
         assert!(c.contains(&u.to_string()));
 
@@ -1087,26 +1170,35 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_filter_disallow_args() {
+    fn test_claude_filter_disallow_args_expands_blackbox_globs() {
         let filters = McpFilters {
             disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(rm -rf *)".into()],
             allow: vec![],
         };
         let args = Provider::Claude.build_filter_args(&filters);
         assert_eq!(args[0], "--disallowedTools");
-        assert!(args[1].contains("mcp__blackbox__bro_*"));
+        // Glob expanded to concrete tool names.
+        assert!(args[1].contains("mcp__blackbox__bro_exec"));
+        assert!(args[1].contains("mcp__blackbox__bro_resume"));
+        // Non-blackbox pattern passes through unchanged.
         assert!(args[1].contains("Bash(rm -rf *)"));
+        // The raw glob should NOT appear — it'd be treated as a literal
+        // tool name by Claude and match nothing.
+        assert!(!args[1].split_whitespace().any(|t| t == "mcp__blackbox__bro_*"));
     }
 
     #[test]
-    fn test_copilot_filter_repeats_flag() {
+    fn test_copilot_filter_repeats_flag_expanded() {
         let filters = McpFilters {
-            disallow: vec!["a".into(), "b".into()],
+            disallow: vec!["mcp__blackbox__bro_*".into(), "a".into()],
             allow: vec!["c".into()],
         };
         let args = Provider::Copilot.build_filter_args(&filters);
+        // Each expanded bro_* tool gets its own --deny-tool=.
+        assert!(args.iter().any(|a| a == "--deny-tool=mcp__blackbox__bro_exec"));
+        assert!(args.iter().any(|a| a == "--deny-tool=mcp__blackbox__bro_resume"));
+        // Non-blackbox pattern passes through.
         assert!(args.contains(&"--deny-tool=a".to_string()));
-        assert!(args.contains(&"--deny-tool=b".to_string()));
         assert!(args.contains(&"--allow-tool=c".to_string()));
     }
 
