@@ -226,24 +226,40 @@ impl TaskStore {
 /// describe the protocol and they can articulate it back. The
 /// contract converts soft doc guidance into a per-turn requirement.
 pub const DEFAULT_COMPLETION_CONTRACT: &str = "\
-Before returning your final answer, call `mcp__blackbox__bbox_note` \
-with:\n\
-  kind=\"done\"\n\
-  body=<a specific one-line summary of what you accomplished — not \
-generic phrases like \"task complete\", but something like \
-\"verified session_field already elides empty-string\" or \
-\"added 3 edge-case tests to format_toml_string_array\">\n\
-  task_id=<copy the `task:` value from the [scope] line above EXACTLY — \
-this is required for dispatch correlation>\n\
-  project=<the `project` value from [scope], if present>\n\
-  bro=<the `bro` value from [scope], if present>\n\
-  session_id=<the `session` value from [scope], if present>\n\
-The `task_id` is the primary correlation key and the orchestrator uses \
-it to find notes for this dispatch — do NOT omit it, do NOT paste any \
-other value (not the project path, not your prose, not \"pending\") into \
-task_id. Emit other kinds (dispute, assumption, surprise, followup, \
-blocked, learned) with the same task_id throughout the work as signal \
-arises. The done-note is required.";
+REQUIRED — before returning your final answer, emit bbox_note records:\n\
+\n\
+1. Emit a SEPARATE `mcp__blackbox__bbox_note` call for each distinct \
+finding that arose during the work. Do NOT consolidate multiple findings \
+into one body. Use the right kind for each:\n\
+   • `surprise` — concrete instance where you expected X and found Y \
+(e.g., \"expected the escape fn to handle control chars, found it only \
+escapes backslash+quote\"). Emit one per surprise.\n\
+   • `followup` — concrete out-of-scope work you noticed but did not do \
+(e.g., \"add roundtrip TOML parse test for format_toml_string_array\"). \
+One per followup. Do NOT do the work — just record.\n\
+   • `assumption` — ambiguity-resolving judgment you made to proceed \
+(e.g., \"brief said `blackbox` server but repo has multiple; assumed the \
+one in src/orchestration/\"). One per assumption.\n\
+   • `learned` — project-local convention you discovered in situ (e.g., \
+\"repo uses `bb:managed-start` markers, not editable outside\").\n\
+   • `blocked`, `dispute` — as applicable.\n\
+Consolidating multiple findings into one body is only correct when they \
+are genuinely one idea. If your prose response has bullet points of \
+findings, those are almost always separate notes.\n\
+\n\
+2. Finally, emit a `done` note with a one-line summary. Not generic \
+phrases like \"task complete\" — something concrete like \"verified X \
+already handles Y\" or \"audited Z; 3 concerns flagged via separate \
+notes\".\n\
+\n\
+Every call MUST include:\n\
+  task_id=<copy `task:` from [scope] above EXACTLY — do NOT paste any \
+other value (not project path, not prose, not \"pending\") into this field>\n\
+  project=<`project` from [scope], if present>\n\
+  bro=<`bro` from [scope], if present>\n\
+  session_id=<`session` from [scope], if present>\n\
+The task_id is the primary correlation key and the orchestrator uses it \
+to find your notes.";
 
 /// Pre-bound context the daemon has at dispatch time but the executor
 /// would otherwise have to infer by reaching back through the prompt.
