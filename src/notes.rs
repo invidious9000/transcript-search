@@ -15,7 +15,13 @@ pub struct NoteParams {
     pub kind: String,
     /// Short note body (1–3 sentences)
     pub body: String,
-    /// Session that produced this note
+    /// Dispatch task ID — copy from the `task:` value in the ambient
+    /// [scope] prefix to link this note to the dispatch. Stable across
+    /// all providers regardless of when the provider emits its session
+    /// ID.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Session that produced this note (provider-native session ID)
     #[serde(default)]
     pub session_id: Option<String>,
     /// Project path
@@ -40,7 +46,10 @@ pub struct NoteListParams {
     /// Filter by project substring
     #[serde(default)]
     pub project: Option<String>,
-    /// Filter by session ID
+    /// Filter by dispatch task ID (the `task:` value in ambient scope)
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Filter by session ID (provider-native)
     #[serde(default)]
     pub session_id: Option<String>,
     /// Filter by thread ID
@@ -119,6 +128,9 @@ pub struct Note {
     pub id: String,
     pub kind: NoteKind,
     pub body: String,
+    /// Dispatch task ID — the stable correlation key across providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -230,6 +242,7 @@ impl Notes {
             id: id.clone(),
             kind,
             body: p.body.clone(),
+            task_id: p.task_id.clone(),
             session_id: p.session_id.clone(),
             project: p.project.clone(),
             thread_id: p.thread_id.clone(),
@@ -325,6 +338,11 @@ impl Notes {
                 } else if !include_addressed && n.resolution == NoteResolution::Addressed {
                     return false;
                 }
+                if let Some(tid) = p.task_id.as_deref() {
+                    if n.task_id.as_deref() != Some(tid) {
+                        return false;
+                    }
+                }
                 if let Some(sid) = p.session_id.as_deref() {
                     if n.session_id.as_deref() != Some(sid) {
                         return false;
@@ -379,6 +397,7 @@ impl Notes {
             let ctx_bits = [
                 n.bro.as_deref().map(|b| format!("bro={b}")),
                 n.provider.as_deref().map(|p| format!("provider={p}")),
+                n.task_id.as_deref().map(|t| format!("task={}", &t[..t.len().min(8)])),
                 n.session_id.as_deref().map(|s| format!("session={}", &s[..s.len().min(8)])),
                 n.thread_id.as_deref().map(|t| format!("thread={t}")),
                 n.project.as_deref().and_then(|p| {
@@ -432,7 +451,8 @@ mod tests {
                 body: "brief conflates schemas".into(),
                 session_id: Some("sess-abc".into()),
                 project: Some("/repo/x".into()),
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 provider: Some("claude".into()),
                 bro: Some("executor".into()),
             })
@@ -444,7 +464,8 @@ mod tests {
                 kind: Some("dispute".into()),
                 project: None,
                 session_id: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -466,7 +487,8 @@ mod tests {
                 body: "x".into(),
                 session_id: None,
                 project: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -483,7 +505,8 @@ mod tests {
                 body: "  ".into(),
                 session_id: None,
                 project: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -500,7 +523,8 @@ mod tests {
                 body: "expected N, found M".into(),
                 session_id: None,
                 project: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -526,7 +550,8 @@ mod tests {
                 kind: None,
                 project: None,
                 session_id: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -550,7 +575,8 @@ mod tests {
                 kind: None,
                 project: None,
                 session_id: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -566,7 +592,8 @@ mod tests {
                 kind: None,
                 project: None,
                 session_id: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 bro: None,
                 resolution: None,
                 query: None,
@@ -590,7 +617,8 @@ mod tests {
                     body: "repo uses bb:managed markers".into(),
                     session_id: None,
                     project: Some("/repo/x".into()),
-                    thread_id: None,
+                    task_id: None,
+            thread_id: None,
                     provider: None,
                     bro: None,
                 })

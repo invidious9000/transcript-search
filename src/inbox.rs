@@ -328,7 +328,8 @@ mod tests {
                 body: "brief assumes invariant X".into(),
                 session_id: None,
                 project: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -339,7 +340,8 @@ mod tests {
                 body: "add tests for the cycle detector".into(),
                 session_id: None,
                 project: None,
-                thread_id: None,
+                task_id: None,
+            thread_id: None,
                 provider: None,
                 bro: None,
             })

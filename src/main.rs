@@ -564,13 +564,18 @@ impl BlackboxServer {
                 Err(e) => return Self::err_text(&e),
             };
 
-        // Generate session_id first so it can land in the ambient scope block.
+        // Pre-generate task_id so it lands in the ambient [scope] block
+        // before subprocess launch — the primary correlation key for
+        // bbox_note emissions regardless of when the provider itself
+        // emits a session ID.
+        let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = if provider == Provider::Claude {
             uuid::Uuid::new_v4().to_string()
         } else {
             "pending".to_string()
         };
         let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
             project_dir: cwd.clone(),
             bro_name: p.bro.clone(),
@@ -589,11 +594,11 @@ impl BlackboxServer {
             lens.as_deref(),
         );
         let mut args = provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &session_id);
+        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id);
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
-            provider, args, session_id,
+            task_id, provider, args, session_id,
             cwd, env_overrides, store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
@@ -636,9 +641,10 @@ impl BlackboxServer {
         // transcript from turn one; re-prepending them here would duplicate
         // them in every follow-up user turn.
         let args = provider.build_resume_args(&session_id, &p.prompt, exec_opts.as_ref());
+        let task_id = uuid::Uuid::new_v4().to_string();
 
         let task = orch::spawn_task(
-            provider, args, session_id,
+            task_id, provider, args, session_id,
             cwd, env_overrides, store_dir,
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
@@ -852,8 +858,9 @@ impl BlackboxServer {
             // Build first-turn prompt with ambient scope + brofile lens.
             // Only applies on fresh-session exec paths; resumes use the
             // raw prompt so ambient/lens aren't re-injected each turn.
-            let build_exec_prompt = |session_id: &str| -> String {
+            let build_exec_prompt = |task_id: &str, session_id: &str| -> String {
                 let ctx = orch::AmbientContext {
+                    task_id: Some(task_id.to_string()),
                     session_id: Some(session_id.to_string()),
                     project_dir: cwd.clone(),
                     bro_name: Some(member.name.clone()),
@@ -872,27 +879,25 @@ impl BlackboxServer {
                     brofile.lens.as_deref(),
                 )
             };
-            // Note: the policy file is indexed by session_id, which for
-            // fresh-session dispatches gets generated per member below.
-            // Broadcast builds one DispatchFilters per member in the
-            // spawn branches where session_id is known.
 
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
+                    let task_id = uuid::Uuid::new_v4().to_string();
                     let args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
                     orch::spawn_task(
-                        brofile.provider, args, sid.clone(),
+                        task_id, brofile.provider, args, sid.clone(),
                         cwd.clone(), env_overrides, store_dir.clone(),
                         self.state.task_store.clone(), self.state.tail_tx.clone(),
                     )
                 } else {
+                    let task_id = uuid::Uuid::new_v4().to_string();
                     let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
-                    let exec_prompt = build_exec_prompt(&session_id);
+                    let exec_prompt = build_exec_prompt(&task_id, &session_id);
                     let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &session_id);
+                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id);
                     args.extend(df.args);
                     let t = orch::spawn_task(
-                        brofile.provider, args, session_id,
+                        task_id, brofile.provider, args, session_id,
                         cwd.clone(), env_overrides, store_dir.clone(),
                         self.state.task_store.clone(), self.state.tail_tx.clone(),
                     );
@@ -901,13 +906,14 @@ impl BlackboxServer {
                     t
                 }
             } else {
+                let task_id = uuid::Uuid::new_v4().to_string();
                 let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
-                let exec_prompt = build_exec_prompt(&session_id);
+                let exec_prompt = build_exec_prompt(&task_id, &session_id);
                 let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-                let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &session_id);
+                let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id);
                 args.extend(df.args);
                 let t = orch::spawn_task(
-                    brofile.provider, args, session_id,
+                    task_id, brofile.provider, args, session_id,
                     cwd.clone(), env_overrides, store_dir.clone(),
                     self.state.task_store.clone(), self.state.tail_tx.clone(),
                 );
