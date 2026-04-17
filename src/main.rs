@@ -576,7 +576,11 @@ impl BlackboxServer {
             bro_name: p.bro.clone(),
             thread_id: None,
             work_item_id: None,
-            completion_contract: None,
+            completion_contract: if allow_recursion {
+                None
+            } else {
+                Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
+            },
             allow_recursion,
             provider: Some(provider),
         };
@@ -855,7 +859,11 @@ impl BlackboxServer {
                     bro_name: Some(member.name.clone()),
                     thread_id: None,
                     work_item_id: None,
-                    completion_contract: None,
+                    completion_contract: if allow_recursion {
+                        None
+                    } else {
+                        Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
+                    },
                     allow_recursion,
                     provider: Some(brofile.provider),
                 };

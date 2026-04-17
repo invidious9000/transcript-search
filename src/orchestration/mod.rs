@@ -219,6 +219,30 @@ impl TaskStore {
 // If defense-in-depth text guards are wanted in the future, reintroduce
 // a prefix here and gate on `AmbientContext::provider`.
 
+/// Default per-dispatch contract requiring a structured completion
+/// signal before the agent returns. Observed empirically: without
+/// this, agents competently complete tasks via prose but never emit
+/// `bbox_note(kind="done")` on their own, even when global docs
+/// describe the protocol and they can articulate it back. The
+/// contract converts soft doc guidance into a per-turn requirement.
+pub const DEFAULT_COMPLETION_CONTRACT: &str = "\
+Before returning your final answer, call `mcp__blackbox__bbox_note` \
+with:\n\
+  kind=\"done\"\n\
+  body=<a specific one-line summary of what you accomplished — not \
+generic phrases like \"task complete\", but something like \
+\"verified session_field already elides empty-string\" or \
+\"added 3 edge-case tests to format_toml_string_array\">\n\
+  session_id=<the `session` value from the [scope] line above, if present>\n\
+  project=<the `project` value from [scope], if present>\n\
+  bro=<the `bro` value from [scope], if present>\n\
+These scope values link the note to this dispatch so the orchestrator \
+can find it; omitting them detaches the record. Emit other kinds \
+(dispute, assumption, surprise, followup, blocked, learned) with the \
+same scope fields throughout the work as signal arises. The done-note \
+is required — the orchestrator reads it to track dispatch outcomes \
+without re-parsing prose.";
+
 /// Pre-bound context the daemon has at dispatch time but the executor
 /// would otherwise have to infer by reaching back through the prompt.
 /// Emitting these into the prefix lets notes, thread links, and work-
