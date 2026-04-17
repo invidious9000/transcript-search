@@ -479,10 +479,9 @@ impl BlackboxServer {
 
     #[tool(name = "bro_resume", description = "Resume a previous agent session with a follow-up prompt. Returns a new taskId on the same session.")]
     async fn bro_resume(&self, Parameters(p): Parameters<ResumeParams>) -> CallToolResult {
-        let allow_recursion = p.allow_recursion.unwrap_or(false);
         let store_dir = self.state.store_dir.clone();
 
-        let (provider, session_id, lens, exec_opts, env_overrides, cwd) =
+        let (provider, session_id, _lens, exec_opts, env_overrides, cwd) =
             match self.resolve_resume_target(
                 p.bro.as_deref(), p.session_id.as_deref(),
                 p.provider.as_deref(), p.project_dir.as_deref(),
@@ -495,8 +494,10 @@ impl BlackboxServer {
             return Self::err_text(&format!("{provider} does not support resume"));
         }
 
-        let final_prompt = orch::apply_lens(&p.prompt, lens.as_deref(), allow_recursion);
-        let args = provider.build_resume_args(&session_id, &final_prompt, exec_opts.as_ref());
+        // Lens + recursion guard are injected once on exec and live in the
+        // transcript from turn one; re-prepending them here would duplicate
+        // them in every follow-up user turn.
+        let args = provider.build_resume_args(&session_id, &p.prompt, exec_opts.as_ref());
 
         let task = orch::spawn_task(
             provider, args, session_id,
@@ -698,7 +699,9 @@ impl BlackboxServer {
                 }
             };
 
-            let final_prompt = orch::apply_lens(&p.prompt, brofile.lens.as_deref(), allow_recursion);
+            // Lens + guard go in the first user turn only; resumes use the raw
+            // prompt so the lens isn't re-injected on every follow-up.
+            let exec_prompt = orch::apply_lens(&p.prompt, brofile.lens.as_deref(), allow_recursion);
             let mut env_overrides = None;
             if let Some(ref acct_name) = brofile.account {
                 if let Some(acct) = orchestration::brofile::load_account(acct_name, &store_dir) {
@@ -713,7 +716,7 @@ impl BlackboxServer {
 
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
-                    let args = brofile.provider.build_resume_args(sid, &final_prompt, exec_opts.as_ref());
+                    let args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
                     orch::spawn_task(
                         brofile.provider, args, sid.clone(),
                         cwd.clone(), env_overrides, store_dir.clone(),
@@ -721,7 +724,7 @@ impl BlackboxServer {
                     )
                 } else {
                     let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
-                    let args = brofile.provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+                    let args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
                     let t = orch::spawn_task(
                         brofile.provider, args, session_id,
                         cwd.clone(), env_overrides, store_dir.clone(),
@@ -732,7 +735,7 @@ impl BlackboxServer {
                 }
             } else {
                 let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
-                let args = brofile.provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+                let args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
                 let t = orch::spawn_task(
                     brofile.provider, args, session_id,
                     cwd.clone(), env_overrides, store_dir.clone(),
