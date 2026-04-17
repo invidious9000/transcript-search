@@ -236,6 +236,221 @@ impl Provider {
 }
 
 // ---------------------------------------------------------------------------
+// MCP registration + dispatch-time filters
+// ---------------------------------------------------------------------------
+
+use super::mcp::McpFilters;
+
+impl Provider {
+    /// Argv for `{provider} mcp add` registering an HTTP server.
+    /// Returns None if the provider has no MCP CRUD CLI (Vibe).
+    ///
+    /// `exclude_tools` is honored only by Gemini (persistent, set at
+    /// registration time). Other providers ignore it — they apply tool
+    /// filtering per-dispatch via `build_filter_args`.
+    pub fn build_mcp_add_http_args(
+        &self,
+        name: &str,
+        url: &str,
+        exclude_tools: &[String],
+    ) -> Option<Vec<String>> {
+        match self {
+            Provider::Claude => Some(vec![
+                "mcp".into(), "add".into(),
+                "--transport".into(), "http".into(),
+                name.into(), url.into(),
+            ]),
+            Provider::Copilot => Some(vec![
+                "copilot".into(), "--".into(),
+                "mcp".into(), "add".into(),
+                "--transport".into(), "http".into(),
+                name.into(), url.into(),
+            ]),
+            Provider::Codex => Some(vec![
+                "mcp".into(), "add".into(),
+                name.into(), "--url".into(), url.into(),
+            ]),
+            Provider::Gemini => {
+                let mut args = vec![
+                    "mcp".into(), "add".into(),
+                    "-t".into(), "http".into(),
+                    "-s".into(), "user".into(),
+                ];
+                if !exclude_tools.is_empty() {
+                    args.extend(["--exclude-tools".into(), exclude_tools.join(",")]);
+                }
+                args.extend([name.into(), url.into()]);
+                Some(args)
+            }
+            Provider::Vibe => None,
+        }
+    }
+
+    /// Argv for `{provider} mcp remove <name>`.
+    pub fn build_mcp_remove_args(&self, name: &str) -> Option<Vec<String>> {
+        match self {
+            Provider::Claude => Some(vec!["mcp".into(), "remove".into(), name.into()]),
+            Provider::Copilot => Some(vec![
+                "copilot".into(), "--".into(),
+                "mcp".into(), "remove".into(), name.into(),
+            ]),
+            Provider::Codex => Some(vec!["mcp".into(), "remove".into(), name.into()]),
+            Provider::Gemini => Some(vec!["mcp".into(), "remove".into(), name.into()]),
+            Provider::Vibe => None,
+        }
+    }
+
+    /// Argv for `{provider} mcp list` (stdout will differ per provider).
+    pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
+        match self {
+            Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
+            Provider::Copilot => Some(vec![
+                "copilot".into(), "--".into(),
+                "mcp".into(), "list".into(),
+            ]),
+            Provider::Codex => Some(vec!["mcp".into(), "list".into()]),
+            Provider::Gemini => Some(vec!["mcp".into(), "list".into()]),
+            Provider::Vibe => None,
+        }
+    }
+
+    /// Detect whether `name` appears in a provider's `mcp list` output
+    /// AND (optionally) whether its URL matches `expected_url`.
+    ///
+    /// Output formats differ: coarse substring match is sufficient for
+    /// our "skip if present with matching URL, else upsert" flow.
+    pub fn mcp_list_has(&self, stdout: &str, name: &str, expected_url: Option<&str>) -> MatchState {
+        let has_name = stdout.lines().any(|l| l.contains(name));
+        if !has_name {
+            return MatchState::Missing;
+        }
+        match expected_url {
+            Some(url) if !stdout.contains(url) => MatchState::Drift,
+            _ => MatchState::MatchesName,
+        }
+    }
+
+    /// Argv SUFFIX appended to exec/resume for dispatch-time tool
+    /// filters. Empty when the provider doesn't support such filtering
+    /// (Vibe — no MCP) or the filter set is empty.
+    ///
+    /// Provider translation rules:
+    ///   - Claude: pass glob patterns directly to `--disallowedTools` /
+    ///     `--allowedTools` (native glob support).
+    ///   - Copilot: pass glob patterns to repeated `--deny-tool=` /
+    ///     `--allow-tool=` flags (native glob support).
+    ///   - Codex: no glob support; expand blackbox-prefixed patterns
+    ///     against the orchestration tool universe and emit a single
+    ///     `-c mcp_servers.blackbox.disabled_tools=[...]` TOML override.
+    ///     Patterns outside the blackbox namespace are skipped — Codex
+    ///     can't filter per-tool outside its own MCP server model.
+    ///   - Gemini: returns a placeholder; real policy file is generated
+    ///     per-dispatch by the caller (see `write_gemini_policy_file`),
+    ///     which appends `--policy <path>` to argv.
+    pub fn build_filter_args(&self, filters: &McpFilters) -> Vec<String> {
+        if filters.is_empty() {
+            return Vec::new();
+        }
+        let mut args = Vec::new();
+        match self {
+            Provider::Claude => {
+                if !filters.disallow.is_empty() {
+                    args.push("--disallowedTools".into());
+                    args.push(filters.disallow.join(" "));
+                }
+                if !filters.allow.is_empty() {
+                    args.push("--allowedTools".into());
+                    args.push(filters.allow.join(" "));
+                }
+            }
+            Provider::Copilot => {
+                for p in &filters.disallow {
+                    args.push(format!("--deny-tool={p}"));
+                }
+                for p in &filters.allow {
+                    args.push(format!("--allow-tool={p}"));
+                }
+            }
+            Provider::Codex => {
+                let disabled = codex_expand_blackbox_patterns(&filters.disallow);
+                if !disabled.is_empty() {
+                    let toml_array = format_toml_string_array(&disabled);
+                    args.push("-c".into());
+                    args.push(format!(
+                        "mcp_servers.blackbox.disabled_tools={toml_array}"
+                    ));
+                }
+                // Codex has enabled_tools too, but allow-only filtering
+                // is rarely what callers want (everything else disabled)
+                // — skip until a real use case appears.
+            }
+            // Gemini: `--policy <path>` is appended by the caller after
+            // generating the policy file. build_filter_args stays empty
+            // so the caller knows whether to bother generating at all.
+            Provider::Gemini => {}
+            // Vibe has no MCP at all.
+            Provider::Vibe => {}
+        }
+        args
+    }
+
+    /// Whether this provider honors dispatch-time filters (vs registration-
+    /// time or not at all). Claude, Copilot, Codex, and Gemini all
+    /// support per-invocation mechanical filtering via different
+    /// mechanisms. Only Vibe (no MCP) falls back to the text guard.
+    pub fn supports_dispatch_filter(&self) -> bool {
+        matches!(
+            self,
+            Provider::Claude | Provider::Copilot | Provider::Codex | Provider::Gemini
+        )
+    }
+}
+
+/// Expand glob patterns targeting the blackbox MCP namespace into bare
+/// tool names understood by Codex's `disabled_tools` array. Patterns
+/// that don't touch blackbox are silently skipped (Codex has no way to
+/// filter tools outside the MCP server it owns).
+fn codex_expand_blackbox_patterns(patterns: &[String]) -> Vec<String> {
+    let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
+    let prefix = crate::tool_docs::BLACKBOX_MCP_PREFIX;
+    let mut out = Vec::new();
+    for p in patterns {
+        let Some(stripped) = p.strip_prefix(prefix) else {
+            continue;
+        };
+        let expanded = super::mcp::expand_pattern(stripped, &universe);
+        for t in expanded {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
+    }
+    out
+}
+
+/// Format a slice of strings as a TOML array literal (`["a", "b"]`)
+/// for use inside `-c key=value` overrides. Each element is quoted
+/// with double-quote escape rules sufficient for tool names.
+fn format_toml_string_array(items: &[String]) -> String {
+    let quoted: Vec<String> = items
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", quoted.join(","))
+}
+
+/// Result of scanning a `mcp list` output for a specific entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchState {
+    /// Name not found in output.
+    Missing,
+    /// Name found AND expected URL substring found (or no URL asked for).
+    MatchesName,
+    /// Name found but expected URL not found — registration drift.
+    Drift,
+}
+
+// ---------------------------------------------------------------------------
 // Event parsing — extract structured data from provider-specific JSON events
 // ---------------------------------------------------------------------------
 
@@ -817,5 +1032,153 @@ mod tests {
             let has_default = p.models().iter().any(|m| m.default);
             assert!(has_default, "{} should have a default model", p);
         }
+    }
+
+    #[test]
+    fn test_mcp_add_args_shape_per_provider() {
+        let u = "http://127.0.0.1:7264/mcp";
+        let c = Provider::Claude.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        assert_eq!(&c[..4], &["mcp", "add", "--transport", "http"]);
+        assert!(c.contains(&"blackbox".to_string()));
+        assert!(c.contains(&u.to_string()));
+
+        let co = Provider::Copilot.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        assert!(co.starts_with(&["copilot".to_string(), "--".to_string()]));
+        assert!(co.contains(&"--transport".to_string()));
+
+        let cx = Provider::Codex.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        assert!(cx.contains(&"--url".to_string()));
+        assert!(cx.contains(&u.to_string()));
+
+        let g = Provider::Gemini.build_mcp_add_http_args("blackbox", u, &[]).unwrap();
+        assert!(g.iter().any(|a| a == "-t"));
+        assert!(g.iter().any(|a| a == "-s"));
+        assert!(g.contains(&u.to_string()));
+
+        assert!(Provider::Vibe.build_mcp_add_http_args("x", "y", &[]).is_none());
+    }
+
+    #[test]
+    fn test_gemini_mcp_add_includes_exclude_tools() {
+        let exclude = vec!["bro_exec".to_string(), "bro_resume".to_string()];
+        let args = Provider::Gemini
+            .build_mcp_add_http_args("blackbox", "http://x/mcp", &exclude)
+            .unwrap();
+        let joined = args.join(" ");
+        assert!(joined.contains("--exclude-tools"));
+        assert!(joined.contains("bro_exec,bro_resume"));
+    }
+
+    #[test]
+    fn test_mcp_list_has_detects_states() {
+        let out = "Name        URL\nblackbox    http://127.0.0.1:7264/mcp\nother       http://x/mcp\n";
+        assert_eq!(
+            Provider::Claude.mcp_list_has(out, "blackbox", Some("http://127.0.0.1:7264/mcp")),
+            MatchState::MatchesName
+        );
+        assert_eq!(
+            Provider::Claude.mcp_list_has(out, "blackbox", Some("http://127.0.0.1:9999/mcp")),
+            MatchState::Drift
+        );
+        assert_eq!(
+            Provider::Claude.mcp_list_has(out, "absent", None),
+            MatchState::Missing
+        );
+    }
+
+    #[test]
+    fn test_claude_filter_disallow_args() {
+        let filters = McpFilters {
+            disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(rm -rf *)".into()],
+            allow: vec![],
+        };
+        let args = Provider::Claude.build_filter_args(&filters);
+        assert_eq!(args[0], "--disallowedTools");
+        assert!(args[1].contains("mcp__blackbox__bro_*"));
+        assert!(args[1].contains("Bash(rm -rf *)"));
+    }
+
+    #[test]
+    fn test_copilot_filter_repeats_flag() {
+        let filters = McpFilters {
+            disallow: vec!["a".into(), "b".into()],
+            allow: vec!["c".into()],
+        };
+        let args = Provider::Copilot.build_filter_args(&filters);
+        assert!(args.contains(&"--deny-tool=a".to_string()));
+        assert!(args.contains(&"--deny-tool=b".to_string()));
+        assert!(args.contains(&"--allow-tool=c".to_string()));
+    }
+
+    #[test]
+    fn test_codex_expands_blackbox_glob_to_disabled_tools() {
+        let filters = McpFilters {
+            disallow: vec!["mcp__blackbox__bro_*".into()],
+            allow: vec![],
+        };
+        let args = Provider::Codex.build_filter_args(&filters);
+        assert_eq!(args[0], "-c");
+        assert!(args[1].starts_with("mcp_servers.blackbox.disabled_tools=["));
+        // Should contain at least the core bro_* names.
+        assert!(args[1].contains("bro_exec"));
+        assert!(args[1].contains("bro_resume"));
+        assert!(args[1].contains("bro_mcp"));
+        // Should NOT contain any bbox_* tools (different category).
+        assert!(!args[1].contains("bbox_note"));
+    }
+
+    #[test]
+    fn test_codex_skips_non_blackbox_patterns() {
+        let filters = McpFilters {
+            disallow: vec!["Bash(git push *)".into()],
+            allow: vec![],
+        };
+        let args = Provider::Codex.build_filter_args(&filters);
+        // Codex can't filter tools outside its MCP server model, so a
+        // pattern that doesn't target blackbox produces no args.
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_gemini_filter_args_deferred_to_policy_file() {
+        let filters = McpFilters {
+            disallow: vec!["mcp__blackbox__bro_*".into()],
+            allow: vec![],
+        };
+        // Gemini gets its policy via --policy <file>, produced by the
+        // caller. build_filter_args returns empty so callers know to
+        // handle it separately.
+        assert!(Provider::Gemini.build_filter_args(&filters).is_empty());
+    }
+
+    #[test]
+    fn test_vibe_ignores_filters() {
+        let filters = McpFilters {
+            disallow: vec!["anything".into()],
+            allow: vec![],
+        };
+        assert!(Provider::Vibe.build_filter_args(&filters).is_empty());
+    }
+
+    #[test]
+    fn test_supports_dispatch_filter_all_but_vibe() {
+        assert!(Provider::Claude.supports_dispatch_filter());
+        assert!(Provider::Copilot.supports_dispatch_filter());
+        assert!(Provider::Codex.supports_dispatch_filter());
+        assert!(Provider::Gemini.supports_dispatch_filter());
+        assert!(!Provider::Vibe.supports_dispatch_filter());
+    }
+
+    #[test]
+    fn test_format_toml_string_array() {
+        assert_eq!(format_toml_string_array(&[]), "[]");
+        assert_eq!(
+            format_toml_string_array(&["a".into(), "b".into()]),
+            r#"["a","b"]"#
+        );
+        assert_eq!(
+            format_toml_string_array(&[r#"with"quote"#.into()]),
+            r#"["with\"quote"]"#
+        );
     }
 }

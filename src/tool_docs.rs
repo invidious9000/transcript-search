@@ -334,6 +334,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Save / list / delete teamplates; create / list / dissolve teams; show roster. A team = instantiated teamplate with named bro instances tracking their own sessionIds.",
         example: None,
     },
+    ToolDoc {
+        name: "bro_mcp",
+        category: ToolCategory::Orchestration,
+        summary: "Manage MCP servers + tool filters for dispatched bros.",
+        when_to_use: "Add/remove MCP servers visible to dispatched bros (fans out to Claude/Copilot/Codex/Gemini CLIs on global-scope writes). Allow/disallow tool patterns for mechanical filtering — default disallow `mcp__blackbox__bro_*` replaces the text recursion guard on providers that support dispatch-time filtering (Claude, Copilot). Actions: list, get, add, remove, allow, disallow, clear_filters, sync.",
+        example: Some(r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
@@ -390,6 +397,23 @@ it resolves provider, account, lens, and sessionId automatically.
 - For ensembles: `bro_broadcast` then `bro_when_all` (blind deliberation) \
 or `bro_when_any` (race).
 ";
+
+// ── Filter translation helpers ───────────────────────────────────────
+
+/// Bare names of every orchestration (`bro_*`) tool. Used by provider
+/// filter translators that can't accept glob patterns (Codex,
+/// Gemini's policy engine) to expand `mcp__blackbox__bro_*` into a
+/// concrete list.
+pub fn orchestration_tool_names() -> Vec<&'static str> {
+    TOOL_DOCS
+        .iter()
+        .filter(|d| d.category == ToolCategory::Orchestration)
+        .map(|d| d.name)
+        .collect()
+}
+
+/// Prefix convention for blackbox-served tools in provider tool namespaces.
+pub const BLACKBOX_MCP_PREFIX: &str = "mcp__blackbox__";
 
 // ── Rendering ────────────────────────────────────────────────────────
 

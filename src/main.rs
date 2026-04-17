@@ -446,6 +446,78 @@ fn format_progress_snapshot(tasks: &[Arc<orch::Task>], store_dir: &Path) -> (Str
     (lines.join("\n"), all_terminal)
 }
 
+/// Load the effective tool filter set for a dispatch (global + project
+/// overlay + default recursion guard unless `allow_recursion`), then
+/// translate to provider-specific CLI args. For Gemini, also writes a
+/// per-dispatch policy file and returns the path so the caller can
+/// clean it up after the child exits.
+struct DispatchFilters {
+    args: Vec<String>,
+    /// Tempfile path for Gemini policy cleanup; None for other providers.
+    policy_file: Option<PathBuf>,
+}
+
+fn resolve_dispatch_filters(
+    provider: Provider,
+    project_dir: Option<&str>,
+    allow_recursion: bool,
+    task_id: &str,
+) -> DispatchFilters {
+    let global = orchestration::mcp::global_store_path()
+        .and_then(|p| orchestration::mcp::McpStore::load(&p).ok())
+        .unwrap_or_default();
+    let project = project_dir
+        .map(|pd| orchestration::mcp::project_store_path(Path::new(pd)))
+        .and_then(|p| orchestration::mcp::McpStore::load(&p).ok());
+
+    let eff = orchestration::mcp::resolve_effective(
+        &global,
+        project.as_ref(),
+        /* include_default_guard */ !allow_recursion,
+    );
+
+    let mut args = provider.build_filter_args(&eff.filters);
+    let mut policy_file = None;
+
+    if provider == Provider::Gemini {
+        match orchestration::mcp::write_gemini_policy_file(task_id, &eff.filters) {
+            Ok(Some(path)) => {
+                args.push("--policy".into());
+                args.push(path.to_string_lossy().into_owned());
+                policy_file = Some(path);
+            }
+            Ok(None) => { /* no filters → no file */ }
+            Err(e) => tracing::warn!("gemini policy file write failed: {e:#}"),
+        }
+    }
+
+    DispatchFilters { args, policy_file }
+}
+
+/// Delete a Gemini policy tempfile once the associated task reaches a
+/// terminal state. Spawned as a detached tokio task from the dispatch
+/// path. No-op if path is None.
+fn cleanup_policy_file_when_done(task: std::sync::Arc<orch::Task>, path: Option<PathBuf>) {
+    let Some(path) = path else { return };
+    tokio::spawn(async move {
+        loop {
+            {
+                let inner = task.inner.lock();
+                if inner.status.is_terminal() {
+                    break;
+                }
+            }
+            tokio::select! {
+                _ = task.notify.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {}
+            }
+        }
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::debug!("gemini policy cleanup {}: {e}", path.display());
+        }
+    });
+}
+
 fn spawn_progress_notifier(
     tasks: Vec<Arc<orch::Task>>,
     peer: rmcp::service::Peer<rmcp::RoleServer>,
@@ -506,12 +578,15 @@ impl BlackboxServer {
             work_item_id: None,
             completion_contract: None,
             allow_recursion,
+            provider: Some(provider),
         };
         let final_prompt = orch::apply_brofile_lens(
             &orch::apply_ambient(&p.prompt, &ambient_ctx),
             lens.as_deref(),
         );
-        let args = provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+        let mut args = provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &session_id);
+        args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
             provider, args, session_id,
@@ -519,6 +594,9 @@ impl BlackboxServer {
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
         );
+
+        // Register Gemini policy-file cleanup once the task terminates.
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
 
         // If targeting a named bro in a team, record the task
         if let Some(bro_name) = &p.bro {
@@ -779,12 +857,17 @@ impl BlackboxServer {
                     work_item_id: None,
                     completion_contract: None,
                     allow_recursion,
+                    provider: Some(brofile.provider),
                 };
                 orch::apply_brofile_lens(
                     &orch::apply_ambient(&p.prompt, &ctx),
                     brofile.lens.as_deref(),
                 )
             };
+            // Note: the policy file is indexed by session_id, which for
+            // fresh-session dispatches gets generated per member below.
+            // Broadcast builds one DispatchFilters per member in the
+            // spawn branches where session_id is known.
 
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
@@ -797,24 +880,30 @@ impl BlackboxServer {
                 } else {
                     let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
                     let exec_prompt = build_exec_prompt(&session_id);
-                    let args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+                    let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &session_id);
+                    args.extend(df.args);
                     let t = orch::spawn_task(
                         brofile.provider, args, session_id,
                         cwd.clone(), env_overrides, store_dir.clone(),
                         self.state.task_store.clone(), self.state.tail_tx.clone(),
                     );
+                    cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
                     t
                 }
             } else {
                 let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
                 let exec_prompt = build_exec_prompt(&session_id);
-                let args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+                let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
+                let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &session_id);
+                args.extend(df.args);
                 let t = orch::spawn_task(
                     brofile.provider, args, session_id,
                     cwd.clone(), env_overrides, store_dir.clone(),
                     self.state.task_store.clone(), self.state.tail_tx.clone(),
                 );
+                cleanup_policy_file_when_done(t.clone(), df.policy_file);
                 updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());
                 t
             };
@@ -996,6 +1085,11 @@ impl BlackboxServer {
             }
             _ => Self::err_text(&format!("Unknown brofile action: {}", p.action)),
         }
+    }
+
+    #[tool(name = "bro_mcp", description = "Manage MCP servers + tool filters for dispatched bros. Actions: list, get, add, remove, allow, disallow, clear_filters, sync. Global-scope add/remove fans out to each installed provider's CLI (Claude/Copilot/Codex/Gemini).")]
+    fn bro_mcp(&self, Parameters(p): Parameters<orchestration::mcp::McpToolParams>) -> CallToolResult {
+        Self::run("bro_mcp", || orchestration::mcp::handle(&p))
     }
 
     #[tool(name = "bro_team", description = "Manage teamplates and teams. Actions: save_template, list_templates, delete_template, create, list, dissolve, roster.")]
@@ -1546,6 +1640,34 @@ async fn main() -> anyhow::Result<()> {
         Ok(r) if r.wrote => tracing::info!("Tool reference synced ({} bytes)", r.bytes),
         Ok(_) => tracing::debug!("Tool reference already up to date"),
         Err(e) => tracing::warn!("Tool reference sync failed: {e:#}"),
+    }
+
+    // Register blackbox in each installed provider's MCP config so that
+    // every `{provider} ...` invocation (dispatched bros or interactive
+    // sessions) sees the daemon without requiring user-managed config.
+    // Resolves the "subprocessed bros don't see bbox tools" gap
+    // discovered in the self-test pass.
+    let bbox_port: u16 = std::env::var("BBOX_PORT")
+        .or_else(|_| std::env::var("BRO_PORT"))
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7263);
+    let bbox_url = format!("http://127.0.0.1:{bbox_port}/mcp");
+    let report = orchestration::mcp::self_register_blackbox(&bbox_url);
+    tracing::info!("blackbox MCP self-registration: {}", report.summary());
+    for (p, outcome) in &report.per_provider {
+        if let orchestration::mcp::SelfRegisterOutcome::Error { detail } = outcome {
+            tracing::warn!("self-register {p}: {detail}");
+        }
+    }
+
+    // Sweep orphaned Gemini policy tempfiles from crashed/force-killed
+    // dispatches. Files younger than 24h are kept in case they belong
+    // to live tasks.
+    match orchestration::mcp::sweep_stale_gemini_policies(24) {
+        Ok(n) if n > 0 => tracing::info!("swept {n} stale gemini policy file(s)"),
+        Ok(_) => {}
+        Err(e) => tracing::debug!("gemini policy sweep: {e:#}"),
     }
 
     let th_path = home.join(".claude-shared").join("blackbox-threads.json");

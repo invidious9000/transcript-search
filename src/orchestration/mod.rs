@@ -1,5 +1,6 @@
 pub mod providers;
 pub mod brofile;
+pub mod mcp;
 pub mod team;
 pub mod tail;
 
@@ -210,8 +211,13 @@ impl TaskStore {
 //   - ambient  = guardrail + scope (daemon-controlled, every dispatch)
 //   - lens     = persona / system-prompt (user-authored, per brofile)
 
-const RECURSION_GUARD: &str =
-    "IMPORTANT: Do not call tools from the bro MCP server (recursion guard).";
+// Text recursion guard retired 2026-04-17. Every dispatch-capable
+// provider (Claude, Copilot, Codex, Gemini) now has a mechanical tool
+// filter applied at argv construction time. Vibe has no MCP at all, so
+// no bro_* tools reach it to recurse through.
+//
+// If defense-in-depth text guards are wanted in the future, reintroduce
+// a prefix here and gate on `AmbientContext::provider`.
 
 /// Pre-bound context the daemon has at dispatch time but the executor
 /// would otherwise have to infer by reaching back through the prompt.
@@ -227,6 +233,11 @@ pub struct AmbientContext {
     /// Per-dispatch expectation, e.g. "call bbox_note(kind='done', body='…') before returning".
     pub completion_contract: Option<String>,
     pub allow_recursion: bool,
+    /// Target provider. When set and the provider supports dispatch-time
+    /// tool filtering (Claude/Copilot), the text recursion guard is
+    /// omitted in favor of the mechanical filter applied at the CLI arg
+    /// layer. Unset or unsupported provider → text guard as fallback.
+    pub provider: Option<providers::Provider>,
 }
 
 impl AmbientContext {
@@ -261,16 +272,19 @@ impl AmbientContext {
     }
 }
 
-/// Wrap a prompt with the per-turn ambient prefix (guardrail + scope +
+/// Wrap a prompt with the per-turn ambient prefix (scope block +
 /// optional completion contract). Skipped entirely when
 /// `allow_recursion` is set. Does NOT touch the brofile lens.
+///
+/// Recursion guarding is done mechanically via provider-specific tool-
+/// filter args (`--disallowedTools`, `--deny-tool`, `-c disabled_tools=…`,
+/// or `--policy <file>`), appended to argv outside this function. No
+/// text guard is emitted.
 pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
     if ctx.allow_recursion {
         return prompt.to_string();
     }
     let mut prefix = String::new();
-    prefix.push_str(RECURSION_GUARD);
-    prefix.push_str("\n\n");
 
     let fields = ctx.scope_fields();
     if !fields.is_empty() {
@@ -777,25 +791,47 @@ mod tests {
     }
 
     #[test]
-    fn ambient_wraps_with_guard_and_scope() {
+    fn ambient_emits_scope_block_no_text_guard() {
         let ctx = AmbientContext {
             session_id: Some("sess-abc".into()),
             project_dir: Some("/repo/x".into()),
             bro_name: Some("executor".into()),
-            thread_id: None,
-            work_item_id: None,
-            completion_contract: None,
             allow_recursion: false,
+            provider: Some(providers::Provider::Claude),
+            ..Default::default()
         };
         let out = apply_ambient("do stuff", &ctx);
-        assert!(out.starts_with("IMPORTANT:"));
+        assert!(!out.contains("IMPORTANT:"), "text recursion guard retired");
         assert!(out.contains("[scope]"));
         assert!(out.contains("session: sess-abc"));
         assert!(out.contains("project: /repo/x"));
         assert!(out.contains("bro: executor"));
         assert!(out.contains("do stuff"));
-        // Protocol text must NOT leak into per-turn anymore.
         assert!(!out.contains("STRUCTURED SIDE CHANNEL"));
+    }
+
+    #[test]
+    fn ambient_no_text_guard_for_any_provider() {
+        // Every provider relies on mechanical filtering now. Vibe has
+        // no MCP to recurse through at all.
+        for p in [
+            providers::Provider::Claude,
+            providers::Provider::Copilot,
+            providers::Provider::Codex,
+            providers::Provider::Gemini,
+            providers::Provider::Vibe,
+        ] {
+            let ctx = AmbientContext {
+                allow_recursion: false,
+                provider: Some(p),
+                ..Default::default()
+            };
+            let out = apply_ambient("work", &ctx);
+            assert!(
+                !out.contains("IMPORTANT:"),
+                "text guard leaked for provider {p:?}"
+            );
+        }
     }
 
     #[test]
@@ -847,13 +883,15 @@ mod tests {
         let ctx = AmbientContext {
             session_id: Some("sess-xyz".into()),
             allow_recursion: false,
+            provider: Some(providers::Provider::Claude),
             ..Default::default()
         };
         let wrapped = apply_brofile_lens(&apply_ambient("work", &ctx), Some("You are a reviewer"));
         assert!(wrapped.starts_with("You are a reviewer"));
-        assert!(wrapped.contains("IMPORTANT:"));
+        assert!(wrapped.contains("[scope]"));
         assert!(wrapped.contains("sess-xyz"));
         assert!(wrapped.contains("work"));
+        assert!(!wrapped.contains("IMPORTANT:"), "text guard retired");
     }
 
     #[test]
