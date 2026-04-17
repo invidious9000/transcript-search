@@ -399,11 +399,23 @@ impl Provider {
                 }
             }
             Provider::Copilot => {
+                // Copilot's --deny-tool / --allow-tool expect
+                // `ServerName(tool_name)` format, not the MCP-prefixed
+                // form Claude accepts. Verified empirically: the
+                // `mcp__blackbox__bro_status` form passed through
+                // without blocking, while `blackbox(bro_status)`
+                // correctly denied the invocation.
                 for p in expand_filter_patterns(&filters.disallow) {
-                    args.push(format!("--deny-tool={p}"));
+                    args.push(format!(
+                        "--deny-tool={}",
+                        copilot_format_mcp_tool(&p).unwrap_or(p)
+                    ));
                 }
                 for p in expand_filter_patterns(&filters.allow) {
-                    args.push(format!("--allow-tool={p}"));
+                    args.push(format!(
+                        "--allow-tool={}",
+                        copilot_format_mcp_tool(&p).unwrap_or(p)
+                    ));
                 }
             }
             Provider::Codex => {
@@ -461,6 +473,18 @@ fn codex_expand_blackbox_patterns(patterns: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Translate a `mcp__server__tool` full name into Copilot's
+/// `Server(tool)` syntax. Returns None for patterns that aren't in
+/// the MCP prefix form (e.g. `Bash(git *)` or `shell(git:*)`) so
+/// callers can pass them through unchanged.
+fn copilot_format_mcp_tool(full: &str) -> Option<String> {
+    // Accept `mcp__<server>__<tool>` with the canonical double-
+    // underscore separator.
+    let rest = full.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    Some(format!("{server}({tool})"))
 }
 
 /// Expand filter patterns for providers that accept full MCP tool
@@ -1190,16 +1214,31 @@ mod tests {
     #[test]
     fn test_copilot_filter_repeats_flag_expanded() {
         let filters = McpFilters {
-            disallow: vec!["mcp__blackbox__bro_*".into(), "a".into()],
-            allow: vec!["c".into()],
+            disallow: vec!["mcp__blackbox__bro_*".into(), "shell(git push)".into()],
+            allow: vec!["shell".into()],
         };
         let args = Provider::Copilot.build_filter_args(&filters);
-        // Each expanded bro_* tool gets its own --deny-tool=.
-        assert!(args.iter().any(|a| a == "--deny-tool=mcp__blackbox__bro_exec"));
-        assert!(args.iter().any(|a| a == "--deny-tool=mcp__blackbox__bro_resume"));
-        // Non-blackbox pattern passes through.
-        assert!(args.contains(&"--deny-tool=a".to_string()));
-        assert!(args.contains(&"--allow-tool=c".to_string()));
+        // Each expanded bro_* tool translates to Copilot's
+        // `Server(tool)` syntax, not the MCP prefix form.
+        assert!(args.iter().any(|a| a == "--deny-tool=blackbox(bro_exec)"));
+        assert!(args.iter().any(|a| a == "--deny-tool=blackbox(bro_resume)"));
+        // No mcp__ prefix leaks into copilot args.
+        assert!(!args.iter().any(|a| a.contains("mcp__blackbox__")));
+        // Non-MCP patterns (shell(...) native form) pass through.
+        assert!(args.contains(&"--deny-tool=shell(git push)".to_string()));
+        assert!(args.contains(&"--allow-tool=shell".to_string()));
+    }
+
+    #[test]
+    fn test_copilot_format_mcp_tool_translation() {
+        assert_eq!(
+            copilot_format_mcp_tool("mcp__blackbox__bro_exec"),
+            Some("blackbox(bro_exec)".to_string())
+        );
+        assert_eq!(copilot_format_mcp_tool("mcp__foo__bar"), Some("foo(bar)".to_string()));
+        // Not MCP-shaped → None, caller uses original.
+        assert_eq!(copilot_format_mcp_tool("Bash(git *)"), None);
+        assert_eq!(copilot_format_mcp_tool("mcp__only_one_underscore"), None);
     }
 
     #[test]
