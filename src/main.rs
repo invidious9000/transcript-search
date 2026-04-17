@@ -1545,12 +1545,18 @@ async fn roster_handler(
 
 #[derive(Debug, Deserialize)]
 struct TailQuery {
-    #[serde(default)]
-    team: Option<String>,
-    #[serde(default)]
-    bro: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
+    /// Comma-separated team names — union of members. Accepts legacy `team=`.
+    #[serde(default, alias = "team")]
+    teams: Option<String>,
+    /// Comma-separated bro names. Accepts legacy `bro=`.
+    #[serde(default, alias = "bro")]
+    bros: Option<String>,
+    /// Comma-separated session IDs — matches events by their task's session_id.
+    #[serde(default, alias = "session")]
+    sessions: Option<String>,
+    /// Comma-separated provider names. Accepts legacy `provider=`.
+    #[serde(default, alias = "provider")]
+    providers: Option<String>,
 }
 
 async fn tail_handler(
@@ -1559,48 +1565,72 @@ async fn tail_handler(
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let mut rx = state.tail_tx.subscribe();
 
-    // Resolve team filter to a set of task IDs (dynamic — checks on each event)
-    let team_name = query.team.clone();
-    let bro_filter = query.bro.clone();
-    let provider_filter = query.provider.and_then(|p| p.parse::<Provider>().ok());
+    let wanted_teams = split_csv(&query.teams);
+    let wanted_bros = split_csv(&query.bros);
+    let wanted_sessions = split_csv(&query.sessions);
+    let wanted_providers: Vec<Provider> = split_csv(&query.providers).iter()
+        .filter_map(|p| p.parse::<Provider>().ok())
+        .collect();
+    let no_selectors = wanted_teams.is_empty()
+        && wanted_bros.is_empty()
+        && wanted_sessions.is_empty()
+        && wanted_providers.is_empty();
     let store_dir = state.store_dir.clone();
 
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    // Apply provider filter — resolve from task store
-                    if let Some(pf) = provider_filter {
-                        // Check if this event's task matches the provider
-                        let task_provider = state.task_store.read()
-                            .get(event.task_id())
-                            .map(|t| t.inner.lock().provider);
-                        if task_provider != Some(pf) {
-                            continue;
-                        }
-                    }
-                    if let Some(ref bf) = bro_filter {
-                        let bro = orchestration::team::find_bro_name_for_task(event.task_id(), &store_dir);
-                        if bro.as_deref() != Some(bf.as_str()) {
-                            continue;
-                        }
-                    }
-                    if let Some(ref tn) = team_name {
-                        if let Some(team) = orchestration::team::load_team(tn, &store_dir) {
-                            let team_tasks: std::collections::HashSet<String> = team.members.iter()
-                                .flat_map(|m| m.task_history.clone())
-                                .collect();
-                            if !team_tasks.contains(event.task_id()) {
-                                continue;
-                            }
-                        }
+                    let tid = event.task_id();
+                    let (task_provider, task_session_id) = {
+                        let store = state.task_store.read();
+                        store.get(tid)
+                            .map(|t| {
+                                let inner = t.inner.lock();
+                                (Some(inner.provider), Some(inner.session_id.clone()))
+                            })
+                            .unwrap_or((None, None))
+                    };
+                    let bro_name = orchestration::team::find_bro_name_for_task(tid, &store_dir);
+
+                    // Provider is a filter that applies on top of the selector
+                    // union. Bros/sessions/teams are OR'd together: match ANY
+                    // specified selector across them; a category being empty
+                    // means it contributes no matches (but also doesn't reject).
+                    let provider_ok = wanted_providers.is_empty()
+                        || task_provider.map(|p| wanted_providers.contains(&p)).unwrap_or(false);
+                    let selectors_specified = !wanted_bros.is_empty()
+                        || !wanted_sessions.is_empty()
+                        || !wanted_teams.is_empty();
+                    let selector_match = if !selectors_specified {
+                        true
+                    } else {
+                        let bro_m = bro_name.as_deref()
+                            .map(|b| wanted_bros.iter().any(|w| w == b))
+                            .unwrap_or(false);
+                        let session_m = task_session_id.as_deref()
+                            .map(|s| wanted_sessions.iter().any(|w| w == s))
+                            .unwrap_or(false);
+                        let team_m = wanted_teams.iter().any(|tn| {
+                            orchestration::team::load_team(tn, &store_dir)
+                                .map(|team| team.members.iter()
+                                    .any(|m| m.task_history.iter().any(|id| id == tid)))
+                                .unwrap_or(false)
+                        });
+                        bro_m || session_m || team_m
+                    };
+                    if !(no_selectors || (provider_ok && selector_match)) {
+                        continue;
                     }
 
-                    // Enrich event with bro name for display
-                    let bro_name = orchestration::team::find_bro_name_for_task(event.task_id(), &store_dir);
                     let mut evt_json = serde_json::to_value(&event).unwrap_or_default();
                     if let Some(ref name) = bro_name {
                         evt_json["bro_name"] = Value::String(name.clone());
+                    }
+                    if let Some(ref sid) = task_session_id {
+                        if sid.as_str() != "pending" {
+                            evt_json["session_id"] = Value::String(sid.clone());
+                        }
                     }
                     let data = serde_json::to_string(&evt_json).unwrap_or_default();
                     yield Ok(Event::default().data(data));

@@ -9,6 +9,7 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
@@ -44,12 +45,108 @@ struct RosterEntry {
     model: Option<String>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 struct TailSelectors {
     bros: Vec<String>,
     teams: Vec<String>,
     sessions: Vec<String>,
     providers: Vec<String>,
+}
+
+// ── SSE subscriber ─────────────────────────────────────────────────
+//
+// The daemon synthesises richer activity signal than the JSONL file
+// gets. Claude exec streams via stdout → the daemon emits TaskProgress
+// events with a rolling snippet of the latest assistant message, even
+// while the subprocess's own JSONL is still sitting idle. We subscribe
+// to that stream so the UI can distinguish "alive and streaming" from
+// "alive but quiet (in a tool call)" from "truly idle".
+
+/// Event pushed from the async SSE task into the sync TUI loop.
+#[derive(Debug, Clone)]
+enum LaneSignal {
+    TaskStarted   { bro: Option<String>, session_id: Option<String>, task_id: String },
+    TaskProgress  { bro: Option<String>, session_id: Option<String>, task_id: String, snippet: String },
+    TaskCompleted { bro: Option<String>, session_id: Option<String>, task_id: String },
+    TaskFailed    { bro: Option<String>, session_id: Option<String>, task_id: String, error: String },
+    TaskCancelled { bro: Option<String>, session_id: Option<String>, task_id: String },
+}
+
+async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
+    let port = std::env::var("BBOX_PORT")
+        .or_else(|_| std::env::var("BRO_PORT"))
+        .unwrap_or_else(|_| "7264".into());
+    let mut url = format!("http://127.0.0.1:{port}/tail");
+    let mut params = Vec::new();
+    if !sel.bros.is_empty()      { params.push(format!("bros={}",      sel.bros.join(","))); }
+    if !sel.teams.is_empty()     { params.push(format!("teams={}",     sel.teams.join(","))); }
+    if !sel.sessions.is_empty()  { params.push(format!("sessions={}",  sel.sessions.join(","))); }
+    if !sel.providers.is_empty() { params.push(format!("providers={}", sel.providers.join(","))); }
+    if !params.is_empty() {
+        url.push('?');
+        url.push_str(&params.join("&"));
+    }
+
+    // Reconnect loop — if the daemon restarts mid-tail, keep trying.
+    loop {
+        let client = match reqwest::Client::builder().build() {
+            Ok(c) => c,
+            Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+        };
+        let resp = match client.get(&url).header("Accept", "text/event-stream").send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
+        };
+
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut buf = String::new();
+        while let Some(chunk) = stream.next().await {
+            let Ok(bytes) = chunk else { break };
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            // SSE frames are separated by blank line. Each frame may contain
+            // multiple `data:` lines, which we concat into one JSON payload.
+            while let Some(split) = buf.find("\n\n") {
+                let frame = buf[..split].to_string();
+                buf.drain(..split + 2);
+                let mut payload = String::new();
+                for line in frame.lines() {
+                    if let Some(rest) = line.strip_prefix("data:") {
+                        payload.push_str(rest.trim_start());
+                    }
+                }
+                if payload.is_empty() { continue; }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) {
+                    if let Some(signal) = parse_lane_signal(&value) {
+                        if tx.send(signal).is_err() { return; }
+                    }
+                }
+            }
+        }
+        // Stream ended — pause and reconnect.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
+    let task_id = v.get("task_id")?.as_str()?.to_string();
+    let bro = v.get("bro_name").and_then(|x| x.as_str()).map(String::from);
+    let session_id = v.get("session_id").and_then(|x| x.as_str()).map(String::from);
+    let kind = v.get("type").and_then(|x| x.as_str())?;
+    match kind {
+        "task_started"   => Some(LaneSignal::TaskStarted   { bro, session_id, task_id }),
+        "task_progress"  => {
+            let snippet = v.get("activity").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            Some(LaneSignal::TaskProgress { bro, session_id, task_id, snippet })
+        }
+        "task_completed" => Some(LaneSignal::TaskCompleted { bro, session_id, task_id }),
+        "task_failed"    => {
+            let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            Some(LaneSignal::TaskFailed { bro, session_id, task_id, error })
+        }
+        "task_cancelled" => Some(LaneSignal::TaskCancelled { bro, session_id, task_id }),
+        _ => None,
+    }
 }
 
 async fn fetch_roster(sel: TailSelectors) -> anyhow::Result<Vec<RosterEntry>> {
@@ -100,6 +197,17 @@ struct Lane {
     scroll_from_bottom: usize,
     cached_total_lines: usize,
     status: LaneStatus,
+    // ── Live activity, driven by the daemon's /tail SSE stream ──────
+    /// Tasks the daemon has told us are currently running for this lane.
+    /// Keyed by task_id; Claude exec/resume stays here until we see a
+    /// task_completed|failed|cancelled event.
+    active_tasks: HashSet<String>,
+    /// Wall-clock of the most recent TaskProgress delta for this lane.
+    last_progress_at: Option<Instant>,
+    /// Rolling 160-char tail of the latest assistant message.
+    last_progress_snippet: Option<String>,
+    /// If a task failed recently, flash its error for a few seconds.
+    last_failure: Option<(Instant, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -132,9 +240,54 @@ impl Lane {
             scroll_from_bottom: 0,
             cached_total_lines: 0,
             status,
+            active_tasks: HashSet::new(),
+            last_progress_at: None,
+            last_progress_snippet: None,
+            last_failure: None,
         };
         lane.seed();
         lane
+    }
+
+    /// Does this signal belong to this lane?
+    fn matches_signal(&self, bro: Option<&str>, session_id: Option<&str>) -> bool {
+        if let Some(b) = bro {
+            if b == self.bro {
+                return true;
+            }
+        }
+        if let (Some(s), Some(lane_sid)) = (session_id, self.session_id.as_deref()) {
+            if s == lane_sid {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn apply_signal(&mut self, sig: &LaneSignal) {
+        match sig {
+            LaneSignal::TaskStarted { task_id, .. } => {
+                self.active_tasks.insert(task_id.clone());
+                self.last_failure = None;
+            }
+            LaneSignal::TaskProgress { task_id, snippet, .. } => {
+                self.active_tasks.insert(task_id.clone());
+                self.last_progress_at = Some(Instant::now());
+                if !snippet.is_empty() {
+                    self.last_progress_snippet = Some(snippet.clone());
+                }
+            }
+            LaneSignal::TaskCompleted { task_id, .. } => {
+                self.active_tasks.remove(task_id);
+            }
+            LaneSignal::TaskFailed { task_id, error, .. } => {
+                self.active_tasks.remove(task_id);
+                self.last_failure = Some((Instant::now(), error.clone()));
+            }
+            LaneSignal::TaskCancelled { task_id, .. } => {
+                self.active_tasks.remove(task_id);
+            }
+        }
     }
 
     fn seed(&mut self) {
@@ -362,9 +515,10 @@ fn main() -> anyhow::Result<()> {
     }
     let sel = parse_tail_args(&args[2..]);
 
-    // One-shot async fetch for roster, then run TUI synchronously.
+    // Tokio runtime stays alive for the TUI's lifetime: the SSE subscriber
+    // task runs on it continuously.
     let rt = tokio::runtime::Runtime::new()?;
-    let roster = match rt.block_on(fetch_roster(sel)) {
+    let roster = match rt.block_on(fetch_roster(sel.clone())) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Failed to fetch roster: {e}");
@@ -375,6 +529,13 @@ fn main() -> anyhow::Result<()> {
         eprintln!("No bros matched. Try `bro tail` with no args, or check team/bro/session names.");
         std::process::exit(1);
     }
+
+    // SSE subscription — the daemon pushes task_started / task_progress /
+    // task_completed / task_failed / task_cancelled events matching our
+    // selectors. We forward them through an mpsc channel into the sync
+    // TUI loop; the channel closes when the runtime drops at exit.
+    let (tx, rx) = mpsc::channel::<LaneSignal>();
+    rt.spawn(run_sse_subscriber(sel, tx));
 
     let lanes: Vec<Lane> = roster.into_iter().map(Lane::from_roster).collect();
     let n = lanes.len();
@@ -389,12 +550,15 @@ fn main() -> anyhow::Result<()> {
         dragging_divider: None,
         quit: false,
     };
-    run_tui(app)
+    let result = run_tui(app, rx);
+    // Runtime is dropped here, killing the SSE task.
+    drop(rt);
+    result
 }
 
 // ── TUI main loop ───────────────────────────────────────────────────
 
-fn run_tui(mut app: App) -> anyhow::Result<()> {
+fn run_tui(mut app: App, signals: mpsc::Receiver<LaneSignal>) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -421,6 +585,11 @@ fn run_tui(mut app: App) -> anyhow::Result<()> {
                 }
             }
 
+            // Drain SSE signals from the async subscriber — non-blocking.
+            while let Ok(sig) = signals.try_recv() {
+                dispatch_signal(&mut app, sig);
+            }
+
             if last_poll.elapsed() >= poll_interval {
                 for lane in &mut app.lanes {
                     lane.poll();
@@ -434,6 +603,21 @@ fn run_tui(mut app: App) -> anyhow::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
     result
+}
+
+fn dispatch_signal(app: &mut App, sig: LaneSignal) {
+    let (bro, session_id) = match &sig {
+        LaneSignal::TaskStarted   { bro, session_id, .. }
+        | LaneSignal::TaskProgress  { bro, session_id, .. }
+        | LaneSignal::TaskCompleted { bro, session_id, .. }
+        | LaneSignal::TaskFailed    { bro, session_id, .. }
+        | LaneSignal::TaskCancelled { bro, session_id, .. } => (bro.as_deref(), session_id.as_deref()),
+    };
+    for lane in &mut app.lanes {
+        if lane.matches_signal(bro, session_id) {
+            lane.apply_signal(&sig);
+        }
+    }
 }
 
 fn handle_mouse(app: &mut App, ev: MouseEvent) {
@@ -686,7 +870,7 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(2)])
         .split(inner);
 
     // Header
@@ -749,13 +933,14 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
     // Footer
     let (text_events, tool_events, thinking_events, signal_events) = count_events(&lane.events);
     let follow_badge = if lane.scroll_from_bottom == 0 {
-        Span::styled(" ● LIVE ", Style::default().fg(Color::Green))
+        Span::styled(" ▼ ", Style::default().fg(Color::DarkGray))
     } else {
         Span::styled(
             format!(" ⏸ -{} ", lane.scroll_from_bottom),
             Style::default().fg(Color::Yellow),
         )
     };
+    let activity_badge = activity_badge(lane);
     let status_badge = match lane.status {
         LaneStatus::Waiting => Span::styled(" waiting ", Style::default().fg(Color::Yellow)),
         LaneStatus::MissingFile => Span::styled(" no-file ", Style::default().fg(Color::Red)),
@@ -763,6 +948,7 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
     };
     let footer = Line::from(vec![
         follow_badge,
+        activity_badge,
         status_badge,
         Span::styled(
             format!(
@@ -772,7 +958,13 @@ fn draw_lane(f: &mut Frame, area: Rect, lane: &mut Lane, is_selected: bool) -> u
             Style::default().fg(Color::DarkGray),
         ),
     ]);
-    f.render_widget(Paragraph::new(footer), rows[2]);
+    let snippet_line = snippet_line(lane);
+    let footer_split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(rows[2]);
+    f.render_widget(Paragraph::new(snippet_line), footer_split[0]);
+    f.render_widget(Paragraph::new(footer), footer_split[1]);
     body_h
 }
 
@@ -797,6 +989,81 @@ fn provider_color(p: &str) -> Color {
         "gemini" => Color::Green,
         _ => Color::White,
     }
+}
+
+/// Wall-clock phase inside a period, for cheap animation. Returns 0..period_ms.
+fn phase_now(period_ms: u64) -> u64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    millis % period_ms.max(1)
+}
+
+/// Activity badge — the ex-"LIVE" indicator, now driven by the daemon's
+/// task lifecycle stream. Three visual tiers:
+///   ● streaming  — bright/dim 400ms throb; task has pushed a progress
+///                  delta in the last 2s (model is actively emitting).
+///   ○ running    — slow 1.2s pulse; task alive but quiet (likely in a
+///                  long tool call / tool result round-trip).
+///   ⚠ FAILED     — red flash for 5s after a task_failed event.
+///   (empty)      — no active task.
+fn activity_badge(lane: &Lane) -> Span<'static> {
+    let now = Instant::now();
+    if let Some((t, _)) = &lane.last_failure {
+        if now.duration_since(*t) < Duration::from_secs(5) {
+            let bright = phase_now(400) < 200;
+            let color = if bright { Color::Red } else { Color::DarkGray };
+            return Span::styled(
+                " ⚠ FAILED ",
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            );
+        }
+    }
+    if lane.active_tasks.is_empty() {
+        return Span::raw("");
+    }
+    let fresh = lane
+        .last_progress_at
+        .map(|t| now.duration_since(t) < Duration::from_secs(2))
+        .unwrap_or(false);
+    if fresh {
+        let bright = phase_now(400) < 200;
+        let color = if bright { Color::Green } else { Color::DarkGray };
+        return Span::styled(
+            " ● streaming ",
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        );
+    }
+    let bright = phase_now(1200) < 600;
+    let color = if bright { Color::Green } else { Color::DarkGray };
+    Span::styled(" ○ running ", Style::default().fg(color))
+}
+
+/// Snippet line shown above the badge row — the rolling tail of the
+/// current assistant message while a task is active, so the user can
+/// watch the model stream even before the on-disk JSONL catches up.
+fn snippet_line(lane: &Lane) -> Line<'static> {
+    if lane.active_tasks.is_empty() {
+        if let Some((t, err)) = &lane.last_failure {
+            if Instant::now().duration_since(*t) < Duration::from_secs(5) {
+                return Line::from(Span::styled(
+                    format!(" ✗ {err}"),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        }
+        return Line::from("");
+    }
+    let snippet = lane.last_progress_snippet.as_deref().unwrap_or("…");
+    // Collapse whitespace so multi-line streaming text still fits a single row.
+    let flat: String = snippet.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    Line::from(Span::styled(
+        format!(" ▶ {flat}"),
+        Style::default().fg(Color::DarkGray),
+    ))
 }
 
 fn count_events(events: &[TranscriptEvent]) -> (usize, usize, usize, usize) {
