@@ -327,7 +327,7 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
 
     let raw_bin = provider.bin();
     let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let list_out = match Command::new(&bin).args(&list_args).output() {
+    let list_out = match capture_cli_with_timeout(&provider, &list_args, CLI_TIMEOUT) {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             // CLI installed but `mcp list` errored — distinct from
@@ -341,7 +341,10 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
             };
         }
         Err(e) => {
-            // Spawn failed — binary genuinely not on PATH (or unreadable).
+            // Spawn failed (binary not on PATH, unreadable, etc.) OR
+            // the CLI hung past CLI_TIMEOUT. Either way the daemon
+            // can't talk to this provider; treat as NotInstalled so
+            // self-registration doesn't block startup.
             return SelfRegisterOutcome::NotInstalled {
                 detail: format!("{bin}: {e}"),
             };
@@ -349,38 +352,90 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
     };
 
     let stdout = String::from_utf8_lossy(&list_out.stdout).to_string();
+    // Both arg builders return None for providers without MCP CRUD
+    // (today: only Vibe, which is filtered out earlier by the
+    // build_mcp_list_args check). Treat unexpected None as Unsupported
+    // rather than spawning the bare binary with zero args, which would
+    // open an interactive REPL on most CLIs.
+    let Some(add_args) = provider.build_mcp_add_http_args("blackbox", url, &[]) else {
+        return SelfRegisterOutcome::Unsupported;
+    };
     match provider.mcp_list_has(&stdout, "blackbox", Some(url)) {
         MatchState::MatchesName => SelfRegisterOutcome::Unchanged,
         MatchState::Drift => {
-            if let Err(e) = run_cli(&provider, &provider.build_mcp_remove_args("blackbox").unwrap_or_default()) {
+            let Some(rm_args) = provider.build_mcp_remove_args("blackbox") else {
+                return SelfRegisterOutcome::Unsupported;
+            };
+            if let Err(e) = run_cli(&provider, &rm_args) {
                 return SelfRegisterOutcome::Error { detail: format!("remove: {e}") };
             }
-            match run_cli(
-                &provider,
-                &provider.build_mcp_add_http_args("blackbox", url, &[]).unwrap_or_default(),
-            ) {
+            match run_cli(&provider, &add_args) {
                 Ok(()) => SelfRegisterOutcome::Updated,
                 Err(e) => SelfRegisterOutcome::Error { detail: format!("re-add: {e}") },
             }
         }
-        MatchState::Missing => match run_cli(
-            &provider,
-            &provider.build_mcp_add_http_args("blackbox", url, &[]).unwrap_or_default(),
-        ) {
+        MatchState::Missing => match run_cli(&provider, &add_args) {
             Ok(()) => SelfRegisterOutcome::Added,
             Err(e) => SelfRegisterOutcome::Error { detail: format!("add: {e}") },
         },
     }
 }
 
+/// Default timeout for provider CLI invocations. MCP CRUD calls
+/// (`mcp list/add/remove`) are typically <500ms; 15s is generous
+/// while still preventing one hung CLI from blocking the whole
+/// fan-out loop indefinitely.
+const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Provider set used by every fan-out call site (action_add /
+/// action_remove / action_sync). Vibe is excluded because it has no
+/// MCP CRUD CLI; the per-provider closure can short-circuit by
+/// returning None when arg-builders return None.
+const FANOUT_PROVIDERS: [Provider; 4] = [
+    Provider::Claude,
+    Provider::Copilot,
+    Provider::Codex,
+    Provider::Gemini,
+];
+
+/// Run a per-provider closure against FANOUT_PROVIDERS in parallel
+/// using a scoped thread pool. Closures return Option<String> — None
+/// drops the provider from the output (e.g. arg builder returned None),
+/// Some(line) appends to the result. Order matches FANOUT_PROVIDERS.
+fn fanout_parallel<F>(work: F) -> Vec<String>
+where
+    F: Fn(Provider) -> Option<String> + Sync,
+{
+    // Capture work by reference so each spawned closure can `move` the
+    // reference (Copy + Send because F: Sync) instead of moving the
+    // closure itself, which would only work for one spawn.
+    let work = &work;
+    let mut results: Vec<Option<String>> = vec![None; FANOUT_PROVIDERS.len()];
+    std::thread::scope(|s| {
+        let handles: Vec<_> = FANOUT_PROVIDERS
+            .iter()
+            .map(|&p| s.spawn(move || work(p)))
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            results[i] = h.join().unwrap_or(None);
+        }
+    });
+    results.into_iter().flatten().collect()
+}
+
 fn run_cli(provider: &Provider, args: &[String]) -> Result<()> {
-    let raw_bin = provider.bin();
-    let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let out = Command::new(&bin)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawning {bin}"))?;
+    run_cli_with_timeout(provider, args, CLI_TIMEOUT)
+}
+
+fn run_cli_with_timeout(
+    provider: &Provider,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let out = capture_cli_with_timeout(provider, args, timeout)?;
     if !out.status.success() {
+        let raw_bin = provider.bin();
+        let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
         anyhow::bail!(
             "{bin} {} exited {:?}: {}",
             args.join(" "),
@@ -389,6 +444,57 @@ fn run_cli(provider: &Provider, args: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Spawn a provider CLI invocation with a wall-clock timeout, capturing
+/// stdout + stderr. SIGKILL on timeout. Returns std::process::Output so
+/// callers needing the stdout (e.g. mcp list parsing) can read it.
+fn capture_cli_with_timeout(
+    provider: &Provider,
+    args: &[String],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let raw_bin = provider.bin();
+    let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
+    let mut child = Command::new(&bin)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {bin}"))?;
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait()? {
+            Some(s) => break s,
+            None => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    anyhow::bail!(
+                        "{bin} {} timed out after {:?}",
+                        args.join(" "),
+                        timeout,
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    };
+
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_end(&mut stdout);
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_end(&mut stderr);
+    }
+    Ok(std::process::Output { status, stdout, stderr })
 }
 
 // ── Gemini policy file generation ──────────────────────────────────
@@ -656,17 +762,9 @@ fn action_add(p: &McpToolParams) -> Result<String> {
     // Fan out FIRST so we know whether the providers accepted the
     // add before we persist intent locally. Project-scope adds skip
     // fan-out (overlay only — user runs `sync` to push later).
-    let mut fanout_lines: Vec<String> = Vec::new();
-    if scope == "global" {
-        for provider in [
-            Provider::Claude,
-            Provider::Copilot,
-            Provider::Codex,
-            Provider::Gemini,
-        ] {
-            let Some(args) = provider.build_mcp_add_http_args(name, url, &exclude) else {
-                continue;
-            };
+    let fanout_lines: Vec<String> = if scope == "global" {
+        fanout_parallel(|provider| {
+            let args = provider.build_mcp_add_http_args(name, url, &exclude)?;
             // Idempotent: best-effort remove (no-op if absent), then add.
             // The remove error is logged but not surfaced — it's expected
             // to fail when the server isn't already registered. Genuine
@@ -678,12 +776,14 @@ fn action_add(p: &McpToolParams) -> Result<String> {
                         "{provider} idempotent pre-add remove of {name} failed (ok if not registered): {e}");
                 }
             }
-            match run_cli(&provider, &args) {
-                Ok(()) => fanout_lines.push(format!("  {provider}: added")),
-                Err(e) => fanout_lines.push(format!("  {provider}: error — {e}")),
-            }
-        }
-    }
+            Some(match run_cli(&provider, &args) {
+                Ok(()) => format!("  {provider}: added"),
+                Err(e) => format!("  {provider}: error — {e}"),
+            })
+        })
+    } else {
+        Vec::new()
+    };
 
     // Persist intent regardless of fan-out outcome — `sync` can replay
     // failed providers later, but only if we recorded the config.
@@ -712,19 +812,13 @@ fn action_remove(p: &McpToolParams) -> Result<String> {
     }];
 
     if scope == "global" {
-        for provider in [
-            Provider::Claude,
-            Provider::Copilot,
-            Provider::Codex,
-            Provider::Gemini,
-        ] {
-            if let Some(args) = provider.build_mcp_remove_args(name) {
-                match run_cli(&provider, &args) {
-                    Ok(()) => lines.push(format!("  {provider}: removed")),
-                    Err(e) => lines.push(format!("  {provider}: {e}")),
-                }
-            }
-        }
+        lines.extend(fanout_parallel(|provider| {
+            let args = provider.build_mcp_remove_args(name)?;
+            Some(match run_cli(&provider, &args) {
+                Ok(()) => format!("  {provider}: removed"),
+                Err(e) => format!("  {provider}: {e}"),
+            })
+        }));
     }
 
     Ok(lines.join("\n"))
@@ -783,26 +877,19 @@ fn action_sync(p: &McpToolParams) -> Result<String> {
             }
         };
         let exclude = cfg.exclude_tools();
-        for provider in [
-            Provider::Claude,
-            Provider::Copilot,
-            Provider::Codex,
-            Provider::Gemini,
-        ] {
-            let Some(add_args) = provider.build_mcp_add_http_args(name, &url, exclude) else {
-                continue;
-            };
+        lines.extend(fanout_parallel(|provider| {
+            let add_args = provider.build_mcp_add_http_args(name, &url, exclude)?;
             if let Some(rm) = provider.build_mcp_remove_args(name) {
                 if let Err(e) = run_cli(&provider, &rm) {
                     tracing::debug!(target: "blackbox::mcp",
                         "{provider} idempotent pre-sync remove of {name} failed (ok if not registered): {e}");
                 }
             }
-            match run_cli(&provider, &add_args) {
-                Ok(()) => lines.push(format!("  {name} → {provider}: synced")),
-                Err(e) => lines.push(format!("  {name} → {provider}: {e}")),
-            }
-        }
+            Some(match run_cli(&provider, &add_args) {
+                Ok(()) => format!("  {name} → {provider}: synced"),
+                Err(e) => format!("  {name} → {provider}: {e}"),
+            })
+        }));
     }
     Ok(lines.join("\n"))
 }
@@ -885,6 +972,49 @@ mod tests {
             env: BTreeMap::new(),
         };
         assert!(cfg.exclude_tools().is_empty());
+    }
+
+    #[test]
+    fn action_add_project_scope_persists_headers_and_exclude_tools() {
+        // Project-scope add skips provider fan-out (overlay only),
+        // so we can exercise the persistence path end-to-end without
+        // touching real provider CLIs.
+        let dir = tempdir().unwrap();
+        let project = dir.path().to_string_lossy().to_string();
+
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Auth".into(), "token123".into());
+
+        let params = McpToolParams {
+            action: McpAction::Add,
+            name: Some("custom-mcp".into()),
+            url: Some("http://example.com/mcp".into()),
+            transport: Some("http".into()),
+            scope: Some("project".into()),
+            project: Some(project.clone()),
+            pattern: None,
+            exclude_tools: Some(vec!["dangerous_tool".into(), "other_tool".into()]),
+            headers: Some(headers),
+        };
+        let result = action_add(&params).unwrap();
+        assert!(result.contains("Saved custom-mcp"));
+
+        // Re-load the project store file directly and verify both
+        // fields round-tripped through action_add → save.
+        let store_path = project_store_path(Path::new(&project));
+        let store = McpStore::load(&store_path).unwrap();
+        let cfg = store.servers.get("custom-mcp").unwrap();
+        assert_eq!(
+            cfg.exclude_tools(),
+            &["dangerous_tool".to_string(), "other_tool".to_string()]
+        );
+        match cfg {
+            McpServerConfig::Http { url, headers, .. } => {
+                assert_eq!(url, "http://example.com/mcp");
+                assert_eq!(headers.get("X-Auth"), Some(&"token123".to_string()));
+            }
+            _ => panic!("expected Http variant"),
+        }
     }
 
     #[test]

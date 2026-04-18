@@ -598,14 +598,35 @@ fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
 }
 
 /// Format a slice of strings as a TOML array literal (`["a", "b"]`)
-/// for use inside `-c key=value` overrides. Each element is quoted
-/// with double-quote escape rules sufficient for tool names.
+/// for use inside `-c key=value` overrides. Each element is encoded as
+/// a TOML basic string: escapes `\`, `"`, and all control chars
+/// (0x00-0x1F + 0x7F) per the TOML 1.0 spec. Recognised whitespace
+/// shorthands (`\t`, `\n`, `\r`) are preferred over `\uXXXX`.
 fn format_toml_string_array(items: &[String]) -> String {
-    let quoted: Vec<String> = items
-        .iter()
-        .map(|s| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")))
-        .collect();
+    let quoted: Vec<String> = items.iter().map(|s| toml_basic_string(s)).collect();
     format!("[{}]", quoted.join(","))
+}
+
+fn toml_basic_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
+                out.push_str(&format!("\\u{:04X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The daemon's own blackbox HTTP MCP URL, for transient injection
@@ -1475,6 +1496,32 @@ mod tests {
         assert_eq!(
             format_toml_string_array(&[r#"with"quote"#.into()]),
             r#"["with\"quote"]"#
+        );
+    }
+
+    #[test]
+    fn test_format_toml_string_array_escapes_control_chars() {
+        // TOML basic strings forbid raw control chars (0x00-0x1F + 0x7F).
+        // Recognised shortforms preferred; everything else \uXXXX.
+        assert_eq!(
+            format_toml_string_array(&["a\tb".into()]),
+            r#"["a\tb"]"#
+        );
+        assert_eq!(
+            format_toml_string_array(&["x\ny\rz".into()]),
+            r#"["x\ny\rz"]"#
+        );
+        assert_eq!(
+            format_toml_string_array(&["\x00null".into()]),
+            r#"["\u0000null"]"#
+        );
+        assert_eq!(
+            format_toml_string_array(&["bell\x07del\x7f".into()]),
+            r#"["bell\u0007del\u007F"]"#
+        );
+        assert_eq!(
+            format_toml_string_array(&["back\x08slash\\".into()]),
+            r#"["back\bslash\\"]"#
         );
     }
 
