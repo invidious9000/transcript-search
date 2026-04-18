@@ -455,10 +455,22 @@ pub fn sweep_stale_gemini_policies(max_age_hours: u64) -> Result<usize> {
 
 // ── MCP tool dispatch ──────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAction {
+    List,
+    Get,
+    Add,
+    Remove,
+    Allow,
+    Disallow,
+    ClearFilters,
+    Sync,
+}
+
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct McpToolParams {
-    /// list, get, add, remove, allow, disallow, clear_filters, sync
-    pub action: String,
+    pub action: McpAction,
     /// Server name (required for add/remove/get).
     #[serde(default)]
     pub name: Option<String>,
@@ -485,18 +497,16 @@ pub struct McpToolParams {
 
 /// Dispatch a bro_mcp tool call. Returns a human-readable result string.
 pub fn handle(p: &McpToolParams) -> Result<String> {
-    match p.action.as_str() {
-        "list" => action_list(p),
-        "get" => action_get(p),
-        "add" => action_add(p),
-        "remove" => action_remove(p),
-        "allow" => action_filter(p, /* disallow */ false),
-        "disallow" => action_filter(p, /* disallow */ true),
-        "clear_filters" => action_clear_filters(p),
-        "sync" => action_sync(p),
-        other => anyhow::bail!(
-            "Unknown action: {other}. Use: list, get, add, remove, allow, disallow, clear_filters, sync"
-        ),
+    use McpAction::*;
+    match p.action {
+        List => action_list(p),
+        Get => action_get(p),
+        Add => action_add(p),
+        Remove => action_remove(p),
+        Allow => action_filter(p, /* disallow */ false),
+        Disallow => action_filter(p, /* disallow */ true),
+        ClearFilters => action_clear_filters(p),
+        Sync => action_sync(p),
     }
 }
 
