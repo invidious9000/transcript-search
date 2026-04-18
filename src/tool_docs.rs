@@ -154,9 +154,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
-        summary: "List / search stored entries with filters.",
-        when_to_use: "Search before guessing. Filter by category, scope, project, or free text.",
-        example: Some(r#"bbox_knowledge(category="decision", project="/repo/x")"#),
+        summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above.",
+        when_to_use: "The start of any task. Default to `query=<one distinctive word>`. Use scoped filters (`category`, `scope`, `project`) only for browsing audit trails, e.g. `bbox_knowledge(category=\"decision\", project=\"/repo/x\")`.",
+        example: Some(r#"bbox_knowledge(query="retry")"#),
     },
     ToolDoc {
         name: "bbox_forget",
@@ -424,6 +424,12 @@ pub fn render_markdown() -> String {
     out.push_str("Blackbox tool reference — the MCP tools this daemon exposes and when to reach for them. ");
     out.push_str("This entry is generated from `src/tool_docs.rs` and refreshed on every daemon restart. ");
     out.push_str("Do not hand-edit.\n\n");
+
+    out.push_str("## CORE RULE: recall first\n\n");
+    out.push_str("**On any substantive task, your FIRST tool call must be `bbox_knowledge(query=<one keyword>)` to check for stored project-specific context.** Not the second call after `ls`. Not after probing the live system. First.\n\n");
+    out.push_str("The signature failure mode here: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. This is not a suggestion.\n\n");
+    out.push_str("Use a single distinctive keyword from the task. If empty, try a different word. Do not fall back to filesystem exploration, process probing, or training-prior inference until at least 2 distinct queries have returned empty.\n\n");
+    out.push_str("Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n");
 
     let categories = [
         ToolCategory::Transcripts,
