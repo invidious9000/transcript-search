@@ -466,17 +466,8 @@ impl Provider {
                 }
             }
             Provider::Codex => {
-                let disabled = codex_expand_blackbox_patterns(&filters.disallow);
-                if !disabled.is_empty() {
-                    let toml_array = format_toml_string_array(&disabled);
-                    args.push("-c".into());
-                    args.push(format!(
-                        "mcp_servers.blackbox.disabled_tools={toml_array}"
-                    ));
-                }
-                // Codex has enabled_tools too, but allow-only filtering
-                // is rarely what callers want (everything else disabled)
-                // — skip until a real use case appears.
+                emit_codex_filter_overrides(&mut args, &filters.disallow, "disabled_tools");
+                emit_codex_filter_overrides(&mut args, &filters.allow, "enabled_tools");
             }
             // Gemini: `--policy <path>` is appended by the caller after
             // generating the policy file. build_filter_args stays empty
@@ -500,26 +491,74 @@ impl Provider {
     }
 }
 
-/// Expand glob patterns targeting the blackbox MCP namespace into bare
-/// tool names understood by Codex's `disabled_tools` array. Patterns
-/// that don't touch blackbox are silently skipped (Codex has no way to
-/// filter tools outside the MCP server it owns).
-fn codex_expand_blackbox_patterns(patterns: &[String]) -> Vec<String> {
+/// Group MCP-prefixed filter patterns by server name and emit one
+/// `-c mcp_servers.<server>.<key>=[...]` arg per server. `key` is
+/// `"disabled_tools"` for disallow filters and `"enabled_tools"` for
+/// allow filters.
+///
+/// For the blackbox server we expand globs against the orchestration
+/// tool universe (compile-time known). For other servers we don't have
+/// a tool universe, so only exact-name patterns (no `*` / `?`) are
+/// passed through; glob patterns on those are warned and skipped.
+/// Non-MCP patterns (e.g. `Bash(...)`) are skipped — Codex's filter
+/// scope is `mcp_servers.*` only.
+fn emit_codex_filter_overrides(args: &mut Vec<String>, patterns: &[String], key: &str) {
+    if patterns.is_empty() {
+        return;
+    }
+    let groups = codex_group_patterns_by_server(patterns);
+    if groups.is_empty() {
+        tracing::warn!(target: "blackbox::filter",
+            "codex {key} patterns yielded zero matches: {patterns:?}");
+        return;
+    }
+    for (server, tools) in groups {
+        let toml_array = format_toml_string_array(&tools);
+        args.push("-c".into());
+        args.push(format!("mcp_servers.{server}.{key}={toml_array}"));
+    }
+}
+
+fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<String>)> {
     let universe: Vec<&str> = crate::tool_docs::orchestration_tool_names();
-    let prefix = crate::tool_docs::BLACKBOX_MCP_PREFIX;
-    let mut out = Vec::new();
+    let bb_prefix = crate::tool_docs::BLACKBOX_MCP_PREFIX; // "mcp__blackbox__"
+    let mut by_server: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for p in patterns {
-        let Some(stripped) = p.strip_prefix(prefix) else {
+        let Some(rest) = p.strip_prefix("mcp__") else {
+            tracing::debug!(target: "blackbox::filter",
+                "codex skipping non-MCP pattern (filter scope is mcp_servers.*): {p}");
             continue;
         };
-        let expanded = super::mcp::expand_pattern(stripped, &universe);
-        for t in expanded {
-            if !out.contains(&t) {
-                out.push(t);
+        let Some((server, tool_pat)) = rest.split_once("__") else {
+            tracing::warn!(target: "blackbox::filter",
+                "codex skipping malformed MCP pattern (expected mcp__<server>__<tool>): {p}");
+            continue;
+        };
+        let group = by_server.entry(server.to_string()).or_default();
+        if p.starts_with(bb_prefix) {
+            let expanded = super::mcp::expand_pattern(tool_pat, &universe);
+            if expanded.is_empty() {
+                tracing::warn!(target: "blackbox::filter",
+                    "codex blackbox pattern matched zero tools (typo or stale name?): {p}");
+                continue;
             }
+            for t in expanded {
+                if !group.contains(&t) {
+                    group.push(t);
+                }
+            }
+        } else if !tool_pat.contains('*') && !tool_pat.contains('?') {
+            let t = tool_pat.to_string();
+            if !group.contains(&t) {
+                group.push(t);
+            }
+        } else {
+            tracing::warn!(target: "blackbox::filter",
+                "codex glob on non-blackbox server (no tool universe to expand against): {p}");
         }
     }
-    out
+    by_server.into_iter().filter(|(_, v)| !v.is_empty()).collect()
 }
 
 /// Translate a `mcp__server__tool` full name into Copilot's
@@ -1328,15 +1367,72 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_skips_non_blackbox_patterns() {
+    fn test_codex_skips_non_mcp_patterns() {
         let filters = McpFilters {
             disallow: vec!["Bash(git push *)".into()],
             allow: vec![],
         };
         let args = Provider::Codex.build_filter_args(&filters);
-        // Codex can't filter tools outside its MCP server model, so a
-        // pattern that doesn't target blackbox produces no args.
+        // Codex's filter scope is mcp_servers.* — patterns outside the
+        // MCP namespace (Bash, shell, etc.) produce no args.
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_codex_routes_non_blackbox_mcp_pattern_to_correct_server() {
+        let filters = McpFilters {
+            disallow: vec!["mcp__github__create_issue".into()],
+            allow: vec![],
+        };
+        let args = Provider::Codex.build_filter_args(&filters);
+        // Exact tool name on a non-blackbox MCP server routes to that
+        // server's disabled_tools array.
+        assert_eq!(args[0], "-c");
+        assert_eq!(args[1], "mcp_servers.github.disabled_tools=[\"create_issue\"]");
+    }
+
+    #[test]
+    fn test_codex_warns_on_glob_against_unknown_server() {
+        // Glob against a non-blackbox server can't be expanded (no tool
+        // universe), so it's skipped with a warning. End result: empty.
+        let filters = McpFilters {
+            disallow: vec!["mcp__github__create_*".into()],
+            allow: vec![],
+        };
+        let args = Provider::Codex.build_filter_args(&filters);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_codex_emits_enabled_tools_for_allow() {
+        let filters = McpFilters {
+            disallow: vec![],
+            allow: vec!["mcp__blackbox__bro_status".into()],
+        };
+        let args = Provider::Codex.build_filter_args(&filters);
+        assert_eq!(args[0], "-c");
+        assert!(args[1].starts_with("mcp_servers.blackbox.enabled_tools=["));
+        assert!(args[1].contains("bro_status"));
+    }
+
+    #[test]
+    fn test_codex_groups_multiple_servers_into_separate_overrides() {
+        let filters = McpFilters {
+            disallow: vec![
+                "mcp__blackbox__bro_exec".into(),
+                "mcp__github__create_issue".into(),
+            ],
+            allow: vec![],
+        };
+        let args = Provider::Codex.build_filter_args(&filters);
+        // Two `-c` overrides — one per server. BTreeMap iteration is
+        // alphabetical, so blackbox comes before github.
+        let overrides: Vec<&String> = args.iter()
+            .filter(|a| a.starts_with("mcp_servers."))
+            .collect();
+        assert_eq!(overrides.len(), 2);
+        assert!(overrides[0].starts_with("mcp_servers.blackbox.disabled_tools="));
+        assert!(overrides[1].starts_with("mcp_servers.github.disabled_tools="));
     }
 
     #[test]

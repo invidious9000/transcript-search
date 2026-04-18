@@ -662,7 +662,13 @@ impl BlackboxServer {
         };
         let wrapped_prompt = orch::apply_ambient(&p.prompt, &ambient_ctx);
 
-        let args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
+        let mut args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
+        // Filters (mechanical recursion guard + user-configured allow/
+        // disallow) must ride with every dispatch — exec AND resume.
+        // Without this, a resumed session re-acquires the orchestration
+        // tool surface the recursion guard was meant to deny.
+        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id);
+        args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
             task_id, provider, args, session_id,
@@ -670,6 +676,7 @@ impl BlackboxServer {
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
         );
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
 
         if let Some(bro_name) = &p.bro {
             self.record_task_to_bro(bro_name, &task);
@@ -904,12 +911,16 @@ impl BlackboxServer {
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
                     let task_id = uuid::Uuid::new_v4().to_string();
-                    let args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
-                    orch::spawn_task(
+                    let mut args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
+                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id);
+                    args.extend(df.args);
+                    let t = orch::spawn_task(
                         task_id, brofile.provider, args, sid.clone(),
                         cwd.clone(), env_overrides, store_dir.clone(),
                         self.state.task_store.clone(), self.state.tail_tx.clone(),
-                    )
+                    );
+                    cleanup_policy_file_when_done(t.clone(), df.policy_file);
+                    t
                 } else {
                     let task_id = uuid::Uuid::new_v4().to_string();
                     let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };

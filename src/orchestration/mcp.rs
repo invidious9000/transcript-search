@@ -201,22 +201,38 @@ pub fn resolve_effective(
 
 // ── Pattern matching ───────────────────────────────────────────────
 
-/// Expand a glob-style pattern (e.g. `mcp__blackbox__bro_*`) against a
-/// known tool universe. Used by providers that accept exact tool names
-/// (Gemini, Codex) rather than patterns.
+/// Expand a glob-style pattern (e.g. `mcp__blackbox__bro_*`, `*_exec`,
+/// `bro_?xec`) against a known tool universe. Used by providers that
+/// accept exact tool names (Gemini, Codex) rather than patterns.
+///
+/// Supports `*` (any sequence) and `?` (single char) anywhere in the
+/// pattern. Character classes (`[abc]`) are not supported — they fall
+/// back to literal match against the bracketed string.
 pub fn expand_pattern(pattern: &str, universe: &[&str]) -> Vec<String> {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        universe
-            .iter()
-            .filter(|t| t.starts_with(prefix))
-            .map(|t| t.to_string())
-            .collect()
-    } else {
-        universe
-            .iter()
-            .filter(|t| **t == pattern)
-            .map(|t| t.to_string())
-            .collect()
+    universe
+        .iter()
+        .filter(|t| glob_match(pattern, t))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Simple recursive glob matcher: `*` = any sequence (incl. empty),
+/// `?` = exactly one char, everything else literal. No character
+/// classes or escapes — adequate for tool-name patterns we ship.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    glob_match_inner(&p, 0, &t, 0)
+}
+
+fn glob_match_inner(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
+    if pi == p.len() {
+        return ti == t.len();
+    }
+    match p[pi] {
+        '*' => (ti..=t.len()).any(|k| glob_match_inner(p, pi + 1, t, k)),
+        '?' => ti < t.len() && glob_match_inner(p, pi + 1, t, ti + 1),
+        c => ti < t.len() && t[ti] == c && glob_match_inner(p, pi + 1, t, ti + 1),
     }
 }
 
@@ -857,6 +873,29 @@ mod tests {
         let universe = ["Bash", "Read", "Edit"];
         let out = expand_pattern("Bash", &universe);
         assert_eq!(out, vec!["Bash"]);
+    }
+
+    #[test]
+    fn expand_pattern_supports_full_globs() {
+        let universe = [
+            "bro_exec", "bro_resume", "bro_status",
+            "bbox_note", "bbox_notes",
+        ];
+        // Trailing `*`
+        assert_eq!(expand_pattern("bro_*", &universe).len(), 3);
+        // Leading `*`
+        let leading = expand_pattern("*_exec", &universe);
+        assert_eq!(leading, vec!["bro_exec"]);
+        // Mid-string `*`
+        let mid = expand_pattern("b*_note*", &universe);
+        assert_eq!(mid, vec!["bbox_note", "bbox_notes"]);
+        // `?` single-char wildcard
+        let single = expand_pattern("bbox_note?", &universe);
+        assert_eq!(single, vec!["bbox_notes"]);
+        // Pure literal still works
+        assert_eq!(expand_pattern("bro_exec", &universe), vec!["bro_exec"]);
+        // No match returns empty (not panic)
+        assert!(expand_pattern("nonexistent_*", &universe).is_empty());
     }
 
     #[test]
