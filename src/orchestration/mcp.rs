@@ -41,11 +41,15 @@ pub enum McpServerConfig {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude_tools: Vec<String>,
     },
     Sse {
         url: String,
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         headers: BTreeMap<String, String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        exclude_tools: Vec<String>,
     },
     Stdio {
         command: String,
@@ -54,6 +58,17 @@ pub enum McpServerConfig {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         env: BTreeMap<String, String>,
     },
+}
+
+impl McpServerConfig {
+    /// Per-server exclude list (Gemini-only at present, applied at
+    /// registration time). Empty for Stdio (no add fan-out).
+    pub fn exclude_tools(&self) -> &[String] {
+        match self {
+            Self::Http { exclude_tools, .. } | Self::Sse { exclude_tools, .. } => exclude_tools,
+            Self::Stdio { .. } => &[],
+        }
+    }
 }
 
 impl McpServerConfig {
@@ -247,11 +262,17 @@ pub enum SelfRegisterOutcome {
     Added,
     /// Provider had a stale URL; removed then added.
     Updated,
-    /// Provider's CLI isn't installed or `mcp list` failed.
+    /// Provider binary isn't on PATH (spawn failed). Distinguished from
+    /// ListFailed: the CLI is genuinely absent, not just misbehaving.
     NotInstalled { detail: String },
+    /// Provider binary spawned but `mcp list` exited non-zero. CLI is
+    /// installed but something is wrong (auth, schema mismatch, etc.).
+    /// Worth surfacing differently — the user can fix this; NotInstalled
+    /// requires actually installing the CLI.
+    ListFailed { detail: String },
     /// Provider has no MCP CRUD (Vibe).
     Unsupported,
-    /// The CLI call itself errored out.
+    /// The subsequent add/remove CLI call errored out.
     Error { detail: String },
 }
 
@@ -269,6 +290,7 @@ impl SelfRegisterReport {
                 SelfRegisterOutcome::Added => "added",
                 SelfRegisterOutcome::Updated => "updated",
                 SelfRegisterOutcome::NotInstalled { .. } => "not-installed",
+                SelfRegisterOutcome::ListFailed { .. } => "list-failed",
                 SelfRegisterOutcome::Unsupported => "unsupported",
                 SelfRegisterOutcome::Error { .. } => "error",
             };
@@ -308,7 +330,9 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
     let list_out = match Command::new(&bin).args(&list_args).output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
-            return SelfRegisterOutcome::NotInstalled {
+            // CLI installed but `mcp list` errored — distinct from
+            // not-installed. User can fix this without installing.
+            return SelfRegisterOutcome::ListFailed {
                 detail: format!(
                     "{bin} mcp list exited {:?}: {}",
                     o.status.code(),
@@ -317,6 +341,7 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
             };
         }
         Err(e) => {
+            // Spawn failed — binary genuinely not on PATH (or unreadable).
             return SelfRegisterOutcome::NotInstalled {
                 detail: format!("{bin}: {e}"),
             };
@@ -509,6 +534,11 @@ pub struct McpToolParams {
     /// registration time).
     #[serde(default)]
     pub exclude_tools: Option<Vec<String>>,
+    /// Optional HTTP/SSE headers (e.g. auth tokens) to pass at
+    /// registration time. Persisted into McpServerConfig and replayed
+    /// by `action=sync`.
+    #[serde(default)]
+    pub headers: Option<BTreeMap<String, String>>,
 }
 
 /// Dispatch a bro_mcp tool call. Returns a human-readable result string.
@@ -604,29 +634,30 @@ fn action_add(p: &McpToolParams) -> Result<String> {
     let url = p.url.as_deref().context("'url' is required")?;
     let transport = p.transport.as_deref().unwrap_or("http");
     let scope = p.scope.as_deref().unwrap_or("global");
+    let headers = p.headers.clone().unwrap_or_default();
+    let exclude = p.exclude_tools.clone().unwrap_or_default();
 
     let config = match transport {
         "http" => McpServerConfig::Http {
             url: url.to_string(),
-            headers: BTreeMap::new(),
+            headers,
+            exclude_tools: exclude.clone(),
         },
         "sse" => McpServerConfig::Sse {
             url: url.to_string(),
-            headers: BTreeMap::new(),
+            headers,
+            exclude_tools: exclude.clone(),
         },
         other => anyhow::bail!("Transport {other} not supported via bro_mcp add (use provider CLI for stdio)"),
     };
 
     let path = resolve_scope_path(p)?;
-    let mut store = McpStore::load(&path)?;
-    store.servers.insert(name.to_string(), config);
-    store.save(&path)?;
 
-    // For global adds, fan out to every provider's CLI. Project-scope
-    // adds live only in bro's overlay for now — user can sync later.
-    let mut lines = vec![format!("Saved {name} to {}", path.display())];
+    // Fan out FIRST so we know whether the providers accepted the
+    // add before we persist intent locally. Project-scope adds skip
+    // fan-out (overlay only — user runs `sync` to push later).
+    let mut fanout_lines: Vec<String> = Vec::new();
     if scope == "global" {
-        let exclude = p.exclude_tools.clone().unwrap_or_default();
         for provider in [
             Provider::Claude,
             Provider::Copilot,
@@ -636,17 +667,32 @@ fn action_add(p: &McpToolParams) -> Result<String> {
             let Some(args) = provider.build_mcp_add_http_args(name, url, &exclude) else {
                 continue;
             };
-            // Idempotent: try remove first (ignoring error), then add.
+            // Idempotent: best-effort remove (no-op if absent), then add.
+            // The remove error is logged but not surfaced — it's expected
+            // to fail when the server isn't already registered. Genuine
+            // failures (CLI crash, permissions) still surface via the
+            // subsequent add error.
             if let Some(rm) = provider.build_mcp_remove_args(name) {
-                let _ = run_cli(&provider, &rm);
+                if let Err(e) = run_cli(&provider, &rm) {
+                    tracing::debug!(target: "blackbox::mcp",
+                        "{provider} idempotent pre-add remove of {name} failed (ok if not registered): {e}");
+                }
             }
             match run_cli(&provider, &args) {
-                Ok(()) => lines.push(format!("  {provider}: added")),
-                Err(e) => lines.push(format!("  {provider}: error — {e}")),
+                Ok(()) => fanout_lines.push(format!("  {provider}: added")),
+                Err(e) => fanout_lines.push(format!("  {provider}: error — {e}")),
             }
         }
     }
 
+    // Persist intent regardless of fan-out outcome — `sync` can replay
+    // failed providers later, but only if we recorded the config.
+    let mut store = McpStore::load(&path)?;
+    store.servers.insert(name.to_string(), config);
+    store.save(&path)?;
+
+    let mut lines = vec![format!("Saved {name} to {}", path.display())];
+    lines.extend(fanout_lines);
     Ok(lines.join("\n"))
 }
 
@@ -736,17 +782,21 @@ fn action_sync(p: &McpToolParams) -> Result<String> {
                 continue;
             }
         };
+        let exclude = cfg.exclude_tools();
         for provider in [
             Provider::Claude,
             Provider::Copilot,
             Provider::Codex,
             Provider::Gemini,
         ] {
-            let Some(add_args) = provider.build_mcp_add_http_args(name, &url, &[]) else {
+            let Some(add_args) = provider.build_mcp_add_http_args(name, &url, exclude) else {
                 continue;
             };
             if let Some(rm) = provider.build_mcp_remove_args(name) {
-                let _ = run_cli(&provider, &rm);
+                if let Err(e) = run_cli(&provider, &rm) {
+                    tracing::debug!(target: "blackbox::mcp",
+                        "{provider} idempotent pre-sync remove of {name} failed (ok if not registered): {e}");
+                }
             }
             match run_cli(&provider, &add_args) {
                 Ok(()) => lines.push(format!("  {name} → {provider}: synced")),
@@ -774,6 +824,7 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://127.0.0.1:7264/mcp".into(),
                 headers: BTreeMap::new(),
+                exclude_tools: Vec::new(),
             },
         );
         store.save(&path).unwrap();
@@ -790,9 +841,63 @@ mod tests {
         let cfg = McpServerConfig::Http {
             url: "http://127.0.0.1:7264/mcp".into(),
             headers: BTreeMap::new(),
+            exclude_tools: Vec::new(),
         };
         assert!(cfg.blackbox_matches("http://127.0.0.1:7264/mcp"));
         assert!(!cfg.blackbox_matches("http://127.0.0.1:7263/mcp"));
+    }
+
+    #[test]
+    fn roundtrip_persists_headers_and_exclude_tools() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let mut store = McpStore::new();
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".into(), "Bearer token".into());
+        store.servers.insert(
+            "blackbox".into(),
+            McpServerConfig::Http {
+                url: "http://127.0.0.1:7264/mcp".into(),
+                headers,
+                exclude_tools: vec!["bro_exec".into(), "bro_resume".into()],
+            },
+        );
+        store.save(&path).unwrap();
+        let loaded = McpStore::load(&path).unwrap();
+        let cfg = loaded.servers.get("blackbox").unwrap();
+        assert_eq!(
+            cfg.exclude_tools(),
+            &["bro_exec".to_string(), "bro_resume".to_string()]
+        );
+        match cfg {
+            McpServerConfig::Http { headers, .. } => {
+                assert_eq!(headers.get("Authorization"), Some(&"Bearer token".to_string()));
+            }
+            _ => panic!("expected Http variant"),
+        }
+    }
+
+    #[test]
+    fn exclude_tools_empty_for_stdio() {
+        let cfg = McpServerConfig::Stdio {
+            command: "node".into(),
+            args: vec![],
+            env: BTreeMap::new(),
+        };
+        assert!(cfg.exclude_tools().is_empty());
+    }
+
+    #[test]
+    fn self_register_outcome_distinguishes_not_installed_from_list_failed() {
+        let r = SelfRegisterReport {
+            per_provider: vec![
+                (Provider::Claude, SelfRegisterOutcome::NotInstalled { detail: "spawn err".into() }),
+                (Provider::Codex, SelfRegisterOutcome::ListFailed { detail: "exit 1".into() }),
+            ],
+        };
+        let s = r.summary();
+        assert!(s.contains("not-installed"));
+        assert!(s.contains("list-failed"));
     }
 
     #[test]
@@ -818,6 +923,7 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://old/mcp".into(),
                 headers: BTreeMap::new(),
+                exclude_tools: Vec::new(),
             },
         );
         global.filters.disallow.push("Bash(git push *)".into());
@@ -828,6 +934,7 @@ mod tests {
             McpServerConfig::Http {
                 url: "http://new/mcp".into(),
                 headers: BTreeMap::new(),
+                exclude_tools: Vec::new(),
             },
         );
         project.filters.disallow.push("Edit(*)".into());
