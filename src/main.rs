@@ -727,20 +727,19 @@ impl BlackboxServer {
             return Self::err_text(&format!("{provider} does not support resume"));
         }
 
-        // Gemini's `--resume <uuid>` silently forks a fresh session when
-        // the cwd's project-hash folder doesn't contain that UUID — so
-        // the daemon would report a fake success under an aliased ID.
-        // Resolve the session's recorded project_root up front and pin
-        // cwd to it; if the session isn't on disk, refuse.
-        let cwd = if provider == Provider::Gemini {
-            match orchestration::providers::resolve_gemini_session_cwd(&session_id) {
-                Some(p) => Some(p.to_string_lossy().into_owned()),
-                None => return Self::err_text(&format!(
-                    "Gemini session {session_id} not found in ~/.gemini/tmp/*/chats. Refusing to resume because Gemini silently forks a new session when the UUID isn't in the cwd's project folder (aliasing the resumed session). Verify the session ID or re-dispatch.",
-                )),
-            }
-        } else {
-            cwd
+        // Auto-resolve cwd from the session's own recorded origin so
+        // agents can resurrect each other across repo boundaries without
+        // the caller threading project_dir. Gemini gets a hard refuse on
+        // miss because its CLI silently forks a fresh session when the
+        // UUID isn't in the cwd's project hash folder (aliasing the
+        // resumed session). Claude/Codex error loudly on miss — fall
+        // through to the caller's cwd and let them surface the failure.
+        let cwd = match provider.resolve_session_cwd(&session_id) {
+            Some(p) => Some(p.to_string_lossy().into_owned()),
+            None if provider == Provider::Gemini => return Self::err_text(&format!(
+                "Gemini session {session_id} not found in ~/.gemini/tmp/*/chats. Refusing to resume because Gemini silently forks a new session when the UUID isn't in the cwd's project folder (aliasing the resumed session). Verify the session ID or re-dispatch.",
+            )),
+            None => cwd,
         };
 
         let allow_recursion = p.allow_recursion.unwrap_or(false);
@@ -1023,23 +1022,22 @@ impl BlackboxServer {
 
             let task = if let Some(ref sid) = member.session_id {
                 if sid != "pending" {
-                    // Gemini: pin cwd to the session's recorded project_root
-                    // to avoid silent-fork aliasing (see bro_resume). Falls
-                    // through to the broadcast-level per-member error when
-                    // the session isn't on disk.
-                    let member_cwd = if brofile.provider == Provider::Gemini {
-                        match orchestration::providers::resolve_gemini_session_cwd(sid) {
-                            Some(p) => Some(p.to_string_lossy().into_owned()),
-                            None => {
-                                launched.push(json!({
-                                    "bro": member.name,
-                                    "error": format!("Gemini session {sid} not found in ~/.gemini/tmp/*/chats — refusing to resume (silent-fork aliasing)"),
-                                }));
-                                continue;
-                            }
+                    // Auto-resolve cwd from the session's origin so a
+                    // broadcast can resurrect members even when the
+                    // current team.project_dir differs from where each
+                    // member's session was recorded. Gemini refuses on
+                    // miss (silent-fork aliasing); claude/codex fall
+                    // through and error loudly themselves.
+                    let member_cwd = match brofile.provider.resolve_session_cwd(sid) {
+                        Some(p) => Some(p.to_string_lossy().into_owned()),
+                        None if brofile.provider == Provider::Gemini => {
+                            launched.push(json!({
+                                "bro": member.name,
+                                "error": format!("Gemini session {sid} not found in ~/.gemini/tmp/*/chats — refusing to resume (silent-fork aliasing)"),
+                            }));
+                            continue;
                         }
-                    } else {
-                        cwd.clone()
+                        None => cwd.clone(),
                     };
                     let task_id = uuid::Uuid::new_v4().to_string();
                     let mut args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());

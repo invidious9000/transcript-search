@@ -218,6 +218,19 @@ impl Provider {
         }
     }
 
+    /// Locate the cwd a prior session was recorded in. Enables agents
+    /// to resume across repo boundaries without hand-passing project_dir.
+    /// Returns None when the provider has no cwd-aware session store or
+    /// when the session can't be found locally.
+    pub fn resolve_session_cwd(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        match self {
+            Provider::Claude => resolve_claude_session_cwd(session_id),
+            Provider::Codex => resolve_codex_session_cwd(session_id),
+            Provider::Gemini => resolve_gemini_session_cwd(session_id),
+            Provider::Copilot | Provider::Vibe => None,
+        }
+    }
+
     pub fn build_resume_args(
         &self,
         session_id: &str,
@@ -1018,6 +1031,130 @@ pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String>
 pub fn resolve_gemini_session_cwd(session_id: &str) -> Option<std::path::PathBuf> {
     let tmp_root = dirs::home_dir()?.join(".gemini/tmp");
     resolve_gemini_session_cwd_in(&tmp_root, session_id)
+}
+
+// ---------------------------------------------------------------------------
+// Claude session discovery
+// ---------------------------------------------------------------------------
+
+/// Locate the cwd a Claude session was recorded in.
+///
+/// Scans `~/.claude/projects/<slug>/<uuid>.jsonl` plus every sibling
+/// `~/.claude-*/projects/...` that looks like a Claude account root, then
+/// reads the cwd out of the first JSONL line that carries one. Lets
+/// agents resume each other across repo boundaries without the caller
+/// having to hand-pass the right `project_dir`.
+pub fn resolve_claude_session_cwd(session_id: &str) -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    resolve_claude_session_cwd_in(&home, session_id)
+}
+
+pub fn resolve_claude_session_cwd_in(
+    home: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let file_name = format!("{session_id}.jsonl");
+    let mut accounts: Vec<std::path::PathBuf> = vec![home.join(".claude")];
+    if let Ok(entries) = std::fs::read_dir(home) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with(".claude-")
+                && !name.contains("shared")
+                && e.path().join("projects").exists()
+            {
+                accounts.push(e.path());
+            }
+        }
+    }
+    for account in &accounts {
+        let projects = account.join("projects");
+        let Ok(slugs) = std::fs::read_dir(&projects) else { continue };
+        for slug in slugs.flatten() {
+            let path = slug.path().join(&file_name);
+            if !path.is_file() { continue; }
+            if let Some(cwd) = extract_claude_cwd(&path) {
+                return Some(cwd);
+            }
+        }
+    }
+    None
+}
+
+fn extract_claude_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(f);
+    for line in reader.lines().take(20).map_while(Result::ok) {
+        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                if !cwd.is_empty() {
+                    return Some(std::path::PathBuf::from(cwd));
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Codex session discovery
+// ---------------------------------------------------------------------------
+
+/// Locate the cwd a Codex session was recorded in.
+///
+/// Codex stores sessions under `~/.codex/sessions/YYYY/MM/DD/
+/// rollout-<iso>-<uuid>.jsonl` — cwd-independent storage, so the
+/// resume itself would work from any working directory, but returning
+/// the original cwd keeps tool resolution (path-based MCPs, git,
+/// repo-local configs) correct after resurrection.
+pub fn resolve_codex_session_cwd(session_id: &str) -> Option<std::path::PathBuf> {
+    let root = std::env::var("TRANSCRIPT_SEARCH_CODEX_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"));
+    resolve_codex_session_cwd_in(&root, session_id)
+}
+
+pub fn resolve_codex_session_cwd_in(
+    codex_root: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let sessions = codex_root.join("sessions");
+    let suffix = format!("-{session_id}.jsonl");
+    // YYYY/MM/DD layout — walk three levels; filename match is cheap.
+    let years = std::fs::read_dir(&sessions).ok()?;
+    for year in years.flatten() {
+        let Ok(months) = std::fs::read_dir(year.path()) else { continue };
+        for month in months.flatten() {
+            let Ok(days) = std::fs::read_dir(month.path()) else { continue };
+            for day in days.flatten() {
+                let Ok(files) = std::fs::read_dir(day.path()) else { continue };
+                for file in files.flatten() {
+                    let name = file.file_name();
+                    let Some(name) = name.to_str() else { continue };
+                    if !name.starts_with("rollout-") || !name.ends_with(&suffix) { continue; }
+                    if let Some(cwd) = extract_codex_cwd(&file.path()) {
+                        return Some(cwd);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_codex_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(f);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let v: Value = serde_json::from_str(&line).ok()?;
+    v.get("payload")
+        .and_then(|p| p.get("cwd"))
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 /// Testable form of `resolve_gemini_session_cwd` — scoped to an explicit
@@ -1853,5 +1990,144 @@ mod tests {
     fn resolve_gemini_session_rejects_short_id() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(resolve_gemini_session_cwd_in(tmp.path(), "short").is_none());
+    }
+
+    fn seed_claude_fixture(
+        home: &std::path::Path,
+        account: &str,
+        slug: &str,
+        session_id: &str,
+        cwd: &str,
+    ) {
+        let projects = home.join(account).join("projects").join(slug);
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = projects.join(format!("{session_id}.jsonl"));
+        let l1 = format!(r#"{{"type":"permission-mode","sessionId":"{session_id}"}}"#);
+        let l2 = format!(r#"{{"type":"system","cwd":"{cwd}","sessionId":"{session_id}"}}"#);
+        std::fs::write(&path, format!("{l1}\n{l2}\n")).unwrap();
+    }
+
+    #[test]
+    fn resolve_claude_session_finds_cwd_primary_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_claude_fixture(
+            tmp.path(),
+            ".claude",
+            "-home-user-repos-proj",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "/home/user/repos/proj",
+        );
+        let cwd = resolve_claude_session_cwd_in(
+            tmp.path(),
+            "aaaaaaaa-1111-2222-3333-444444444444",
+        )
+        .expect("should resolve");
+        assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/proj"));
+    }
+
+    #[test]
+    fn resolve_claude_session_spans_accounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Primary account has an unrelated session; target lives in account2.
+        seed_claude_fixture(
+            tmp.path(),
+            ".claude",
+            "-home-user-repos-a",
+            "11111111-0000-0000-0000-000000000000",
+            "/home/user/repos/a",
+        );
+        seed_claude_fixture(
+            tmp.path(),
+            ".claude-account2",
+            "-home-user-repos-b",
+            "22222222-0000-0000-0000-000000000000",
+            "/home/user/repos/b",
+        );
+        let cwd = resolve_claude_session_cwd_in(
+            tmp.path(),
+            "22222222-0000-0000-0000-000000000000",
+        )
+        .expect("should resolve from secondary account");
+        assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/b"));
+    }
+
+    #[test]
+    fn resolve_claude_session_returns_none_for_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_claude_fixture(
+            tmp.path(),
+            ".claude",
+            "-home-user-repos-a",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "/home/user/repos/a",
+        );
+        assert!(
+            resolve_claude_session_cwd_in(
+                tmp.path(),
+                "bbbbbbbb-1111-2222-3333-444444444444",
+            )
+            .is_none()
+        );
+    }
+
+    fn seed_codex_fixture(
+        codex_root: &std::path::Path,
+        date: (&str, &str, &str),
+        iso_time: &str,
+        session_id: &str,
+        cwd: &str,
+    ) {
+        let (y, m, d) = date;
+        let dir = codex_root.join("sessions").join(y).join(m).join(d);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-{iso_time}-{session_id}.jsonl"));
+        let meta = format!(
+            r#"{{"type":"session_meta","payload":{{"id":"{session_id}","cwd":"{cwd}","originator":"codex_exec"}}}}"#
+        );
+        std::fs::write(&path, format!("{meta}\n")).unwrap();
+    }
+
+    #[test]
+    fn resolve_codex_session_finds_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_codex_fixture(
+            tmp.path(),
+            ("2026", "04", "17"),
+            "2026-04-17T23-53-39",
+            "019d9f26-e455-7da0-9e6c-460a5bbb223d",
+            "/home/user/repos/daystrom-mk2",
+        );
+        let cwd = resolve_codex_session_cwd_in(
+            tmp.path(),
+            "019d9f26-e455-7da0-9e6c-460a5bbb223d",
+        )
+        .expect("should resolve");
+        assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/daystrom-mk2"));
+    }
+
+    #[test]
+    fn resolve_codex_session_returns_none_for_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_codex_fixture(
+            tmp.path(),
+            ("2026", "04", "17"),
+            "2026-04-17T10-00-00",
+            "019d9f26-e455-7da0-9e6c-460a5bbb223d",
+            "/home/user/repos/a",
+        );
+        assert!(
+            resolve_codex_session_cwd_in(
+                tmp.path(),
+                "00000000-0000-0000-0000-000000000000",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_session_cwd_dispatches_per_provider() {
+        // Copilot + Vibe have no cwd-aware store and should return None.
+        assert!(Provider::Copilot.resolve_session_cwd("any").is_none());
+        assert!(Provider::Vibe.resolve_session_cwd("any").is_none());
     }
 }
