@@ -90,6 +90,24 @@ impl TaskStore {
     pub fn all_tasks(&self) -> Vec<Arc<Task>> {
         self.tasks.values().cloned().collect()
     }
+
+    /// Drop entries matching the predicate (e.g. failed, older than X).
+    /// Returns the IDs that were removed for caller reporting + persist.
+    pub fn retain_drop<F>(&mut self, mut keep: F) -> Vec<String>
+    where
+        F: FnMut(&Task) -> bool,
+    {
+        let mut dropped = Vec::new();
+        self.tasks.retain(|id, t| {
+            if keep(t) {
+                true
+            } else {
+                dropped.push(id.clone());
+                false
+            }
+        });
+        dropped
+    }
 }
 
 // ---------------------------------------------------------------------------

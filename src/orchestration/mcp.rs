@@ -327,7 +327,7 @@ fn register_one(provider: Provider, url: &str) -> SelfRegisterOutcome {
 
     let raw_bin = provider.bin();
     let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let list_out = match capture_cli_with_timeout(&provider, &list_args, CLI_TIMEOUT) {
+    let list_out = match capture_cli_with_timeout(&provider, &list_args, None, CLI_TIMEOUT) {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             // CLI installed but `mcp list` errored — distinct from
@@ -424,15 +424,20 @@ where
 }
 
 fn run_cli(provider: &Provider, args: &[String]) -> Result<()> {
-    run_cli_with_timeout(provider, args, CLI_TIMEOUT)
+    run_cli_with_timeout(provider, args, None, CLI_TIMEOUT)
+}
+
+fn run_cli_in(provider: &Provider, args: &[String], cwd: Option<&Path>) -> Result<()> {
+    run_cli_with_timeout(provider, args, cwd, CLI_TIMEOUT)
 }
 
 fn run_cli_with_timeout(
     provider: &Provider,
     args: &[String],
+    cwd: Option<&Path>,
     timeout: std::time::Duration,
 ) -> Result<()> {
-    let out = capture_cli_with_timeout(provider, args, timeout)?;
+    let out = capture_cli_with_timeout(provider, args, cwd, timeout)?;
     if !out.status.success() {
         let raw_bin = provider.bin();
         let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
@@ -447,11 +452,14 @@ fn run_cli_with_timeout(
 }
 
 /// Spawn a provider CLI invocation with a wall-clock timeout, capturing
-/// stdout + stderr. SIGKILL on timeout. Returns std::process::Output so
-/// callers needing the stdout (e.g. mcp list parsing) can read it.
+/// stdout + stderr. SIGKILL on timeout. `cwd` sets the child's working
+/// directory — required for project-scope `mcp add` because the CLI
+/// writes to <cwd>/.mcp.json (or equivalent). Returns std::process::Output
+/// so callers needing the stdout (e.g. mcp list parsing) can read it.
 fn capture_cli_with_timeout(
     provider: &Provider,
     args: &[String],
+    cwd: Option<&Path>,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output> {
     use std::io::Read;
@@ -460,10 +468,14 @@ fn capture_cli_with_timeout(
 
     let raw_bin = provider.bin();
     let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let mut child = Command::new(&bin)
-        .args(args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(args)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawning {bin}"))?;
 
@@ -760,30 +772,34 @@ fn action_add(p: &McpToolParams) -> Result<String> {
     let path = resolve_scope_path(p)?;
 
     // Fan out FIRST so we know whether the providers accepted the
-    // add before we persist intent locally. Project-scope adds skip
-    // fan-out (overlay only — user runs `sync` to push later).
-    let fanout_lines: Vec<String> = if scope == "global" {
-        fanout_parallel(|provider| {
-            let args = provider.build_mcp_add_http_args(name, url, &exclude)?;
-            // Idempotent: best-effort remove (no-op if absent), then add.
-            // The remove error is logged but not surfaced — it's expected
-            // to fail when the server isn't already registered. Genuine
-            // failures (CLI crash, permissions) still surface via the
-            // subsequent add error.
-            if let Some(rm) = provider.build_mcp_remove_args(name) {
-                if let Err(e) = run_cli(&provider, &rm) {
-                    tracing::debug!(target: "blackbox::mcp",
-                        "{provider} idempotent pre-add remove of {name} failed (ok if not registered): {e}");
-                }
-            }
-            Some(match run_cli(&provider, &args) {
-                Ok(()) => format!("  {provider}: added"),
-                Err(e) => format!("  {provider}: error — {e}"),
-            })
-        })
+    // add before we persist intent locally. Both global and project
+    // scope fan out — project scope invokes the CLI with cwd =
+    // project_dir so providers that support `-s project` write into
+    // the right per-project config file.
+    let cli_scope = if scope == "global" { "user" } else { "project" };
+    let cwd: Option<&Path> = if scope == "project" {
+        p.project.as_deref().map(Path::new)
     } else {
-        Vec::new()
+        None
     };
+    let fanout_lines: Vec<String> = fanout_parallel(|provider| {
+        let args = provider.build_mcp_add_http_args_scoped(name, url, &exclude, cli_scope)?;
+        // Idempotent: best-effort remove (no-op if absent), then add.
+        // The remove error is logged but not surfaced — it's expected
+        // to fail when the server isn't already registered. Genuine
+        // failures (CLI crash, permissions) still surface via the
+        // subsequent add error.
+        if let Some(rm) = provider.build_mcp_remove_args_scoped(name, cli_scope) {
+            if let Err(e) = run_cli_in(&provider, &rm, cwd) {
+                tracing::debug!(target: "blackbox::mcp",
+                    "{provider} idempotent pre-add remove of {name} ({cli_scope}) failed (ok if not registered): {e}");
+            }
+        }
+        Some(match run_cli_in(&provider, &args, cwd) {
+            Ok(()) => format!("  {provider} ({cli_scope}): added"),
+            Err(e) => format!("  {provider} ({cli_scope}): error — {e}"),
+        })
+    });
 
     // Persist intent regardless of fan-out outcome — `sync` can replay
     // failed providers later, but only if we recorded the config.
@@ -811,15 +827,19 @@ fn action_remove(p: &McpToolParams) -> Result<String> {
         format!("{name} not in {}", path.display())
     }];
 
-    if scope == "global" {
-        lines.extend(fanout_parallel(|provider| {
-            let args = provider.build_mcp_remove_args(name)?;
-            Some(match run_cli(&provider, &args) {
-                Ok(()) => format!("  {provider}: removed"),
-                Err(e) => format!("  {provider}: {e}"),
-            })
-        }));
-    }
+    let cli_scope = if scope == "global" { "user" } else { "project" };
+    let cwd: Option<&Path> = if scope == "project" {
+        p.project.as_deref().map(Path::new)
+    } else {
+        None
+    };
+    lines.extend(fanout_parallel(|provider| {
+        let args = provider.build_mcp_remove_args_scoped(name, cli_scope)?;
+        Some(match run_cli_in(&provider, &args, cwd) {
+            Ok(()) => format!("  {provider} ({cli_scope}): removed"),
+            Err(e) => format!("  {provider} ({cli_scope}): {e}"),
+        })
+    }));
 
     Ok(lines.join("\n"))
 }

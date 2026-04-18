@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::mcp::McpFilters;
 use super::providers::Provider;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +24,12 @@ pub struct Brofile {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Persona-bound tool filter overlay. Merges between project mcp.json
+    /// and per-dispatch ExecParams overrides at dispatch time. Lets a
+    /// brofile (e.g. "auditor") restrict the tool surface every member
+    /// inherits without touching global/project config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<McpFilters>,
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +184,7 @@ mod tests {
             lens: Some("You are a code reviewer".into()),
             model: None,
             effort: None,
+            filters: None,
         };
         save_brofile(&bf, "global", dir.path(), None);
         let loaded = resolve_brofile("reviewer", dir.path(), None);
@@ -199,6 +207,7 @@ mod tests {
             lens: Some("global lens".into()),
             model: None,
             effort: None,
+            filters: None,
         };
         save_brofile(&global_bf, "global", store.path(), None);
 
@@ -209,6 +218,7 @@ mod tests {
             lens: Some("project lens".into()),
             model: None,
             effort: None,
+            filters: None,
         };
         save_brofile(&project_bf, "project", store.path(), Some(project.path().to_str().unwrap()));
 
@@ -224,7 +234,7 @@ mod tests {
             let bf = Brofile {
                 name: name.to_string(),
                 provider: Provider::Claude,
-                account: None, lens: None, model: None, effort: None,
+                account: None, lens: None, model: None, effort: None, filters: None,
             };
             save_brofile(&bf, "global", dir.path(), None);
         }
@@ -240,7 +250,7 @@ mod tests {
         let bf = Brofile {
             name: "to_delete".into(),
             provider: Provider::Gemini,
-            account: None, lens: None, model: None, effort: None,
+            account: None, lens: None, model: None, effort: None, filters: None,
         };
         save_brofile(&bf, "global", dir.path(), None);
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -269,6 +279,29 @@ mod tests {
     }
 
     #[test]
+    fn test_brofile_persists_filters() {
+        let dir = temp_store();
+        let bf = Brofile {
+            name: "auditor".into(),
+            provider: Provider::Claude,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: Some(McpFilters {
+                allow: vec![],
+                disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(*)".into()],
+            }),
+        };
+        save_brofile(&bf, "global", dir.path(), None);
+        let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
+        let f = loaded.filters.expect("filters round-trip");
+        assert_eq!(f.disallow.len(), 2);
+        assert!(f.disallow.contains(&"Bash(*)".to_string()));
+        assert!(f.allow.is_empty());
+    }
+
+    #[test]
     fn test_brofile_with_model_effort() {
         let dir = temp_store();
         let bf = Brofile {
@@ -278,6 +311,7 @@ mod tests {
             lens: None,
             model: Some("gpt-5.4-mini".into()),
             effort: Some("low".into()),
+            filters: None,
         };
         save_brofile(&bf, "global", dir.path(), None);
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();

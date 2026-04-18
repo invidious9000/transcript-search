@@ -289,6 +289,13 @@ struct ExecParams {
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
     allow_recursion: Option<bool>,
+    /// Per-dispatch allow patterns merged on top of global+project+brofile.
+    /// Use to tighten or open the tool surface for this one invocation.
+    #[serde(default)]
+    allow_tools: Option<Vec<String>>,
+    /// Per-dispatch disallow patterns merged on top of global+project+brofile.
+    #[serde(default)]
+    disallow_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -310,6 +317,11 @@ struct ResumeParams {
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
     allow_recursion: Option<bool>,
+    /// Per-dispatch allow/disallow overlays for this resume only.
+    #[serde(default)]
+    allow_tools: Option<Vec<String>>,
+    #[serde(default)]
+    disallow_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -346,6 +358,11 @@ struct BroadcastParams {
     /// Skip anti-recursion guard (default: false)
     #[serde(default)]
     allow_recursion: Option<bool>,
+    /// Per-dispatch allow/disallow overlays applied to every member.
+    #[serde(default)]
+    allow_tools: Option<Vec<String>>,
+    #[serde(default)]
+    disallow_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -372,6 +389,25 @@ struct CancelParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+struct PruneParams {
+    /// Status to prune (failed, completed, cancelled). Defaults to
+    /// "failed" — the only status that's almost always safe to drop
+    /// without further filtering. Running tasks are never pruned.
+    #[serde(default)]
+    status: Option<String>,
+    /// Optional provider filter (claude, codex, copilot, gemini, vibe).
+    #[serde(default)]
+    provider: Option<String>,
+    /// Drop tasks that started more than this many hours ago.
+    #[serde(default)]
+    older_than_hours: Option<u64>,
+    /// Dry-run: report what would be pruned without removing.
+    /// Defaults to false — bro_prune is the explicit pruning verb.
+    #[serde(default)]
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 struct BrofileParams {
     /// Operation: create, list, get, delete, set_account, list_accounts
     action: String,
@@ -384,6 +420,11 @@ struct BrofileParams {
     #[serde(default)] env: Option<std::collections::HashMap<String, String>>,
     #[serde(default)] scope: Option<String>,
     #[serde(default)] project_dir: Option<String>,
+    /// Persona-bound allow/disallow patterns embedded in the brofile.
+    /// Apply at every dispatch using this brofile, between project
+    /// mcp.json and per-dispatch ExecParams overrides.
+    #[serde(default)] allow_tools: Option<Vec<String>>,
+    #[serde(default)] disallow_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -457,11 +498,49 @@ struct DispatchFilters {
     policy_file: Option<PathBuf>,
 }
 
+/// Build a per-dispatch McpFilters overlay from a tool's allow/disallow
+/// param vectors. Returns None when both are empty so callers can pass
+/// None directly into resolve_dispatch_filters without an empty merge.
+fn extra_filters_from_params(
+    allow: Option<&[String]>,
+    disallow: Option<&[String]>,
+) -> Option<orchestration::mcp::McpFilters> {
+    let allow = allow.unwrap_or(&[]);
+    let disallow = disallow.unwrap_or(&[]);
+    if allow.is_empty() && disallow.is_empty() {
+        return None;
+    }
+    Some(orchestration::mcp::McpFilters {
+        allow: allow.to_vec(),
+        disallow: disallow.to_vec(),
+    })
+}
+
+/// Combine brofile-embedded filters with per-dispatch params overlay.
+/// Brofile applies first (persona scope), then per-dispatch (call scope).
+/// Returns None when both are empty/absent.
+fn combine_dispatch_filters(
+    brofile_filters: Option<&orchestration::mcp::McpFilters>,
+    params_filters: Option<&orchestration::mcp::McpFilters>,
+) -> Option<orchestration::mcp::McpFilters> {
+    match (brofile_filters, params_filters) {
+        (None, None) => None,
+        (Some(b), None) => Some(b.clone()),
+        (None, Some(p)) => Some(p.clone()),
+        (Some(b), Some(p)) => {
+            let mut combined = b.clone();
+            combined.merge_from(p);
+            Some(combined)
+        }
+    }
+}
+
 fn resolve_dispatch_filters(
     provider: Provider,
     project_dir: Option<&str>,
     allow_recursion: bool,
     task_id: &str,
+    extra: Option<&orchestration::mcp::McpFilters>,
 ) -> DispatchFilters {
     let global = orchestration::mcp::global_store_path()
         .and_then(|p| orchestration::mcp::McpStore::load(&p).ok())
@@ -470,11 +549,19 @@ fn resolve_dispatch_filters(
         .map(|pd| orchestration::mcp::project_store_path(Path::new(pd)))
         .and_then(|p| orchestration::mcp::McpStore::load(&p).ok());
 
-    let eff = orchestration::mcp::resolve_effective(
+    let mut eff = orchestration::mcp::resolve_effective(
         &global,
         project.as_ref(),
         /* include_default_guard */ !allow_recursion,
     );
+    // Per-dispatch overlay merges last (after global, project, default
+    // guard) so callers can tighten or open the surface for a single
+    // invocation. Disallow patterns in `extra` add to the deny set;
+    // allow patterns add to the allow set. Recursion guard still wins
+    // because allow doesn't override disallow at provider level.
+    if let Some(extra) = extra {
+        eff.filters.merge_from(extra);
+    }
 
     let mut args = provider.build_filter_args(&eff.filters);
     let mut policy_file = None;
@@ -558,7 +645,7 @@ impl BlackboxServer {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let store_dir = self.state.store_dir.clone();
 
-        let (provider, lens, exec_opts, env_overrides, cwd) =
+        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters) =
             match self.resolve_exec_target(p.bro.as_deref(), p.provider.as_deref(), p.project_dir.as_deref()) {
                 Ok(r) => r,
                 Err(e) => return Self::err_text(&e),
@@ -594,7 +681,9 @@ impl BlackboxServer {
             lens.as_deref(),
         );
         let mut args = provider.build_exec_args(&final_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id);
+        let params_extra = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
+        let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
+        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
@@ -624,7 +713,7 @@ impl BlackboxServer {
     async fn bro_resume(&self, Parameters(p): Parameters<ResumeParams>) -> CallToolResult {
         let store_dir = self.state.store_dir.clone();
 
-        let (provider, session_id, _lens, exec_opts, env_overrides, cwd) =
+        let (provider, session_id, _lens, exec_opts, env_overrides, cwd, brofile_filters) =
             match self.resolve_resume_target(
                 p.bro.as_deref(), p.session_id.as_deref(),
                 p.provider.as_deref(), p.project_dir.as_deref(),
@@ -667,7 +756,9 @@ impl BlackboxServer {
         // disallow) must ride with every dispatch — exec AND resume.
         // Without this, a resumed session re-acquires the orchestration
         // tool surface the recursion guard was meant to deny.
-        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id);
+        let params_extra = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
+        let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
+        let dispatch_filters = resolve_dispatch_filters(provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
         args.extend(dispatch_filters.args);
 
         let task = orch::spawn_task(
@@ -859,6 +950,7 @@ impl BlackboxServer {
         let store_dir = self.state.store_dir.clone();
         let mut launched = Vec::new();
         let mut updated_team = team.clone();
+        let params_extra = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
 
         for (i, member) in team.members.iter().enumerate() {
             let brofile = match orchestration::brofile::resolve_brofile(
@@ -882,6 +974,10 @@ impl BlackboxServer {
             } else {
                 None
             };
+            // Per-member combined extra: brofile.filters + broadcast-level
+            // params overlay. Recursion guard is added inside
+            // resolve_dispatch_filters; both layers above merge on top.
+            let extra = combine_dispatch_filters(brofile.filters.as_ref(), params_extra.as_ref());
 
             // Build first-turn prompt with ambient scope + brofile lens.
             // Only applies on fresh-session exec paths; resumes use the
@@ -912,7 +1008,7 @@ impl BlackboxServer {
                 if sid != "pending" {
                     let task_id = uuid::Uuid::new_v4().to_string();
                     let mut args = brofile.provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
-                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id);
+                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
                     args.extend(df.args);
                     let t = orch::spawn_task(
                         task_id, brofile.provider, args, sid.clone(),
@@ -926,7 +1022,7 @@ impl BlackboxServer {
                     let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
                     let exec_prompt = build_exec_prompt(&task_id, &session_id);
                     let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id);
+                    let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
                     args.extend(df.args);
                     let t = orch::spawn_task(
                         task_id, brofile.provider, args, session_id,
@@ -942,7 +1038,7 @@ impl BlackboxServer {
                 let session_id = if brofile.provider == Provider::Claude { uuid::Uuid::new_v4().to_string() } else { "pending".into() };
                 let exec_prompt = build_exec_prompt(&task_id, &session_id);
                 let mut args = brofile.provider.build_exec_args(&exec_prompt, &session_id, cwd.as_deref(), exec_opts.as_ref());
-                let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id);
+                let df = resolve_dispatch_filters(brofile.provider, cwd.as_deref(), allow_recursion, &task_id, extra.as_ref());
                 args.extend(df.args);
                 let t = orch::spawn_task(
                     task_id, brofile.provider, args, session_id,
@@ -1018,6 +1114,67 @@ impl BlackboxServer {
         Self::ok_json(&json!({"count": entries.len(), "tasks": entries}))
     }
 
+    #[tool(name = "bro_prune", description = "Drop terminal tasks from the in-memory store + persisted tasks.json. Defaults to status=failed. Filters: status, provider, older_than_hours. Use dry_run=true to preview. Never touches running tasks.")]
+    fn bro_prune(&self, Parameters(p): Parameters<PruneParams>) -> CallToolResult {
+        let target_status = p.status.as_deref().unwrap_or("failed");
+        let allowed = ["failed", "completed", "cancelled"];
+        if !allowed.contains(&target_status) {
+            return Self::err_text(&format!(
+                "status must be one of {:?} (got {:?}); running tasks are never pruned",
+                allowed, target_status,
+            ));
+        }
+        let parsed_status: orch::TaskStatus =
+            match serde_json::from_str(&format!("\"{target_status}\"")) {
+                Ok(s) => s,
+                Err(e) => return Self::err_text(&format!("status parse: {e}")),
+            };
+        let filter_provider = p.provider.as_deref().and_then(|s| s.parse::<Provider>().ok());
+        let cutoff_ms = p
+            .older_than_hours
+            .map(|h| orch::now_ms().saturating_sub(h.saturating_mul(3600 * 1000)));
+        let dry_run = p.dry_run.unwrap_or(false);
+
+        let dropped: Vec<String> = if dry_run {
+            self.state.task_store.read().all_tasks().iter().filter_map(|t| {
+                let inner = t.inner.lock();
+                if inner.status != parsed_status { return None; }
+                if let Some(fp) = filter_provider {
+                    if inner.provider != fp { return None; }
+                }
+                if let Some(cutoff) = cutoff_ms {
+                    if inner.started_at >= cutoff { return None; }
+                }
+                Some(inner.id.clone())
+            }).collect()
+        } else {
+            let mut store = self.state.task_store.write();
+            let dropped = store.retain_drop(|t| {
+                let inner = t.inner.lock();
+                // Keep running tasks always.
+                if inner.status == orch::TaskStatus::Running { return true; }
+                // Keep tasks that don't match the filter.
+                if inner.status != parsed_status { return true; }
+                if let Some(fp) = filter_provider {
+                    if inner.provider != fp { return true; }
+                }
+                if let Some(cutoff) = cutoff_ms {
+                    if inner.started_at >= cutoff { return true; }
+                }
+                false
+            });
+            store.persist(&self.state.store_dir);
+            dropped
+        };
+
+        Self::ok_json(&json!({
+            "dryRun": dry_run,
+            "status": target_status,
+            "pruned": dropped.len(),
+            "taskIds": dropped,
+        }))
+    }
+
     #[tool(name = "bro_cancel", description = "Cancel a running task (sends SIGTERM).")]
     fn bro_cancel(&self, Parameters(p): Parameters<CancelParams>) -> CallToolResult {
         let task = match self.state.task_store.read().get(&p.task_id) {
@@ -1082,10 +1239,12 @@ impl BlackboxServer {
                     Some(p) => p,
                     None => return Self::err_text("valid provider is required"),
                 };
+                let filters = extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
                 let bf = brofile::Brofile {
                     name: name.clone(), provider,
                     account: p.account.clone(), lens: p.lens.clone(),
                     model: p.model.clone(), effort: p.effort.clone(),
+                    filters,
                 };
                 brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref());
                 Self::ok_json(&json!({"created": name, "scope": scope, "brofile": bf}))
@@ -1273,7 +1432,7 @@ impl BlackboxServer {
         bro_name: Option<&str>,
         raw_provider: Option<&str>,
         project_dir: Option<&str>,
-    ) -> Result<(Provider, Option<String>, Option<ExecOpts>, Option<std::collections::HashMap<String, String>>, Option<String>), String> {
+    ) -> Result<(Provider, Option<String>, Option<ExecOpts>, Option<std::collections::HashMap<String, String>>, Option<String>, Option<orchestration::mcp::McpFilters>), String> {
         let store_dir = &self.state.store_dir;
 
         if let Some(name) = bro_name {
@@ -1286,10 +1445,10 @@ impl BlackboxServer {
                     .and_then(|a| orchestration::brofile::load_account(a, store_dir))
                     .and_then(|a| a.env);
                 let opts = if bf.model.is_some() || bf.effort.is_some() {
-                    Some(ExecOpts { model: bf.model, effort: bf.effort })
+                    Some(ExecOpts { model: bf.model.clone(), effort: bf.effort.clone() })
                 } else { None };
                 let cwd = project_dir.map(String::from).or(bro_match.team.project_dir.clone());
-                return Ok((bf.provider, bf.lens, opts, env, cwd));
+                return Ok((bf.provider, bf.lens, opts, env, cwd, bf.filters));
             }
             // Standalone brofile fallback
             let bf = orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
@@ -1298,14 +1457,14 @@ impl BlackboxServer {
                 .and_then(|a| orchestration::brofile::load_account(a, store_dir))
                 .and_then(|a| a.env);
             let opts = if bf.model.is_some() || bf.effort.is_some() {
-                Some(ExecOpts { model: bf.model, effort: bf.effort })
+                Some(ExecOpts { model: bf.model.clone(), effort: bf.effort.clone() })
             } else { None };
-            return Ok((bf.provider, bf.lens, opts, env, project_dir.map(String::from)));
+            return Ok((bf.provider, bf.lens, opts, env, project_dir.map(String::from), bf.filters));
         }
 
         if let Some(p) = raw_provider {
             let provider = p.parse::<Provider>().map_err(|_| format!("Unknown provider: {p}"))?;
-            return Ok((provider, None, None, None, project_dir.map(String::from)));
+            return Ok((provider, None, None, None, project_dir.map(String::from), None));
         }
 
         Err("Provide either bro or provider".into())
@@ -1318,7 +1477,7 @@ impl BlackboxServer {
         session_id: Option<&str>,
         raw_provider: Option<&str>,
         project_dir: Option<&str>,
-    ) -> Result<(Provider, String, Option<String>, Option<ExecOpts>, Option<std::collections::HashMap<String, String>>, Option<String>), String> {
+    ) -> Result<(Provider, String, Option<String>, Option<ExecOpts>, Option<std::collections::HashMap<String, String>>, Option<String>, Option<orchestration::mcp::McpFilters>), String> {
         let store_dir = &self.state.store_dir;
 
         if let Some(name) = bro_name {
@@ -1341,15 +1500,15 @@ impl BlackboxServer {
                 .and_then(|a| orchestration::brofile::load_account(a, store_dir))
                 .and_then(|a| a.env);
             let opts = if bf.model.is_some() || bf.effort.is_some() {
-                Some(ExecOpts { model: bf.model, effort: bf.effort })
+                Some(ExecOpts { model: bf.model.clone(), effort: bf.effort.clone() })
             } else { None };
             let cwd = project_dir.map(String::from).or(bro_match.team.project_dir.clone());
-            return Ok((bf.provider, sid.to_string(), bf.lens, opts, env, cwd));
+            return Ok((bf.provider, sid.to_string(), bf.lens, opts, env, cwd, bf.filters));
         }
 
         if let (Some(sid), Some(p)) = (session_id, raw_provider) {
             let provider = p.parse::<Provider>().map_err(|_| format!("Unknown provider: {p}"))?;
-            return Ok((provider, sid.to_string(), None, None, None, project_dir.map(String::from)));
+            return Ok((provider, sid.to_string(), None, None, None, project_dir.map(String::from), None));
         }
 
         Err("Provide either bro or session_id + provider".into())

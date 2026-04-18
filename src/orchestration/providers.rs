@@ -312,34 +312,64 @@ impl Provider {
         url: &str,
         exclude_tools: &[String],
     ) -> Option<Vec<String>> {
+        self.build_mcp_add_http_args_scoped(name, url, exclude_tools, "user")
+    }
+
+    /// Scoped form. `scope` is "user" (global, default) or "project" (writes
+    /// into the cwd's project-scoped config file). Returns None when the
+    /// provider's CLI doesn't support that scope (Codex has no project
+    /// scope; Vibe has no MCP CRUD at all).
+    pub fn build_mcp_add_http_args_scoped(
+        &self,
+        name: &str,
+        url: &str,
+        exclude_tools: &[String],
+        scope: &str,
+    ) -> Option<Vec<String>> {
         match self {
-            Provider::Claude => Some(vec![
-                "mcp".into(), "add".into(),
-                // Default scope is `local` which writes to a project-
-                // scoped block in `~/.claude.json` — bad for us because
-                // dispatched subprocesses in other cwds won't see it.
-                // Force user-global so blackbox is visible everywhere.
-                "-s".into(), "user".into(),
-                "--transport".into(), "http".into(),
-                name.into(), url.into(),
-            ]),
-            Provider::Copilot => Some(vec![
-                "copilot".into(), "--".into(),
+            Provider::Claude => {
+                let scope_flag = match scope {
+                    "user" | "project" | "local" => scope,
+                    _ => return None,
+                };
+                Some(vec![
+                    "mcp".into(), "add".into(),
+                    "-s".into(), scope_flag.into(),
+                    "--transport".into(), "http".into(),
+                    name.into(), url.into(),
+                ])
+            }
+            Provider::Copilot => {
                 // Copilot defaults to user scope per `mcp add --help`
                 // ("Add a new MCP server to the user configuration.").
-                "mcp".into(), "add".into(),
-                "--transport".into(), "http".into(),
-                name.into(), url.into(),
-            ]),
-            Provider::Codex => Some(vec![
-                "mcp".into(), "add".into(),
-                name.into(), "--url".into(), url.into(),
-            ]),
+                // No documented project-scope flag; treat project as
+                // unsupported until verified.
+                if scope != "user" { return None; }
+                Some(vec![
+                    "copilot".into(), "--".into(),
+                    "mcp".into(), "add".into(),
+                    "--transport".into(), "http".into(),
+                    name.into(), url.into(),
+                ])
+            }
+            Provider::Codex => {
+                // Codex config lives at ~/.codex/config.toml — single
+                // global file, no per-project equivalent.
+                if scope != "user" { return None; }
+                Some(vec![
+                    "mcp".into(), "add".into(),
+                    name.into(), "--url".into(), url.into(),
+                ])
+            }
             Provider::Gemini => {
+                let scope_flag = match scope {
+                    "user" | "project" => scope,
+                    _ => return None,
+                };
                 let mut args = vec![
                     "mcp".into(), "add".into(),
                     "-t".into(), "http".into(),
-                    "-s".into(), "user".into(),
+                    "-s".into(), scope_flag.into(),
                 ];
                 if !exclude_tools.is_empty() {
                     args.extend(["--exclude-tools".into(), exclude_tools.join(",")]);
@@ -355,22 +385,48 @@ impl Provider {
     /// only ever delete entries we wrote — never touch user-installed
     /// entries in other scopes.
     pub fn build_mcp_remove_args(&self, name: &str) -> Option<Vec<String>> {
+        self.build_mcp_remove_args_scoped(name, "user")
+    }
+
+    pub fn build_mcp_remove_args_scoped(
+        &self,
+        name: &str,
+        scope: &str,
+    ) -> Option<Vec<String>> {
         match self {
-            Provider::Claude => Some(vec![
-                "mcp".into(), "remove".into(),
-                "-s".into(), "user".into(),
-                name.into(),
-            ]),
-            Provider::Copilot => Some(vec![
-                "copilot".into(), "--".into(),
-                "mcp".into(), "remove".into(), name.into(),
-            ]),
-            Provider::Codex => Some(vec!["mcp".into(), "remove".into(), name.into()]),
-            Provider::Gemini => Some(vec![
-                "mcp".into(), "remove".into(),
-                "-s".into(), "user".into(),
-                name.into(),
-            ]),
+            Provider::Claude => {
+                let scope_flag = match scope {
+                    "user" | "project" | "local" => scope,
+                    _ => return None,
+                };
+                Some(vec![
+                    "mcp".into(), "remove".into(),
+                    "-s".into(), scope_flag.into(),
+                    name.into(),
+                ])
+            }
+            Provider::Copilot => {
+                if scope != "user" { return None; }
+                Some(vec![
+                    "copilot".into(), "--".into(),
+                    "mcp".into(), "remove".into(), name.into(),
+                ])
+            }
+            Provider::Codex => {
+                if scope != "user" { return None; }
+                Some(vec!["mcp".into(), "remove".into(), name.into()])
+            }
+            Provider::Gemini => {
+                let scope_flag = match scope {
+                    "user" | "project" => scope,
+                    _ => return None,
+                };
+                Some(vec![
+                    "mcp".into(), "remove".into(),
+                    "-s".into(), scope_flag.into(),
+                    name.into(),
+                ])
+            }
             Provider::Vibe => None,
         }
     }
@@ -1497,6 +1553,38 @@ mod tests {
             format_toml_string_array(&[r#"with"quote"#.into()]),
             r#"["with\"quote"]"#
         );
+    }
+
+    #[test]
+    fn test_scoped_arg_builders_honor_scope_capability() {
+        // Claude + Gemini support both user and project.
+        assert!(Provider::Claude.build_mcp_add_http_args_scoped("x", "u", &[], "user").is_some());
+        assert!(Provider::Claude.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_some());
+        assert!(Provider::Gemini.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_some());
+
+        // Codex has no project scope (single config file).
+        assert!(Provider::Codex.build_mcp_add_http_args_scoped("x", "u", &[], "user").is_some());
+        assert!(Provider::Codex.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_none());
+        assert!(Provider::Codex.build_mcp_remove_args_scoped("x", "project").is_none());
+
+        // Copilot only user (no documented project flag).
+        assert!(Provider::Copilot.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_none());
+
+        // Vibe never.
+        assert!(Provider::Vibe.build_mcp_add_http_args_scoped("x", "u", &[], "user").is_none());
+        assert!(Provider::Vibe.build_mcp_add_http_args_scoped("x", "u", &[], "project").is_none());
+
+        // Claude project scope emits -s project.
+        let claude_proj = Provider::Claude
+            .build_mcp_add_http_args_scoped("x", "http://u/mcp", &[], "project")
+            .unwrap();
+        let joined = claude_proj.join(" ");
+        assert!(joined.contains("-s project"), "expected -s project in: {joined}");
+        // Gemini project scope emits -s project.
+        let gemini_proj = Provider::Gemini
+            .build_mcp_add_http_args_scoped("x", "http://u/mcp", &[], "project")
+            .unwrap();
+        assert!(gemini_proj.join(" ").contains("-s project"));
     }
 
     #[test]

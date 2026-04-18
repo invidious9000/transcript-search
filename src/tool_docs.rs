@@ -314,6 +314,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: None,
     },
     ToolDoc {
+        name: "bro_prune",
+        category: ToolCategory::Orchestration,
+        summary: "Drop terminal tasks from the store + persisted tasks.json.",
+        when_to_use: "Stale failed/completed tasks are cluttering bro_dashboard or bbox_inbox. Defaults to status=failed. Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched.",
+        example: Some(r#"bro_prune(status="failed", provider="gemini")"#),
+    },
+    ToolDoc {
         name: "bro_providers",
         category: ToolCategory::Orchestration,
         summary: "List configured providers, binaries, models.",
