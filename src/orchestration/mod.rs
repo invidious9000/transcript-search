@@ -556,6 +556,16 @@ pub fn spawn_task(
                         if let Some(sid) = sink.session_id {
                             if inner.session_id == "pending" {
                                 inner.session_id = sid;
+                            } else if inner.session_id != sid && inner.status != TaskStatus::Failed {
+                                // Provider emitted a session_id that doesn't
+                                // match the one we asked to resume. Mark failed
+                                // so the caller doesn't trust a forked session
+                                // as a successful continuation.
+                                let requested = inner.session_id.clone();
+                                inner.status = TaskStatus::Failed;
+                                inner.stderr.push_str(&format!(
+                                    "\nsession fork detected: requested resume of {requested}, provider emitted {sid}"
+                                ));
                             }
                         }
                         inner.last_assistant_message.as_ref().map(|msg| {
@@ -615,6 +625,12 @@ pub fn spawn_task(
                 if let Some(sid) = sink.session_id {
                     if inner.session_id == "pending" {
                         inner.session_id = sid;
+                    } else if inner.session_id != sid && inner.status != TaskStatus::Failed {
+                        let requested = inner.session_id.clone();
+                        inner.status = TaskStatus::Failed;
+                        inner.stderr.push_str(&format!(
+                            "\nsession fork detected: requested resume of {requested}, provider emitted {sid}"
+                        ));
                     }
                 }
             }
@@ -665,7 +681,10 @@ pub fn spawn_task(
         {
             let mut inner = task_ref_wait.inner.lock();
             inner.exit_code = code;
-            if inner.status != TaskStatus::Cancelled {
+            // Preserve terminal states set during stream parsing (Cancelled
+            // on kill, Failed on session fork detection) — don't let a
+            // clean exit code flip a detected failure back to Completed.
+            if inner.status != TaskStatus::Cancelled && inner.status != TaskStatus::Failed {
                 inner.status = if code == Some(0) { TaskStatus::Completed } else { TaskStatus::Failed };
             }
             inner.completed_at = Some(now_ms());

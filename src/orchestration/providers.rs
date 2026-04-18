@@ -999,6 +999,66 @@ pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String>
 }
 
 // ---------------------------------------------------------------------------
+// Gemini session discovery (pre-dispatch cwd resolution)
+// ---------------------------------------------------------------------------
+
+/// Locate the project cwd recorded for a Gemini session UUID.
+///
+/// Gemini keys sessions per-cwd under `~/.gemini/tmp/<name>/chats/` with
+/// filenames `session-<iso>-<first8>.json`. When `--resume <uuid>` runs
+/// from a cwd whose folder doesn't contain that UUID, Gemini silently
+/// forks a fresh session instead of erroring — which looks like a
+/// successful resume at the daemon boundary but delivers the wrong
+/// conversation context.
+///
+/// Returns the matched folder's `.project_root` path so the caller can
+/// pin the child's cwd to what Gemini expects. `None` means no session
+/// with this UUID is on disk — the caller should refuse the resume.
+///
+pub fn resolve_gemini_session_cwd(session_id: &str) -> Option<std::path::PathBuf> {
+    let tmp_root = dirs::home_dir()?.join(".gemini/tmp");
+    resolve_gemini_session_cwd_in(&tmp_root, session_id)
+}
+
+/// Testable form of `resolve_gemini_session_cwd` — scoped to an explicit
+/// Gemini tmp root so unit tests can build a fixture without touching
+/// `~/.gemini`.
+pub fn resolve_gemini_session_cwd_in(
+    tmp_root: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    use std::io::Read;
+    if session_id.len() < 8 { return None; }
+    let first8 = &session_id[..8];
+    let suffix = format!("-{first8}.json");
+    let needle = format!("\"sessionId\": \"{session_id}\"");
+
+    for entry in std::fs::read_dir(tmp_root).ok()?.flatten() {
+        let chats = entry.path().join("chats");
+        let Ok(chat_entries) = std::fs::read_dir(&chats) else { continue };
+        for chat in chat_entries.flatten() {
+            let name = chat.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with("session-") || !name.ends_with(&suffix) { continue; }
+            // The filename suffix is only the UUID's first 8 chars, so
+            // confirm the full sessionId via the file header before
+            // trusting the match.
+            let Ok(mut f) = std::fs::File::open(chat.path()) else { continue };
+            let mut buf = [0u8; 256];
+            let n = f.read(&mut buf).ok()?;
+            let header = std::str::from_utf8(&buf[..n]).unwrap_or("");
+            if !header.contains(&needle) { continue; }
+
+            let Ok(root) = std::fs::read_to_string(entry.path().join(".project_root")) else { continue };
+            let root = root.trim();
+            if root.is_empty() { continue; }
+            return Some(std::path::PathBuf::from(root));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Model/Effort catalogs
 // ---------------------------------------------------------------------------
 
@@ -1700,5 +1760,98 @@ mod tests {
         let path = resolve_bin("sh").expect("sh should resolve");
         assert!(path.starts_with('/'), "expected absolute path, got {path}");
         assert!(path.ends_with("/sh") || path.ends_with("/sh\n"));
+    }
+
+    fn seed_gemini_fixture(
+        tmp_root: &std::path::Path,
+        project_name: &str,
+        project_root: &str,
+        session_id: &str,
+        iso: &str,
+    ) {
+        let proj_dir = tmp_root.join(project_name);
+        let chats = proj_dir.join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        std::fs::write(proj_dir.join(".project_root"), project_root).unwrap();
+        let first8 = &session_id[..8];
+        let path = chats.join(format!("session-{iso}-{first8}.json"));
+        std::fs::write(
+            &path,
+            format!("{{\n  \"sessionId\": \"{session_id}\",\n  \"messages\": []\n}}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn resolve_gemini_session_finds_cwd_from_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_fixture(
+            tmp.path(),
+            "daystrom-mk2",
+            "/home/user/repos/daystrom-mk2",
+            "13683fa2-df9a-44f3-a068-4520b4dbb55b",
+            "2026-04-18T19-18",
+        );
+        let cwd = resolve_gemini_session_cwd_in(
+            tmp.path(),
+            "13683fa2-df9a-44f3-a068-4520b4dbb55b",
+        )
+        .expect("should resolve");
+        assert_eq!(cwd, std::path::PathBuf::from("/home/user/repos/daystrom-mk2"));
+    }
+
+    #[test]
+    fn resolve_gemini_session_returns_none_for_unknown_uuid() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj-a",
+            "/repo/a",
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "2026-04-18T10-00",
+        );
+        // Different UUID — silent fork territory on the real Gemini CLI;
+        // here we want None so the caller refuses.
+        assert!(
+            resolve_gemini_session_cwd_in(
+                tmp.path(),
+                "bbbbbbbb-1111-2222-3333-444444444444",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_gemini_session_rejects_prefix_collision() {
+        // Two files share the first-8 prefix but have different full UUIDs.
+        // The returned cwd must be the one whose file body actually
+        // contains the requested UUID — not a neighbor.
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj-a",
+            "/repo/a",
+            "13683fa2-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "2026-04-18T19-00",
+        );
+        seed_gemini_fixture(
+            tmp.path(),
+            "proj-b",
+            "/repo/b",
+            "13683fa2-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "2026-04-18T20-00",
+        );
+        let cwd = resolve_gemini_session_cwd_in(
+            tmp.path(),
+            "13683fa2-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        )
+        .expect("should resolve");
+        assert_eq!(cwd, std::path::PathBuf::from("/repo/b"));
+    }
+
+    #[test]
+    fn resolve_gemini_session_rejects_short_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_gemini_session_cwd_in(tmp.path(), "short").is_none());
     }
 }
