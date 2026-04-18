@@ -312,7 +312,7 @@ impl Provider {
         url: &str,
         exclude_tools: &[String],
     ) -> Option<Vec<String>> {
-        self.build_mcp_add_http_args_scoped(name, url, exclude_tools, "user")
+        self.build_mcp_add_http_args_full(name, url, exclude_tools, &std::collections::BTreeMap::new(), "user")
     }
 
     /// Scoped form. `scope` is "user" (global, default) or "project" (writes
@@ -326,25 +326,52 @@ impl Provider {
         exclude_tools: &[String],
         scope: &str,
     ) -> Option<Vec<String>> {
+        self.build_mcp_add_http_args_full(name, url, exclude_tools, &std::collections::BTreeMap::new(), scope)
+    }
+
+    /// Full form. Adds custom HTTP headers (e.g. auth tokens) to the
+    /// add-args when the provider's CLI supports them: Claude (`-H`)
+    /// and Gemini (`-H`). Codex's only header-like option is a bearer-
+    /// token env var (`--bearer-token-env-var`) which can't be set
+    /// from arbitrary key=value pairs without inventing env-var names,
+    /// so Codex passes the URL alone — bearer tokens for Codex must
+    /// be configured out-of-band. Copilot has no documented header
+    /// flag. When the provider can't carry headers, they're silently
+    /// dropped at the CLI layer (still persisted in McpServerConfig
+    /// for clients that read the config directly).
+    pub fn build_mcp_add_http_args_full(
+        &self,
+        name: &str,
+        url: &str,
+        exclude_tools: &[String],
+        headers: &std::collections::BTreeMap<String, String>,
+        scope: &str,
+    ) -> Option<Vec<String>> {
         match self {
             Provider::Claude => {
                 let scope_flag = match scope {
                     "user" | "project" | "local" => scope,
                     _ => return None,
                 };
-                Some(vec![
+                let mut args = vec![
                     "mcp".into(), "add".into(),
                     "-s".into(), scope_flag.into(),
                     "--transport".into(), "http".into(),
-                    name.into(), url.into(),
-                ])
+                ];
+                for (k, v) in headers {
+                    args.push("-H".into());
+                    args.push(format!("{k}: {v}"));
+                }
+                args.extend([name.into(), url.into()]);
+                Some(args)
             }
             Provider::Copilot => {
-                // Copilot defaults to user scope per `mcp add --help`
-                // ("Add a new MCP server to the user configuration.").
-                // No documented project-scope flag; treat project as
-                // unsupported until verified.
                 if scope != "user" { return None; }
+                if !headers.is_empty() {
+                    tracing::debug!(target: "blackbox::mcp",
+                        "copilot mcp add: dropping {} header(s) (no documented header flag)",
+                        headers.len());
+                }
                 Some(vec![
                     "copilot".into(), "--".into(),
                     "mcp".into(), "add".into(),
@@ -353,9 +380,12 @@ impl Provider {
                 ])
             }
             Provider::Codex => {
-                // Codex config lives at ~/.codex/config.toml — single
-                // global file, no per-project equivalent.
                 if scope != "user" { return None; }
+                if !headers.is_empty() {
+                    tracing::debug!(target: "blackbox::mcp",
+                        "codex mcp add: dropping {} header(s) (only --bearer-token-env-var supported)",
+                        headers.len());
+                }
                 Some(vec![
                     "mcp".into(), "add".into(),
                     name.into(), "--url".into(), url.into(),
@@ -373,6 +403,10 @@ impl Provider {
                 ];
                 if !exclude_tools.is_empty() {
                     args.extend(["--exclude-tools".into(), exclude_tools.join(",")]);
+                }
+                for (k, v) in headers {
+                    args.push("-H".into());
+                    args.push(format!("{k}: {v}"));
                 }
                 args.extend([name.into(), url.into()]);
                 Some(args)
@@ -1553,6 +1587,42 @@ mod tests {
             format_toml_string_array(&[r#"with"quote"#.into()]),
             r#"["with\"quote"]"#
         );
+    }
+
+    #[test]
+    fn test_build_mcp_add_http_args_full_threads_headers() {
+        use std::collections::BTreeMap;
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer xyz".to_string());
+        headers.insert("X-Trace".to_string(), "abc123".to_string());
+
+        // Claude emits -H "key: value" pairs.
+        let claude = Provider::Claude
+            .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
+            .unwrap();
+        let joined = claude.join(" | ");
+        assert!(joined.contains("-H | Authorization: Bearer xyz"), "got: {joined}");
+        assert!(joined.contains("-H | X-Trace: abc123"), "got: {joined}");
+
+        // Gemini also emits -H pairs.
+        let gemini = Provider::Gemini
+            .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
+            .unwrap();
+        let joined = gemini.join(" | ");
+        assert!(joined.contains("-H | Authorization: Bearer xyz"));
+
+        // Codex drops headers (only --bearer-token-env-var supported).
+        let codex = Provider::Codex
+            .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
+            .unwrap();
+        assert!(!codex.iter().any(|a| a == "-H"));
+        assert!(!codex.iter().any(|a| a.contains("Bearer xyz")));
+
+        // Copilot drops headers (no documented header flag).
+        let copilot = Provider::Copilot
+            .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
+            .unwrap();
+        assert!(!copilot.iter().any(|a| a == "-H"));
     }
 
     #[test]

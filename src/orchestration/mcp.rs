@@ -770,6 +770,7 @@ fn action_add(p: &McpToolParams) -> Result<String> {
     };
 
     let path = resolve_scope_path(p)?;
+    let headers_for_cli = p.headers.clone().unwrap_or_default();
 
     // Fan out FIRST so we know whether the providers accepted the
     // add before we persist intent locally. Both global and project
@@ -783,7 +784,7 @@ fn action_add(p: &McpToolParams) -> Result<String> {
         None
     };
     let fanout_lines: Vec<String> = fanout_parallel(|provider| {
-        let args = provider.build_mcp_add_http_args_scoped(name, url, &exclude, cli_scope)?;
+        let args = provider.build_mcp_add_http_args_full(name, url, &exclude, &headers_for_cli, cli_scope)?;
         // Idempotent: best-effort remove (no-op if absent), then add.
         // The remove error is logged but not surfaced — it's expected
         // to fail when the server isn't already registered. Genuine
@@ -889,8 +890,9 @@ fn action_sync(p: &McpToolParams) -> Result<String> {
 
     let mut lines = vec![format!("Syncing {} server(s)…", store.servers.len())];
     for (name, cfg) in &store.servers {
-        let url = match cfg {
-            McpServerConfig::Http { url, .. } | McpServerConfig::Sse { url, .. } => url.clone(),
+        let (url, headers) = match cfg {
+            McpServerConfig::Http { url, headers, .. }
+            | McpServerConfig::Sse { url, headers, .. } => (url.clone(), headers.clone()),
             McpServerConfig::Stdio { .. } => {
                 lines.push(format!("  {name}: stdio not yet supported via sync"));
                 continue;
@@ -898,7 +900,7 @@ fn action_sync(p: &McpToolParams) -> Result<String> {
         };
         let exclude = cfg.exclude_tools();
         lines.extend(fanout_parallel(|provider| {
-            let add_args = provider.build_mcp_add_http_args(name, &url, exclude)?;
+            let add_args = provider.build_mcp_add_http_args_full(name, &url, exclude, &headers, "user")?;
             if let Some(rm) = provider.build_mcp_remove_args(name) {
                 if let Err(e) = run_cli(&provider, &rm) {
                     tracing::debug!(target: "blackbox::mcp",
