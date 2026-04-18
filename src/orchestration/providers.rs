@@ -197,12 +197,14 @@ impl Provider {
                 args
             }
             Provider::Vibe => {
-                let mut args = vec![
+                // Vibe CLI has no `--model` flag — model is selected
+                // out-of-band via `--agent NAME` (~/.vibe/agents/*.toml)
+                // or `vibe --setup`. Ignore opts.model.
+                let _ = model;
+                vec![
                     "-p".into(), prompt.into(),
                     "--output".into(), "json".into(),
-                ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
-                args
+                ]
             }
             Provider::Gemini => {
                 let mut args = vec![
@@ -269,13 +271,13 @@ impl Provider {
                 args
             }
             Provider::Vibe => {
-                let mut args = vec![
+                // Vibe CLI has no `--model` flag — see build_exec_args.
+                let _ = model;
+                vec![
                     "--resume".into(), session_id.into(),
                     "-p".into(), prompt.into(),
                     "--output".into(), "json".into(),
-                ];
-                if let Some(m) = model { args.extend(["--model".into(), m.into()]); }
-                args
+                ]
             }
             Provider::Gemini => {
                 let mut args = vec![
@@ -916,18 +918,19 @@ static COPILOT_EFFORTS: &[EffortInfo] = &[
     EffortInfo { id: "xhigh", description: "Maximum reasoning depth", default: false },
 ];
 
-static VIBE_MODELS: &[ModelInfo] = &[
-    ModelInfo { id: "devstral-2", description: "Devstral 2 123B, flagship coding model", default: true },
-    ModelInfo { id: "devstral-small", description: "Devstral Small 2 24B, fast and compact", default: false },
-];
+// Vibe CLI does not expose per-invocation model selection (no --model
+// flag). Model is configured out-of-band via `--agent NAME`
+// (~/.vibe/agents/*.toml) or `vibe --setup`. Listing models here would
+// imply they're selectable through bro_exec/brofiles when they aren't.
+static VIBE_MODELS: &[ModelInfo] = &[];
 
 static GEMINI_MODELS: &[ModelInfo] = &[
-    ModelInfo { id: "gemini-2.5-flash", description: "Fast and capable", default: true },
-    ModelInfo { id: "gemini-2.5-flash-lite", description: "Lightweight, lowest cost", default: false },
-    ModelInfo { id: "gemini-2.5-pro", description: "Most capable Gemini 2.5", default: false },
-    ModelInfo { id: "gemini-3-flash-preview", description: "Next-gen flash preview", default: false },
-    ModelInfo { id: "gemini-3.1-flash-lite-preview", description: "Next-gen lite preview", default: false },
-    ModelInfo { id: "gemini-3.1-pro-preview", description: "Next-gen pro preview", default: false },
+    ModelInfo { id: "gemini-3.1-pro-preview", description: "Gemini 3.1 Pro, flagship reasoning model (preview)", default: true },
+    ModelInfo { id: "gemini-3-flash-preview", description: "Gemini 3 Flash, fast generalist (preview)", default: false },
+    ModelInfo { id: "gemini-3.1-flash-lite-preview", description: "Gemini 3.1 Flash-Lite, lowest cost (preview)", default: false },
+    ModelInfo { id: "gemini-2.5-pro", description: "Gemini 2.5 Pro, prior-gen flagship (GA)", default: false },
+    ModelInfo { id: "gemini-2.5-flash", description: "Gemini 2.5 Flash, prior-gen fast (GA)", default: false },
+    ModelInfo { id: "gemini-2.5-flash-lite", description: "Gemini 2.5 Flash-Lite, prior-gen low-cost (GA)", default: false },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1008,17 @@ mod tests {
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"s1".to_string()));
         assert!(args.contains(&"--output".to_string()));
+    }
+
+    #[test]
+    fn test_vibe_ignores_model_param() {
+        let opts = ExecOpts { model: Some("devstral-2".into()), effort: None };
+        let exec_args = Provider::Vibe.build_exec_args("hi", "sid", None, Some(&opts));
+        assert!(!exec_args.contains(&"--model".to_string()),
+            "vibe exec must not emit --model (CLI rejects it): {exec_args:?}");
+        let resume_args = Provider::Vibe.build_resume_args("sid", "hi", Some(&opts));
+        assert!(!resume_args.contains(&"--model".to_string()),
+            "vibe resume must not emit --model (CLI rejects it): {resume_args:?}");
     }
 
     #[test]
@@ -1172,6 +1186,9 @@ mod tests {
     #[test]
     fn test_models_nonempty() {
         for p in Provider::ALL {
+            // Vibe has no selectable model surface (CLI lacks --model);
+            // catalog is intentionally empty.
+            if matches!(p, Provider::Vibe) { continue; }
             assert!(!p.models().is_empty(), "{} should have at least one model", p);
         }
     }
@@ -1179,9 +1196,16 @@ mod tests {
     #[test]
     fn test_each_provider_has_default_model() {
         for p in Provider::ALL {
+            if matches!(p, Provider::Vibe) { continue; }
             let has_default = p.models().iter().any(|m| m.default);
             assert!(has_default, "{} should have a default model", p);
         }
+    }
+
+    #[test]
+    fn test_vibe_models_empty() {
+        assert!(Provider::Vibe.models().is_empty(),
+            "vibe must not advertise selectable models — CLI has no --model flag");
     }
 
     #[test]
