@@ -1951,7 +1951,7 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|_| std::env::var("BRO_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(7263);
+        .unwrap_or(7264);
     let bbox_url = format!("http://127.0.0.1:{bbox_port}/mcp");
     // Export for provider arg-builders so they can inject `--mcp-config`
     // etc. at dispatch time — ensures dispatched subprocesses see
@@ -2019,7 +2019,7 @@ async fn main() -> anyhow::Result<()> {
         .or_else(|_| std::env::var("BRO_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(7263);
+        .unwrap_or(7264);
 
     let ct = CancellationToken::new();
     let config = StreamableHttpServerConfig::default()
