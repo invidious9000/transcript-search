@@ -219,6 +219,23 @@ impl TaskStore {
 // If defense-in-depth text guards are wanted in the future, reintroduce
 // a prefix here and gate on `AmbientContext::provider`.
 
+/// Per-turn recall directive. The managed-region CORE RULE reliably
+/// triggers `bbox_knowledge` queries on cold-start but attention-
+/// decays within-session on Claude Opus 4.7 and Gemini 2.5-flash:
+/// at ~15 turns of accumulated context, the session-start memory
+/// guidance no longer binds. Per-turn ambient injection survives
+/// because it rides with every turn. Codex gpt-5.4 does not appear
+/// to need this — Tier 1 instruction binds at depth there — but
+/// the extra reinforcement is harmless. Parallels the empirical
+/// fix for `bbox_note` emission (DEFAULT_COMPLETION_CONTRACT below).
+pub const RECALL_DIRECTIVE: &str = "\
+Your FIRST tool call on any substantive task must be \
+`bbox_knowledge(query=<one keyword>)` to check for stored project-\
+specific context. Use a distinctive keyword; if empty, try 1-2 \
+different keywords before falling back to filesystem probing or \
+training-prior inference. A wasted query costs near-nothing; a \
+confident wrong answer wastes the task.";
+
 /// Default per-dispatch contract requiring a structured completion
 /// signal before the agent returns. Observed empirically: without
 /// this, agents competently complete tasks via prose but never emit
@@ -345,6 +362,13 @@ pub fn apply_ambient(prompt: &str, ctx: &AmbientContext) -> String {
         prefix.push_str(&fields.join(" · "));
         prefix.push_str("\n\n");
     }
+
+    // Per-turn recall reinforcement. Session-start memory guidance
+    // decays at depth on Claude and Gemini; ambient survives because
+    // it rides with every turn.
+    prefix.push_str("[recall before acting]\n");
+    prefix.push_str(RECALL_DIRECTIVE);
+    prefix.push_str("\n\n");
 
     if let Some(contract) = &ctx.completion_contract {
         prefix.push_str("[completion contract]\n");
@@ -931,6 +955,27 @@ mod tests {
         let out = apply_ambient("work", &ctx);
         assert!(out.contains("[completion contract]"));
         assert!(out.contains("bbox_note"));
+    }
+
+    #[test]
+    fn ambient_emits_recall_directive() {
+        let ctx = AmbientContext::default();
+        let out = apply_ambient("work", &ctx);
+        assert!(out.contains("[recall before acting]"));
+        assert!(out.contains("bbox_knowledge"));
+        assert!(out.contains("FIRST tool call"));
+    }
+
+    #[test]
+    fn ambient_recall_directive_skipped_under_allow_recursion() {
+        let ctx = AmbientContext {
+            allow_recursion: true,
+            ..Default::default()
+        };
+        let out = apply_ambient("work", &ctx);
+        assert!(!out.contains("[recall before acting]"));
+        assert!(!out.contains("bbox_knowledge"));
+        assert_eq!(out, "work");
     }
 
     #[test]

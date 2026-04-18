@@ -637,11 +637,32 @@ impl BlackboxServer {
             return Self::err_text(&format!("{provider} does not support resume"));
         }
 
-        // Lens + recursion guard are injected once on exec and live in the
-        // transcript from turn one; re-prepending them here would duplicate
-        // them in every follow-up user turn.
-        let args = provider.build_resume_args(&session_id, &p.prompt, exec_opts.as_ref());
+        let allow_recursion = p.allow_recursion.unwrap_or(false);
         let task_id = uuid::Uuid::new_v4().to_string();
+
+        // Re-apply ambient on resume: each resume is its own dispatch with a
+        // fresh task_id, and the per-turn recall directive + completion
+        // contract need to ride with every follow-up (memory-file
+        // reinforcement decays at depth). The brofile lens was injected on
+        // exec and lives in the transcript — not re-prepended here.
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(session_id.clone()),
+            project_dir: cwd.clone(),
+            bro_name: p.bro.clone(),
+            thread_id: None,
+            work_item_id: None,
+            completion_contract: if allow_recursion {
+                None
+            } else {
+                Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
+            },
+            allow_recursion,
+            provider: Some(provider),
+        };
+        let wrapped_prompt = orch::apply_ambient(&p.prompt, &ambient_ctx);
+
+        let args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
 
         let task = orch::spawn_task(
             task_id, provider, args, session_id,
