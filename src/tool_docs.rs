@@ -134,7 +134,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
         summary: "Persist a rule or convention; rendered into provider markdown files.",
-        when_to_use: "User says 'from now on / always / never X' in a way that should bind future sessions. Entry appears in every agent's CLAUDE.md / AGENTS.md / GEMINI.md after `bbox_render`.",
+        when_to_use: "User-stated rule, convention, or preference meant to bind future sessions — positive or negative, project-wide or global. Triggers include 'from now on', 'always X', 'never X', 'we (don't) use Y', 'prefer Y', 'X is banned / retired / out of scope', 'stop using X', 'house rule', 'standing order'. Implementation ≠ rule: a .gitignore, linter config, or deleted dependency enforces the rule for *now* but won't transmit the *intent* to a future session that doesn't see this turn. After implementing a user policy in code/config, ask: did the user state a standing rule that should outlive this edit? If yes, also call `bbox_learn`. Scope test — only call if the statement would still matter after this edit is reverted or forgotten; don't store one-off task constraints like 'for this fix, skip tests'. Distinct from `bbox_note(kind=learned)` which is for what YOU observed about the codebase during work — this tool is for what the USER told you. Renders into every agent's CLAUDE.md / AGENTS.md / GEMINI.md after `bbox_render`.",
         example: Some(r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#),
     },
     ToolDoc {
@@ -155,7 +155,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
         summary: "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above.",
-        when_to_use: "The start of any task. Default to `query=<one distinctive word>`. Use scoped filters (`category`, `scope`, `project`) only for browsing audit trails, e.g. `bbox_knowledge(category=\"decision\", project=\"/repo/x\")`.",
+        when_to_use: "The start of any task. Default to `query=<one distinctive word>`. Before calling `bbox_decide(supersedes=...)`, add `project=<current-project-dir>` to narrow to *this* repo's prior entries — same-topic entries from other repos can appear and lead to superseding the wrong entry. `category` filter helps when you specifically want decisions, conventions, etc.",
         example: Some(r#"bbox_knowledge(query="retry")"#),
     },
     ToolDoc {
@@ -222,7 +222,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note",
         category: ToolCategory::Notes,
         summary: "Record a structured side-channel note while working.",
-        when_to_use: "As an executor: emit throughout a dispatch for the 7 kinds below. As an orchestrator: rarely — you're the reader. Genuine signal only, not stylistic preference. The `done` kind with a one-line acceptance summary is the most important: always emit before returning. Kinds: `dispute` (disagree with brief/premise), `assumption` (ambiguity-resolving judgment), `surprise` (expected X, found Y), `followup` (out-of-scope work deferred), `blocked` (subtask blocked, include reason), `learned` (project convention discovered in situ), `done` (completion + summary).",
+        when_to_use: "As an executor: emit throughout a dispatch for the 7 kinds below. As an orchestrator: rarely — you're the reader. Genuine signal only, not stylistic preference. The `done` kind with a one-line acceptance summary is the most important: always emit before returning. Kinds: `dispute` (disagree with brief/premise), `assumption` (ambiguity-resolving judgment), `surprise` (expected X, found Y), `followup` (out-of-scope work deferred), `blocked` (subtask blocked, include reason), `learned` (codebase/environment fact YOU discovered mid-work, e.g. 'this repo uses tabs not spaces', 'cargo check works here' — NOT user-stated rules; those go to `bbox_learn`), `done` (completion + summary).",
         example: Some(r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#),
     },
     ToolDoc {
@@ -377,6 +377,11 @@ daemon may also auto-fill these fields when you omit them.
 
 ## Persistence hierarchy (when to reach for which)
 
+**Rule of thumb:** `bbox_learn` / `bbox_remember` / `bbox_decide` capture \
+what the USER told you and should survive future sessions. `bbox_note` \
+captures what YOU observed during the current dispatch. Never use \
+`bbox_note(kind=learned)` for a user-stated rule — that's `bbox_learn`.
+
 - `bbox_remember` — default. Indexed, grep-able, never rendered. \
 Safest choice when unsure.
 - `bbox_learn` — rules / conventions that should bind every future \
@@ -437,6 +442,14 @@ pub fn render_markdown() -> String {
     out.push_str("The signature failure mode here: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. This is not a suggestion.\n\n");
     out.push_str("Use a single distinctive keyword from the task. If empty, try a different word. Do not fall back to filesystem exploration, process probing, or training-prior inference until at least 2 distinct queries have returned empty.\n\n");
     out.push_str("Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n");
+
+    out.push_str("## CORE RULE: capture durable user directives\n\n");
+    out.push_str("**When the user states a rule, convention, or preference meant to bind future sessions, your response MUST include a `bbox_learn` (or `bbox_remember` / `bbox_decide`) call BEFORE you wrap up the task.** Mechanical enforcement — a `.gitignore` entry, a linter config, deleted code, a removed dependency — does not replace this. It enforces the rule for the current edit; it does NOT transmit the *intent* to a future session that won't see this turn. Skipping the call means the rule silently rots and a future agent re-derives the wrong answer.\n\n");
+    out.push_str("Triggers (positive and negative bind equally): \"from now on\", \"always X\", \"never X\", \"we (don't) use Y\", \"prefer Y\", \"X is banned / retired / out of scope\", \"stop using X\", \"no more X\", \"house rule\", \"standing order\", \"keep X out of\", \"X must not\".\n\n");
+    out.push_str("Scope test before emitting: would the statement still matter after this edit is reverted or forgotten? If yes, store it. If no (\"for this fix, skip tests\", \"just for today\"), don't — that's an ephemeral task constraint, not a standing rule.\n\n");
+    out.push_str("After implementing any user directive in code/config, explicitly ask yourself: did the user just state a standing rule? If yes, emit the storage call before replying.\n\n");
+
+    out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");
 
     let categories = [
         ToolCategory::Transcripts,
