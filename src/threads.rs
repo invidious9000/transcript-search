@@ -20,7 +20,13 @@ pub struct ThreadParams {
     /// get, open, continue, link, resolve, promote, rename
     pub action: String,
     #[serde(default)] pub name: Option<String>,
-    #[serde(default)] pub id: Option<String>,
+    /// Thread ID. Canonical form is `thread-<8 hex>` (e.g. `thread-7f01324e`)
+    /// — the exact string returned by `bbox_thread(action="open")` and listed
+    /// by `bbox_thread_list`. Required for `continue`, `resolve`, `rename`,
+    /// `link`, `promote`; optional for `get` (friendly `name` works too).
+    #[serde(default)]
+    #[schemars(regex(pattern = r"^(thread-)?[0-9a-f]{8}$"))]
+    pub id: Option<String>,
     #[serde(default)] pub topic: Option<String>,
     #[serde(default)] pub project: Option<String>,
     #[serde(default)] pub session_id: Option<String>,
@@ -281,7 +287,9 @@ impl Threads {
 
     fn thread_get(&self, p: &ThreadParams) -> Result<String> {
         let thread = if let Some(id) = p.id.as_deref() {
-            self.store.threads.iter().find(|t| t.id == id)
+            // Accept bare `<8hex>` as fallback for canonical `thread-<8hex>`
+            // — matches the schema regex and the NoteResolveParams policy.
+            self.store.threads.iter().find(|t| t.id == id || t.id.strip_prefix("thread-") == Some(id))
         } else if let Some(name) = p.name.as_deref() {
             let name_lower = name.to_lowercase();
             self.store.threads.iter().find(|t| {
@@ -418,13 +426,20 @@ impl Threads {
         Ok(format!("Thread {id} ({topic}) — added {kind_str} edge to {target}"))
     }
 
-    /// Resolve a thread by `id` or `name` in the params.
+    /// Resolve a thread by `id` or `name` in the params. Accepts bare
+    /// `<8hex>` as fallback for canonical `thread-<8hex>` and always
+    /// returns the canonical stored form.
     fn resolve_thread_id(&self, p: &ThreadParams) -> Result<String> {
         if let Some(id) = p.id.as_deref() {
-            if self.store.threads.iter().any(|t| t.id == id) {
-                return Ok(id.to_string());
+            if let Some(t) = self
+                .store
+                .threads
+                .iter()
+                .find(|t| t.id == id || t.id.strip_prefix("thread-") == Some(id))
+            {
+                return Ok(t.id.clone());
             }
-            anyhow::bail!("Thread not found: {id}");
+            anyhow::bail!("Thread not found: {id} (expected `thread-<8hex>`, e.g. `thread-7f01324e`)");
         }
         if let Some(name) = p.name.as_deref() {
             let name_lower = name.to_lowercase();

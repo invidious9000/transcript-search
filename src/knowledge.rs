@@ -162,11 +162,16 @@ pub enum Scope {
 }
 
 impl Scope {
-    /// Parse a free-form string into a Scope, defaulting to Global for
-    /// empty or unrecognized input. This matches the legacy behavior
-    /// where the param layer treated a missing `scope` as "global".
-    fn parse_or_global(s: Option<&str>) -> Self {
-        s.and_then(|s| s.parse().ok()).unwrap_or(Self::Global)
+    /// `None` → `Global` (schema default). `Some(invalid)` → error.
+    /// Silent coercion previously masked typos like `scope="projct"` by
+    /// quietly routing them to global memory.
+    fn parse_optional(s: Option<&str>) -> Result<Self> {
+        match s {
+            None => Ok(Self::Global),
+            Some(raw) => raw.parse().map_err(|_| {
+                anyhow::anyhow!("invalid scope: {raw:?} (expected \"global\" or \"project\")")
+            }),
+        }
     }
 }
 
@@ -202,12 +207,27 @@ impl Category {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, strum::EnumString)]
 #[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
 pub enum Priority {
     Critical,
     Standard,
     Supplementary,
+}
+
+impl Priority {
+    /// `None` → `Standard` (schema default). `Some(invalid)` → error.
+    fn parse_optional(s: Option<&str>) -> Result<Self> {
+        match s {
+            None => Ok(Self::Standard),
+            Some(raw) => raw.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "invalid priority: {raw:?} (expected \"critical\", \"standard\", or \"supplementary\")"
+                )
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -391,13 +411,9 @@ impl Knowledge {
         let category = Category::from_str(&p.category)
             .map_err(|_| anyhow::anyhow!("invalid category: {}", p.category))?;
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
-        let scope = Scope::parse_or_global(p.scope.as_deref());
+        let scope = Scope::parse_optional(p.scope.as_deref())?;
         let providers = p.providers.clone().unwrap_or_default();
-        let priority = match p.priority.as_deref().unwrap_or("standard") {
-            "critical" => Priority::Critical,
-            "supplementary" => Priority::Supplementary,
-            _ => Priority::Standard,
-        };
+        let priority = Priority::parse_optional(p.priority.as_deref())?;
         let weight = p.weight.unwrap_or(100);
 
         let now = Self::now_iso();
@@ -510,12 +526,15 @@ impl Knowledge {
 
     /// Remember — store for on-demand recall only, never rendered into markdown.
     pub fn remember(&mut self, p: &RememberParams, from_agent: bool) -> Result<String> {
-        let category_str = p.category.as_deref().unwrap_or("memory");
-        let category = Category::from_str(category_str).unwrap_or(Category::Memory);
-        // (strum's EnumString::from_str returns Result; unwrap_or treats any
-        // unknown string as plain Memory — consistent with prior behavior.)
+        // None → Memory (schema default). Some(invalid) → error rather than
+        // silently landing the entry in the wrong bucket.
+        let category = match p.category.as_deref() {
+            None => Category::Memory,
+            Some(raw) => Category::from_str(raw)
+                .map_err(|_| anyhow::anyhow!("invalid category: {raw}"))?,
+        };
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
-        let scope = Scope::parse_or_global(p.scope.as_deref());
+        let scope = Scope::parse_optional(p.scope.as_deref())?;
 
         let now = Self::now_iso();
         let id = Self::gen_id();
@@ -562,12 +581,8 @@ impl Knowledge {
         }
 
         let title = p.title.clone().unwrap_or_else(|| derive_title(&p.content));
-        let scope = Scope::parse_or_global(p.scope.as_deref());
-        let priority = match p.priority.as_deref().unwrap_or("standard") {
-            "critical" => Priority::Critical,
-            "supplementary" => Priority::Supplementary,
-            _ => Priority::Standard,
-        };
+        let scope = Scope::parse_optional(p.scope.as_deref())?;
+        let priority = Priority::parse_optional(p.priority.as_deref())?;
         let render_flag = p.render.unwrap_or(true);
 
         // Validate supersedes target exists before we create anything.

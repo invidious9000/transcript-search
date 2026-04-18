@@ -27,8 +27,12 @@ pub struct NoteParams {
     /// Project path
     #[serde(default)]
     pub project: Option<String>,
-    /// Linked work-item thread ID (optional)
+    /// Linked work-item thread ID. Canonical form is `thread-<8 hex>` (e.g.
+    /// `thread-7f01324e`) — the exact string returned by `bbox_thread`
+    /// / listed by `bbox_thread_list`. Copy verbatim from the `thread:` line
+    /// of the ambient `[scope]` prefix when available.
     #[serde(default)]
+    #[schemars(regex(pattern = r"^(thread-)?[0-9a-f]{8}$"))]
     pub thread_id: Option<String>,
     /// Provider (claude, codex, gemini, ...)
     #[serde(default)]
@@ -77,7 +81,11 @@ pub struct NoteListParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NoteResolveParams {
-    /// Note ID
+    /// Note ID. Canonical form is `note-<8 hex>` (e.g. `note-a1b2c3d4`) — the
+    /// exact string returned by `bbox_note` and listed by `bbox_notes` /
+    /// `bbox_inbox`. The bare 8-hex suffix (`a1b2c3d4`) is accepted as a
+    /// fallback for ergonomics, but prefer the canonical form.
+    #[schemars(regex(pattern = r"^(note-)?[0-9a-f]{8}$"))]
     pub id: String,
     /// One of: unresolved, acknowledged, addressed
     pub resolution: String,
@@ -271,12 +279,21 @@ impl Notes {
             )
         })?;
 
+        // Canonical IDs are `note-<8hex>`. Accept the bare suffix as a
+        // fallback — agents sometimes strip the prefix treating it as display
+        // decoration; fail loudly rather than silently on true misses.
+        let needle = p.id.as_str();
         let note = self
             .store
             .notes
             .iter_mut()
-            .find(|n| n.id == p.id)
-            .with_context(|| format!("Note not found: {}", p.id))?;
+            .find(|n| n.id == needle || n.id.strip_prefix("note-") == Some(needle))
+            .with_context(|| {
+                format!(
+                    "Note not found: {} (expected `note-<8hex>`, e.g. `note-a1b2c3d4`)",
+                    p.id
+                )
+            })?;
 
         let now = Self::now_iso();
         note.resolution = resolution;
@@ -603,6 +620,50 @@ mod tests {
             })
             .unwrap();
         assert!(out_all.contains(&id));
+    }
+
+    #[test]
+    fn resolve_accepts_bare_hex_fallback() {
+        let (_tmp, mut notes) = mk_store();
+        notes
+            .create(&NoteParams {
+                kind: "done".into(),
+                body: "task complete".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        let full_id = notes.store.notes[0].id.clone();
+        let bare = full_id.strip_prefix("note-").unwrap().to_string();
+        assert_eq!(bare.len(), 8, "gen_id produces 8 hex chars");
+
+        notes
+            .resolve(&NoteResolveParams {
+                id: bare,
+                resolution: "addressed".into(),
+                note: None,
+            })
+            .unwrap();
+
+        assert_eq!(notes.store.notes[0].resolution, NoteResolution::Addressed);
+    }
+
+    #[test]
+    fn resolve_unknown_id_errors_with_format_hint() {
+        let (_tmp, mut notes) = mk_store();
+        let e = notes
+            .resolve(&NoteResolveParams {
+                id: "does-not-exist".into(),
+                resolution: "addressed".into(),
+                note: None,
+            })
+            .unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("note-<8hex>"), "error should hint at format: {msg}");
     }
 
     #[test]

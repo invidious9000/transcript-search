@@ -131,7 +131,7 @@ use threads::{ThreadListParams, ThreadParams};
 
 #[tool_router(router = bbox_tools)]
 impl BlackboxServer {
-    #[tool(name = "bbox_search", description = "Full-text search across Claude Code conversation transcripts from all accounts. Returns ranked results with excerpts.")]
+    #[tool(name = "bbox_search", description = "Full-text search across all indexed transcripts.")]
     fn bbox_search(&self, Parameters(p): Parameters<SearchParams>) -> CallToolResult {
         Self::run("bbox_search", || {
             let mut idx = self.state.idx.write();
@@ -143,122 +143,122 @@ impl BlackboxServer {
         })
     }
 
-    #[tool(name = "bbox_cite", description = "Trace a claim, rule, or phrase back to the transcript turn that established it. Defaults to role=user (origin of most rules); returns citations oldest-first.")]
+    #[tool(name = "bbox_cite", description = "Trace a claim back to the turn that established it.")]
     fn bbox_cite(&self, Parameters(p): Parameters<CiteParams>) -> CallToolResult {
         Self::run("bbox_cite", || self.state.idx.read().cite(&p))
     }
 
-    #[tool(name = "bbox_context", description = "Get conversation context around a specific point in a transcript. Use after bbox_search.")]
+    #[tool(name = "bbox_context", description = "Conversation context around a specific byte offset.")]
     fn bbox_context(&self, Parameters(p): Parameters<ContextParams>) -> CallToolResult {
         Self::run("bbox_context", || self.state.idx.read().context(&p))
     }
 
-    #[tool(name = "bbox_session", description = "Get summary info for a session: first prompt, project, duration, tool usage, message counts.")]
+    #[tool(name = "bbox_session", description = "Summary metadata for a single session.")]
     fn bbox_session(&self, Parameters(p): Parameters<SessionParams>) -> CallToolResult {
         Self::run("bbox_session", || self.state.idx.read().session(&p))
     }
 
-    #[tool(name = "bbox_messages", description = "List messages from a session in chronological order. Supports pagination, role filter, tail mode.")]
+    #[tool(name = "bbox_messages", description = "Chronological messages from a session.")]
     fn bbox_messages(&self, Parameters(p): Parameters<MessagesParams>) -> CallToolResult {
         Self::run("bbox_messages", || self.state.idx.read().messages(&p))
     }
 
-    #[tool(name = "bbox_reindex", description = "Build or incrementally update the transcript search index.")]
+    #[tool(name = "bbox_reindex", description = "Build or incrementally update the search index.")]
     fn bbox_reindex(&self, Parameters(p): Parameters<ReindexParams>) -> CallToolResult {
         Self::run("bbox_reindex", || self.state.idx.write().reindex(&p))
     }
 
-    #[tool(name = "bbox_topics", description = "Extract top terms from a session by frequency analysis. No LLM — pure term counting.")]
+    #[tool(name = "bbox_topics", description = "Top terms in a session by frequency.")]
     fn bbox_topics(&self, Parameters(p): Parameters<TopicsParams>) -> CallToolResult {
         Self::run("bbox_topics", || self.state.idx.read().topics(&p))
     }
 
-    #[tool(name = "bbox_sessions_list", description = "Browse sessions across all accounts, sorted by most recent.")]
+    #[tool(name = "bbox_sessions_list", description = "Browse sessions sorted by recency.")]
     fn bbox_sessions_list(&self, Parameters(p): Parameters<SessionsListParams>) -> CallToolResult {
         Self::run("bbox_sessions_list", || self.state.idx.read().sessions_list(&p))
     }
 
-    #[tool(name = "bbox_stats", description = "Corpus statistics: indexed document count, index size, source file counts.")]
+    #[tool(name = "bbox_stats", description = "Corpus statistics (doc count, index size, file counts).")]
     fn bbox_stats(&self) -> CallToolResult {
         Self::run("bbox_stats", || self.state.idx.read().stats())
     }
 
-    #[tool(name = "bbox_learn", description = "Add or update a knowledge entry. Entries are rendered into CLAUDE.md/AGENTS.md/GEMINI.md.")]
+    #[tool(name = "bbox_learn", description = "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files.")]
     fn bbox_learn(&self, Parameters(p): Parameters<LearnParams>) -> CallToolResult {
         Self::run("bbox_learn", || self.state.kb.write().learn(&p, false))
     }
 
-    #[tool(name = "bbox_remember", description = "Store a fact for on-demand recall only — NOT rendered into markdown files.")]
+    #[tool(name = "bbox_remember", description = "Persist a fact for later recall; indexed but NOT rendered.")]
     fn bbox_remember(&self, Parameters(p): Parameters<RememberParams>) -> CallToolResult {
         Self::run("bbox_remember", || self.state.kb.write().remember(&p, false))
     }
 
-    #[tool(name = "bbox_decide", description = "Record a durable decision with required rationale. If 'supersedes' is given, marks the prior entry as superseded and links it to this one.")]
+    #[tool(name = "bbox_decide", description = "Record a durable commitment with required rationale; supports supersession.")]
     fn bbox_decide(&self, Parameters(p): Parameters<DecideParams>) -> CallToolResult {
         Self::run("bbox_decide", || self.state.kb.write().decide(&p, false))
     }
 
-    #[tool(name = "bbox_knowledge", description = "List/search knowledge entries with filters.")]
+    #[tool(name = "bbox_knowledge", description = "Query stored entries by free-text or filters. First tool call on any substantive task per the CORE RULE above.")]
     fn bbox_knowledge(&self, Parameters(p): Parameters<KnowledgeListParams>) -> CallToolResult {
         Self::run("bbox_knowledge", || self.state.kb.write().list(&p))
     }
 
-    #[tool(name = "bbox_forget", description = "Remove or supersede a knowledge entry.")]
+    #[tool(name = "bbox_forget", description = "Retire or supersede an entry.")]
     fn bbox_forget(&self, Parameters(p): Parameters<ForgetParams>) -> CallToolResult {
         Self::run("bbox_forget", || self.state.kb.write().forget(&p))
     }
 
-    #[tool(name = "bbox_render", description = "Render knowledge entries into provider markdown files.")]
+    #[tool(name = "bbox_render", description = "Render entries into CLAUDE.md / AGENTS.md / GEMINI.md.")]
     fn bbox_render(&self, Parameters(p): Parameters<RenderParams>) -> CallToolResult {
         Self::run("bbox_render", || self.state.kb.read().render(&p))
     }
 
-    #[tool(name = "bbox_absorb", description = "Absorb external changes from rendered files back into knowledge store.")]
+    #[tool(name = "bbox_absorb", description = "Import external edits to rendered files back as unverified entries.")]
     fn bbox_absorb(&self, Parameters(p): Parameters<AbsorbParams>) -> CallToolResult {
         Self::run("bbox_absorb", || self.state.kb.write().absorb(&p))
     }
 
-    #[tool(name = "bbox_lint", description = "Health check: find contradictions, stale entries, duplicates.")]
+    #[tool(name = "bbox_lint", description = "Health check for contradictions, stale entries, duplicates.")]
     fn bbox_lint(&self) -> CallToolResult {
         Self::run("bbox_lint", || self.state.kb.read().lint())
     }
 
-    #[tool(name = "bbox_review", description = "Review unverified entries. List, approve, or reject.")]
+    #[tool(name = "bbox_review", description = "Approve or reject entries awaiting review.")]
     fn bbox_review(&self, Parameters(p): Parameters<ReviewParams>) -> CallToolResult {
         Self::run("bbox_review", || self.state.kb.write().review(&p))
     }
 
-    #[tool(name = "bbox_bootstrap", description = "Bootstrap a new repo into the blackbox knowledge system.")]
+    #[tool(name = "bbox_bootstrap", description = "Onboard a new repo into the blackbox knowledge system.")]
     fn bbox_bootstrap(&self, Parameters(p): Parameters<BootstrapParams>) -> CallToolResult {
         Self::run("bbox_bootstrap", || self.state.kb.read().bootstrap(&p))
     }
 
-    #[tool(name = "bbox_thread", description = "Manage work threads — lightweight continuity tracker for non-dispatchable work.")]
+    #[tool(name = "bbox_thread", description = "Open / continue / resolve / promote / rename / link a work thread.")]
     fn bbox_thread(&self, Parameters(p): Parameters<ThreadParams>) -> CallToolResult {
         Self::run("bbox_thread", || self.state.threads.write().thread(&p))
     }
 
-    #[tool(name = "bbox_thread_list", description = "List and scan work threads. Shows open/active/stale threads by default.")]
+    #[tool(name = "bbox_thread_list", description = "Scan open / active / stale threads.")]
     fn bbox_thread_list(&self, Parameters(p): Parameters<ThreadListParams>) -> CallToolResult {
         Self::run("bbox_thread_list", || self.state.threads.read().thread_list(&p))
     }
 
-    #[tool(name = "bbox_note", description = "Record a structured side-channel note (dispute, assumption, surprise, followup, blocked, learned, done). Executors should emit these during work so the orchestrator can scan a compact trail instead of re-parsing prose.")]
+    #[tool(name = "bbox_note", description = "Record a structured side-channel note while working.")]
     fn bbox_note(&self, Parameters(p): Parameters<NoteParams>) -> CallToolResult {
         Self::run("bbox_note", || self.state.notes.write().create(&p))
     }
 
-    #[tool(name = "bbox_notes", description = "List/filter notes by kind, project, session, thread, or resolution.")]
+    #[tool(name = "bbox_notes", description = "List / filter notes by kind, project, session, thread, resolution.")]
     fn bbox_notes(&self, Parameters(p): Parameters<NoteListParams>) -> CallToolResult {
         Self::run("bbox_notes", || self.state.notes.read().list(&p))
     }
 
-    #[tool(name = "bbox_note_resolve", description = "Mark a note as acknowledged or addressed. Optional resolution note.")]
+    #[tool(name = "bbox_note_resolve", description = "Mark a note acknowledged or addressed.")]
     fn bbox_note_resolve(&self, Parameters(p): Parameters<NoteResolveParams>) -> CallToolResult {
         Self::run("bbox_note_resolve", || self.state.notes.write().resolve(&p))
     }
 
-    #[tool(name = "bbox_inbox", description = "Attention layer: aggregates unresolved notes (disputes/blocked/surprises), deferred followups, stale threads, unverified knowledge, and failed bro tasks. Morning-brief / pre-round scan.")]
+    #[tool(name = "bbox_inbox", description = "Aggregate attention layer across every store.")]
     fn bbox_inbox(&self, Parameters(p): Parameters<InboxParams>) -> CallToolResult {
         Self::run("bbox_inbox", || {
             let kb = self.state.kb.read();
@@ -641,7 +641,7 @@ fn spawn_progress_notifier(
 
 #[tool_router(router = bro_tools)]
 impl BlackboxServer {
-    #[tool(name = "bro_exec", description = "Launch an agent task. Returns {taskId, sessionId} immediately. Prefer named bro over raw provider.")]
+    #[tool(name = "bro_exec", description = "Launch an agent task. Returns {taskId, sessionId} immediately.")]
     async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let store_dir = self.state.store_dir.clone();
@@ -710,7 +710,7 @@ impl BlackboxServer {
         }))
     }
 
-    #[tool(name = "bro_resume", description = "Resume a previous agent session with a follow-up prompt. Returns a new taskId on the same session.")]
+    #[tool(name = "bro_resume", description = "Continue an existing session with a follow-up.")]
     async fn bro_resume(&self, Parameters(p): Parameters<ResumeParams>) -> CallToolResult {
         let store_dir = self.state.store_dir.clone();
 
@@ -782,7 +782,7 @@ impl BlackboxServer {
         }))
     }
 
-    #[tool(name = "bro_wait", description = "Block until a task completes. USE MAXIMUM TIMEOUT. With timeout_seconds, returns a progress snapshot if not finished yet.")]
+    #[tool(name = "bro_wait", description = "Block until a single task completes.")]
     async fn bro_wait(
         &self,
         Parameters(p): Parameters<WaitParams>,
@@ -813,7 +813,7 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(name = "bro_when_all", description = "Block until ALL tasks complete. Accepts team name or task_ids array. USE MAXIMUM TIMEOUT.")]
+    #[tool(name = "bro_when_all", description = "Block until ALL tasks / team members complete.")]
     async fn bro_when_all(
         &self,
         Parameters(p): Parameters<WhenParams>,
@@ -868,7 +868,7 @@ impl BlackboxServer {
         Self::ok_json(&json!({ "all_completed": all_done, "results": results }))
     }
 
-    #[tool(name = "bro_when_any", description = "Block until the FIRST task completes. Returns all current states. USE MAXIMUM TIMEOUT.")]
+    #[tool(name = "bro_when_any", description = "Block until the FIRST task completes.")]
     async fn bro_when_any(
         &self,
         Parameters(p): Parameters<WhenParams>,
@@ -939,7 +939,7 @@ impl BlackboxServer {
         Self::ok_json(&json!({ "any_completed": any_completed, "results": results }))
     }
 
-    #[tool(name = "bro_broadcast", description = "Send same prompt to every team member. Follow with bro_when_all or bro_when_any.")]
+    #[tool(name = "bro_broadcast", description = "Send the same prompt to every team member.")]
     async fn bro_broadcast(&self, Parameters(p): Parameters<BroadcastParams>) -> CallToolResult {
         let _team_lock = orchestration::team::lock_teams();
         let team = match orchestration::team::load_team(&p.team, &self.state.store_dir) {
@@ -1061,7 +1061,7 @@ impl BlackboxServer {
         Self::ok_json(&json!({"team": p.team, "tasks": launched}))
     }
 
-    #[tool(name = "bro_status", description = "Non-blocking progress check. Returns current state without waiting.")]
+    #[tool(name = "bro_status", description = "Non-blocking progress check on a task.")]
     fn bro_status(&self, Parameters(p): Parameters<StatusParams>) -> CallToolResult {
         match self.state.task_store.read().get(&p.task_id) {
             Some(task) => Self::ok_json(&orch::task_status_json(&task, p.tail.unwrap_or(0))),
@@ -1069,7 +1069,7 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(name = "bro_dashboard", description = "List recent tasks and sessions. Use to look up a taskId or sessionId.")]
+    #[tool(name = "bro_dashboard", description = "List recent tasks / sessions.")]
     fn bro_dashboard(&self, Parameters(p): Parameters<DashboardParams>) -> CallToolResult {
         let store = self.state.task_store.read();
         let limit = p.limit.unwrap_or(20);
@@ -1115,7 +1115,7 @@ impl BlackboxServer {
         Self::ok_json(&json!({"count": entries.len(), "tasks": entries}))
     }
 
-    #[tool(name = "bro_prune", description = "Drop terminal tasks from the in-memory store + persisted tasks.json. Defaults to status=failed. Filters: status, provider, older_than_hours. Use dry_run=true to preview. Never touches running tasks.")]
+    #[tool(name = "bro_prune", description = "Drop terminal tasks from the store + persisted tasks.json.")]
     fn bro_prune(&self, Parameters(p): Parameters<PruneParams>) -> CallToolResult {
         let target_status = p.status.as_deref().unwrap_or("failed");
         let allowed = ["failed", "completed", "cancelled"];
@@ -1176,7 +1176,7 @@ impl BlackboxServer {
         }))
     }
 
-    #[tool(name = "bro_cancel", description = "Cancel a running task (sends SIGTERM).")]
+    #[tool(name = "bro_cancel", description = "Cancel a running task (SIGTERM).")]
     fn bro_cancel(&self, Parameters(p): Parameters<CancelParams>) -> CallToolResult {
         let task = match self.state.task_store.read().get(&p.task_id) {
             Some(t) => t,
@@ -1199,7 +1199,7 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(name = "bro_providers", description = "List configured providers, binary paths, and available models.")]
+    #[tool(name = "bro_providers", description = "List configured providers, binaries, models.")]
     fn bro_providers(&self) -> CallToolResult {
         let mut info = serde_json::Map::new();
         for p in Provider::ALL {
@@ -1224,7 +1224,7 @@ impl BlackboxServer {
         Self::ok_json(&Value::Object(info))
     }
 
-    #[tool(name = "bro_brofile", description = "Manage brofile templates and accounts. Actions: create, list, get, delete, set_account, list_accounts.")]
+    #[tool(name = "bro_brofile", description = "Manage brofile templates + accounts (provider+account+lens).")]
     fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
         let store_dir = &self.state.store_dir;
@@ -1287,12 +1287,12 @@ impl BlackboxServer {
         }
     }
 
-    #[tool(name = "bro_mcp", description = "Manage MCP servers + tool filters for dispatched bros. Actions: list, get, add, remove, allow, disallow, clear_filters, sync. Global-scope add/remove fans out to each installed provider's CLI (Claude/Copilot/Codex/Gemini).")]
+    #[tool(name = "bro_mcp", description = "Manage MCP servers + tool filters for dispatched bros.")]
     fn bro_mcp(&self, Parameters(p): Parameters<orchestration::mcp::McpToolParams>) -> CallToolResult {
         Self::run("bro_mcp", || orchestration::mcp::handle(&p))
     }
 
-    #[tool(name = "bro_team", description = "Manage teamplates and teams. Actions: save_template, list_templates, delete_template, create, list, dissolve, roster.")]
+    #[tool(name = "bro_team", description = "Manage teamplates and instantiated teams.")]
     fn bro_team(&self, Parameters(p): Parameters<TeamParams>) -> CallToolResult {
         use orchestration::team;
         let store_dir = &self.state.store_dir;

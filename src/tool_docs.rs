@@ -133,8 +133,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
-        summary: "Persist a rule or convention; rendered into provider markdown files.",
-        when_to_use: "User-stated rule, convention, or preference meant to bind future sessions — positive or negative, project-wide or global. Triggers include 'from now on', 'always X', 'never X', 'we (don't) use Y', 'prefer Y', 'X is banned / retired / out of scope', 'stop using X', 'house rule', 'standing order'. Implementation ≠ rule: a .gitignore, linter config, or deleted dependency enforces the rule for *now* but won't transmit the *intent* to a future session that doesn't see this turn. After implementing a user policy in code/config, ask: did the user state a standing rule that should outlive this edit? If yes, also call `bbox_learn`. Scope test — only call if the statement would still matter after this edit is reverted or forgotten; don't store one-off task constraints like 'for this fix, skip tests'. Distinct from `bbox_note(kind=learned)` which is for what YOU observed about the codebase during work — this tool is for what the USER told you. Renders into every agent's CLAUDE.md / AGENTS.md / GEMINI.md after `bbox_render`.",
+        summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files.",
+        when_to_use: "A standing rule stated by the USER that must outlive the current edit — 'from now on', 'always X', 'never X', 'house rule', 'standing order', 'we (don't) use Y'. Implementation alone (a .gitignore, linter config, deleted code) enforces the rule for *now* but doesn't transmit intent to a future session. Not for one-off task constraints, and not for facts YOU observed — use `bbox_remember` or `bbox_note(kind=learned)` for those. See the 'Persistence hierarchy' in the workflow notes for the full taxonomy. Before calling, `bbox_knowledge(query=<keyword>)` to check for an existing matching entry (see 'Create etiquette').",
         example: Some(r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#),
     },
     ToolDoc {
@@ -148,8 +148,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_decide",
         category: ToolCategory::Knowledge,
         summary: "Record a durable commitment with required rationale; supports supersession.",
-        when_to_use: "You're locking in a design choice or reversing a prior decision. Rationale is required. Passing `supersedes` marks the prior entry superseded and links them.",
-        example: Some(r#"bbox_decide(content="use RocksDB for cache", rationale="SQLite locking conflicted with concurrent writers", supersedes="8a3f...")"#),
+        when_to_use: "You're locking in a design choice or reversing a prior decision. Rationale is required. Before calling, `bbox_knowledge(query=<keyword>, project=<cwd>)` to find the prior decision this one replaces — pass its ID as `supersedes` to mark it superseded and link the two (see 'Create etiquette'). `id` format for `supersedes` is the bare 8-hex knowledge entry ID (no prefix).",
+        example: Some(r#"bbox_decide(content="use RocksDB for cache", rationale="SQLite locking conflicted with concurrent writers", supersedes="8a3f12cd")"#),
     },
     ToolDoc {
         name: "bbox_knowledge",
@@ -206,7 +206,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_thread",
         category: ToolCategory::Threads,
         summary: "Open / continue / resolve / promote / rename / link a work thread.",
-        when_to_use: "Investigation or QC walk that may span sessions; deferred work too informal for a finding. Check `bbox_thread_list` first — a thread may already exist. Use `kind=work_item` for orchestrator-led dispatch loops.",
+        when_to_use: "Investigation or QC walk that may span sessions; deferred work too informal for a finding. Before `action=open`, call `bbox_thread_list` to check for an existing same-topic thread (see 'Create etiquette' in the workflow notes). Use `kind=work_item` for orchestrator-led dispatch loops.",
         example: Some(r#"bbox_thread(action="open", topic="audit the dispatch path", project="/repo/x", kind="work_item")"#),
     },
     ToolDoc {
@@ -236,8 +236,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note_resolve",
         category: ToolCategory::Notes,
         summary: "Mark a note acknowledged or addressed.",
-        when_to_use: "Orchestrator's close-the-loop move. Addressed notes drop from the default inbox view.",
-        example: None,
+        when_to_use: "Orchestrator's close-the-loop move. Addressed notes drop from the default inbox view. `id` is the full `note-<8hex>` as returned by `bbox_note` and shown in `bbox_notes` / `bbox_inbox` — pass it verbatim, do not strip the `note-` prefix. Resolutions: `acknowledged` (seen, deferred), `addressed` (acted on — removes from default inbox view), `unresolved` (re-open).",
+        example: Some(r#"bbox_note_resolve(id="note-a1b2c3d4", resolution="addressed", note="fixed in commit abc123")"#),
     },
 
     // ── Inbox ────────────────────────────────────────────────────────
@@ -331,26 +331,36 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_brofile",
         category: ToolCategory::Orchestration,
         summary: "Manage brofile templates + accounts (provider+account+lens).",
-        when_to_use: "Create / list / get / delete brofiles; set accounts. Brofiles are reusable team-member blueprints.",
-        example: None,
+        when_to_use: "Create / list / get / delete brofiles; set accounts. Brofiles are reusable team-member blueprints. Before `action=create`, call `action=list` first — a matching brofile may already exist (see 'Create etiquette').",
+        example: Some(r#"bro_brofile(action="list")"#),
     },
     ToolDoc {
         name: "bro_team",
         category: ToolCategory::Orchestration,
         summary: "Manage teamplates and instantiated teams.",
-        when_to_use: "Save / list / delete teamplates; create / list / dissolve teams; show roster. A team = instantiated teamplate with named bro instances tracking their own sessionIds.",
-        example: None,
+        when_to_use: "Save / list / delete teamplates; create / list / dissolve teams; show roster. A team = instantiated teamplate with named bro instances tracking their own sessionIds. Before `save_template` run `list_templates`; before `create` run `list`; both are dedupe-sensitive (see 'Create etiquette').",
+        example: Some(r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#),
     },
     ToolDoc {
         name: "bro_mcp",
         category: ToolCategory::Orchestration,
         summary: "Manage MCP servers + tool filters for dispatched bros.",
-        when_to_use: "Add/remove MCP servers visible to dispatched bros (fans out to Claude/Copilot/Codex/Gemini CLIs on global-scope writes). Allow/disallow tool patterns for mechanical filtering — default disallow `mcp__blackbox__bro_*` replaces the text recursion guard on providers that support dispatch-time filtering (Claude, Copilot). Actions: list, get, add, remove, allow, disallow, clear_filters, sync.",
+        when_to_use: "Add/remove MCP servers visible to dispatched bros (fans out to Claude/Copilot/Codex/Gemini CLIs on global-scope writes). Allow/disallow tool patterns for mechanical filtering — default disallow `mcp__blackbox__bro_*` replaces the text recursion guard on providers that support dispatch-time filtering (Claude, Copilot). Before `action=add`, call `action=list` to check for an existing entry (see 'Create etiquette'). Actions: list, get, add, remove, allow, disallow, clear_filters, sync.",
         example: Some(r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#),
     },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
+## Create etiquette — check stock before ordering
+
+Before any create/open/save/add action that could duplicate an existing \
+object, call the list/get/search variant first to look for an existing \
+same-name or same-topic entry. Applies to brofiles (`bro_brofile list`), \
+teamplates and teams (`bro_team list_templates` / `list`), MCP servers \
+(`bro_mcp list`), work threads (`bbox_thread_list`), and dedupe-sensitive \
+knowledge writes (`bbox_knowledge` before `bbox_learn` / `bbox_decide`). \
+Reuse or update an existing match instead of creating a duplicate.
+
 ## Roles and the core loop
 
 Blackbox supports a two-role workflow across multi-provider dispatch:
@@ -558,22 +568,91 @@ mod tests {
         assert!(md.contains("Persistence hierarchy"));
     }
 
-    #[test]
-    fn every_registered_tool_has_a_doc() {
-        // Greps main.rs for `#[tool(name = "bbox_..." / "bro_..."` and
-        // asserts each name has a ToolDoc stanza. Source-of-truth check.
-        let main_rs = include_str!("main.rs");
-        let mut registered: Vec<String> = Vec::new();
-        for line in main_rs.lines() {
-            if let Some(rest) = line.trim_start().strip_prefix("#[tool(name = \"") {
-                if let Some(end) = rest.find('"') {
-                    let name = &rest[..end];
-                    if name.starts_with("bbox_") || name.starts_with("bro_") {
-                        registered.push(name.to_string());
+    /// Parse `#[tool(...)]` attributes from main.rs. Tolerates:
+    ///   - single-line and multi-line attribute bodies
+    ///   - `name` and `description` in any order
+    ///   - arbitrary whitespace between `=` and the string literal
+    ///
+    /// Does NOT tolerate: escaped double-quotes inside the string literal
+    /// (none of our descriptions need them). Returns (name, description)
+    /// pairs. If either field is absent on a given attr, that attr is
+    /// skipped — `every_registered_tool_has_a_doc` covers the missing-doc
+    /// case separately.
+    fn parse_registered_tools() -> Vec<(String, String)> {
+        let src = include_str!("main.rs");
+        let mut out = Vec::new();
+        let mut cursor = 0;
+        while let Some(open) = src[cursor..].find("#[tool(") {
+            let attr_start = cursor + open + "#[tool(".len();
+            // Find the matching `)]` — simple paren-balance, which is
+            // fine since our attr bodies never contain raw parens.
+            let mut depth = 1;
+            let mut i = attr_start;
+            let bytes = src.as_bytes();
+            let mut in_str = false;
+            while i < bytes.len() && depth > 0 {
+                let c = bytes[i] as char;
+                if in_str {
+                    if c == '\\' { i += 2; continue; }
+                    if c == '"' { in_str = false; }
+                } else {
+                    match c {
+                        '"' => in_str = true,
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
                     }
+                }
+                i += 1;
+            }
+            if depth != 0 { break; }
+            let body = &src[attr_start..i - 1];
+            cursor = i;
+
+            let name = extract_string_arg(body, "name");
+            let desc = extract_string_arg(body, "description");
+            if let (Some(n), Some(d)) = (name, desc) {
+                if n.starts_with("bbox_") || n.starts_with("bro_") {
+                    out.push((n, d));
                 }
             }
         }
+        out
+    }
+
+    /// Extract `key = "value"` from an attribute body. Whitespace-tolerant.
+    /// Returns the unescaped `value` (no escape processing needed in our
+    /// current corpus).
+    fn extract_string_arg(body: &str, key: &str) -> Option<String> {
+        let needle = format!("{key}");
+        let mut start = 0;
+        while let Some(pos) = body[start..].find(&needle) {
+            let abs = start + pos;
+            // Require preceding char to be non-identifier (start-of-body,
+            // whitespace, or comma) so `description` doesn't match inside
+            // some other identifier.
+            let ok_before = abs == 0
+                || matches!(body.as_bytes()[abs - 1] as char, ' ' | '\t' | '\n' | '\r' | ',' | '(');
+            start = abs + needle.len();
+            if !ok_before { continue; }
+            let after = &body[start..];
+            let after = after.trim_start();
+            let Some(after) = after.strip_prefix('=') else { continue };
+            let after = after.trim_start();
+            let Some(after) = after.strip_prefix('"') else { continue };
+            let end = after.find('"')?;
+            return Some(after[..end].to_string());
+        }
+        None
+    }
+
+    #[test]
+    fn every_registered_tool_has_a_doc() {
+        // Asserts each #[tool]-registered name has a ToolDoc stanza.
+        let registered: Vec<String> = parse_registered_tools()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         assert!(!registered.is_empty(), "no tools found in main.rs — parse regressed");
 
         let documented: std::collections::HashSet<&str> =
@@ -600,6 +679,38 @@ mod tests {
         assert!(
             extra.is_empty(),
             "ToolDoc stanzas without a matching #[tool] registration: {extra:?}"
+        );
+    }
+
+    #[test]
+    fn description_summary_parity() {
+        // Fourth-surface invariant: the per-call chooser blurb in
+        // `#[tool(description = ...)]` (src/main.rs) must equal the
+        // managed-layer `ToolDoc.summary` (this file). They're the same
+        // text to the agent — let them drift and the agent gets
+        // contradictory guidance at the two surfaces. See the
+        // `bb846aad` decision entry for the four-surface policy.
+        let registered = parse_registered_tools();
+        let summaries: std::collections::HashMap<&str, &str> = TOOL_DOCS
+            .iter()
+            .map(|d| (d.name, d.summary))
+            .collect();
+
+        let mut mismatches: Vec<String> = Vec::new();
+        for (name, desc) in &registered {
+            let Some(summary) = summaries.get(name.as_str()) else { continue };
+            if desc != *summary {
+                mismatches.push(format!(
+                    "\n  {name}:\n    main.rs    : {desc:?}\n    tool_docs  : {summary:?}",
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "#[tool(description)] strings in main.rs must match the corresponding \
+             ToolDoc.summary strings in tool_docs.rs. Mismatches:{}",
+            mismatches.join(""),
         );
     }
 }

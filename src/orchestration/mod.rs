@@ -247,12 +247,9 @@ impl TaskStore {
 /// the extra reinforcement is harmless. Parallels the empirical
 /// fix for `bbox_note` emission (DEFAULT_COMPLETION_CONTRACT below).
 pub const RECALL_DIRECTIVE: &str = "\
-Your FIRST tool call on any substantive task must be \
-`bbox_knowledge(query=<one keyword>)` to check for stored project-\
-specific context. Use a distinctive keyword; if empty, try 1-2 \
-different keywords before falling back to filesystem probing or \
-training-prior inference. A wasted query costs near-nothing; a \
-confident wrong answer wastes the task.";
+Recall: your FIRST tool call on any substantive task must be \
+`bbox_knowledge(query=<one keyword>)`. Justification and fallback \
+procedure are in the managed tool reference.";
 
 /// Default per-dispatch contract requiring a structured completion
 /// signal before the agent returns. Observed empirically: without
