@@ -84,6 +84,35 @@ bbox_render(scope: "both", project: "/home/you/repos/my-app")
 
 From this point on: `bbox_learn` / `bbox_remember` to add or update, `bbox_render` to push changes out to provider files, `bbox_absorb` to pull external edits back in. See [Knowledge lifecycle](#knowledge-lifecycle) below for the full loop.
 
+### 6. Migrate hand-authored content (one-time, per scope)
+
+> **Critical**: pre-existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content is **not deleted** by `bbox_bootstrap` or `bbox_render`. Without explicit migration, the same rules end up in the file **twice** — once as your original prose, once again rendered inside the bbox managed region. Agents read both and get confused.
+
+The migration loop is the same for global and project scope:
+
+1. **Inspect** what bbox would write (dry-run):
+   ```
+   bbox_render(scope: "global",  dry_run: true)
+   bbox_render(scope: "project", project: "/home/you/repos/my-app", dry_run: true)
+   ```
+2. **Absorb** any hand-authored content you want to keep into the store (creates `Imported` entries):
+   - **Global**: `bbox_absorb(scope: "global")` reads ONLY the managed region between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. Content outside the markers (RTK steerage, your own notes) is left alone.
+   - **Project**: `bbox_absorb(project: "/home/you/repos/my-app")` reads the WHOLE rendered file (project files are entirely bbox-rendered).
+3. **Review + approve** the imports:
+   ```
+   bbox_review(action: "list")               # see imports
+   bbox_review(action: "approve", id: "…")   # promote each one to verified
+   ```
+4. **Prune** the original hand-authored content from the file:
+   - **Global** files: delete content **inside** the managed region that's now also stored in bbox; leave RTK `@imports` and your own notes outside the markers untouched.
+   - **Project** files (`<repo>/CLAUDE.md` etc.): if you want everything bbox-managed, delete the entire file's contents — `bbox_render scope=project` will recreate it from the store. If you want a hybrid, leave the section above the managed region.
+5. **Render** to confirm a clean output:
+   ```
+   bbox_render(scope: "both", project: "/home/you/repos/my-app")
+   ```
+
+After step 5 the rendered file should match the bbox managed region with no duplicates. Subsequent edits go through `bbox_learn` / `bbox_remember` (write) and `bbox_render` (publish); `bbox_absorb` is for catching out-of-band edits made directly in the rendered file.
+
 ---
 
 ## Knowledge lifecycle
@@ -117,7 +146,7 @@ Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMI
 | **`bbox_remember`** | Store an on-demand fact. **NOT rendered** into markdown — searchable via `bbox_knowledge` only. |
 | **`bbox_knowledge`** | List / search entries with category / scope / provider filters. |
 | **`bbox_render`** | Emit the canonical store back to provider instruction files (global / project / both). |
-| **`bbox_absorb`** | Detect external edits to rendered files and import them as unverified entries. |
+| **`bbox_absorb`** | Detect external edits to rendered files and import them as unverified entries. `scope=project` (default) reads the whole `<repo>/{CLAUDE,AGENTS,GEMINI}.md`; `scope=global` reads only the managed region of `~/.claude-shared/CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md`. |
 | **`bbox_review`** | Approve or reject unverified entries (from bootstrap or absorb). |
 | **`bbox_forget`** | Remove or supersede an entry. |
 | **`bbox_lint`** | Health check: contradictions, stale entries, duplicates. |
