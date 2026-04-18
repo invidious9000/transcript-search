@@ -69,7 +69,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_search",
         category: ToolCategory::Transcripts,
         summary: "Full-text search across all indexed transcripts.",
-        when_to_use: "User asks 'when did we discuss X' / 'find the session where Y' / 'what did codex say about Z'. Filterable by account, project, role.",
+        when_to_use: "User asks 'when did we discuss X' / 'find the session where Y' / 'what did codex say about Z'. Filterable by account, project, role. Pass exclude_self=true to suppress the caller's own current session via tail-content heuristic (off by default).",
         example: Some(r#"bbox_search(query="redis locking", project="my-app", role="user")"#),
     },
     ToolDoc {
@@ -492,7 +492,7 @@ pub fn sync_into_knowledge(kb: &mut crate::knowledge::Knowledge) -> Result<SyncR
         }
     }
 
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let now = crate::util::now_iso();
     let entry = KnowledgeEntry {
         id: TOOL_DOC_ENTRY_ID.to_string(),
         title: "Blackbox tool reference".to_string(),

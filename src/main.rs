@@ -7,6 +7,7 @@ mod parser;
 mod render;
 mod threads;
 mod tool_docs;
+mod util;
 
 use std::io;
 use std::path::{Path, PathBuf};

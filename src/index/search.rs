@@ -34,6 +34,12 @@ pub struct SearchParams {
     #[serde(default)] pub include_subagents: Option<bool>,
     /// Max results (default: 20, max: 100)
     #[serde(default)] pub limit: Option<u64>,
+    /// Auto-exclude the caller's own session by detecting which active
+    /// transcript contains this query as a recent user message
+    /// (self-reference suppression). Defaults to false — opt-in. Enable
+    /// when an interactive agent is searching for context derived from
+    /// its own current turn and would otherwise see itself in results.
+    #[serde(default)] pub exclude_self: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -165,16 +171,23 @@ impl TranscriptIndex {
             }
         }
 
-        // Auto-exclude the caller's own session by detecting which active session
-        // contains the search query as a recent user message (self-reference).
-        if let Some(caller_sid) = detect_caller_session(&self.config, query_str) {
-            clauses.push((
-                Occur::MustNot,
-                Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.session_id, &caller_sid),
-                    IndexRecordOption::Basic,
-                )),
-            ));
+        // Caller-session auto-exclude. Disabled by default — the heuristic
+        // (find an active transcript whose tail contains this query as a
+        // recent user message) is best-effort and can mis-attribute when
+        // multiple agents share the host or when the same query phrase
+        // legitimately appears in unrelated sessions. Opt in via
+        // `exclude_self=true` from interactive callers that genuinely
+        // need to suppress self-reference.
+        if p.exclude_self.unwrap_or(false) {
+            if let Some(caller_sid) = detect_caller_session(&self.config, query_str) {
+                clauses.push((
+                    Occur::MustNot,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(self.fields.session_id, &caller_sid),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
+            }
         }
 
         let query = BooleanQuery::new(clauses);
