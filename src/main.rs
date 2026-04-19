@@ -238,9 +238,14 @@ impl BlackboxServer {
         Self::run("bbox_thread", || self.state.threads.write().thread(&p))
     }
 
-    #[tool(name = "bbox_thread_list", description = "Scan open / active / stale threads.")]
+    #[tool(
+        name = "bbox_thread_list",
+        description = "Scan threads by lifecycle status and idle age."
+    )]
     fn bbox_thread_list(&self, Parameters(p): Parameters<ThreadListParams>) -> CallToolResult {
-        Self::run("bbox_thread_list", || self.state.threads.read().thread_list(&p))
+        Self::run("bbox_thread_list", || {
+            self.state.threads.read().thread_list(&p)
+        })
     }
 
     #[tool(name = "bbox_note", description = "Record a structured side-channel note while working.")]

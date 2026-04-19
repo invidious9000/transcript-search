@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 pub struct ThreadParams {
     /// get, open, continue, link, resolve, promote, rename
     pub action: String,
-    #[serde(default)] pub name: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
     /// Thread ID. Canonical form is `thread-<8 hex>` (e.g. `thread-7f01324e`)
     /// — the exact string returned by `bbox_thread(action="open")` and listed
     /// by `bbox_thread_list`. Required for `continue`, `resolve`, `rename`,
@@ -27,30 +28,50 @@ pub struct ThreadParams {
     #[serde(default)]
     #[schemars(regex(pattern = r"^(thread-)?[0-9a-f]{8}$"))]
     pub id: Option<String>,
-    #[serde(default)] pub topic: Option<String>,
-    #[serde(default)] pub project: Option<String>,
-    #[serde(default)] pub session_id: Option<String>,
-    #[serde(default)] pub provider: Option<String>,
-    #[serde(default)] pub session_name: Option<String>,
-    #[serde(default)] pub handoff_doc: Option<String>,
-    #[serde(default)] pub note: Option<String>,
-    #[serde(default)] pub target: Option<String>,
-    #[serde(default)] pub target_type: Option<String>,
-    #[serde(default)] pub edge: Option<String>,
-    #[serde(default)] pub promoted_to: Option<String>,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub session_name: Option<String>,
+    #[serde(default)]
+    pub handoff_doc: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub target_type: Option<String>,
+    #[serde(default)]
+    pub edge: Option<String>,
+    #[serde(default)]
+    pub promoted_to: Option<String>,
     /// Thread kind (e.g. "work_item"). Optional; defaults to general.
-    #[serde(default)] pub kind: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ThreadListParams {
-    #[serde(default)] pub status: Option<String>,
-    #[serde(default)] pub project: Option<String>,
-    #[serde(default)] pub name: Option<String>,
-    #[serde(default)] pub stale_days: Option<u64>,
-    #[serde(default)] pub include_resolved: Option<bool>,
+    /// Filter by lifecycle status: open, active, resolved, promoted.
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Return only threads idle for at least this many days.
+    #[serde(default)]
+    pub min_idle_days: Option<u64>,
+    #[serde(default)]
+    pub include_resolved: Option<bool>,
     /// Filter by thread kind (e.g. "work_item")
-    #[serde(default)] pub kind: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -61,13 +82,14 @@ pub struct ThreadListParams {
 pub enum ThreadStatus {
     Open,
     Active,
-    Stale,
     Resolved,
     /// graduated to graph (finding/inquiry/task)
     Promoted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr,
+)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ThreadKind {
@@ -232,7 +254,9 @@ impl Threads {
             "resolve" => self.thread_resolve(p),
             "promote" => self.thread_promote(p),
             "rename" => self.thread_rename(p),
-            other => anyhow::bail!("Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"),
+            other => anyhow::bail!(
+                "Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"
+            ),
         }
     }
 
@@ -260,7 +284,12 @@ impl Threads {
             .as_deref()
             .map(ThreadKind::from_str)
             .transpose()
-            .map_err(|_| anyhow::anyhow!("Unknown thread kind: {:?}. Use: work_item, investigation", p.kind))?;
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Unknown thread kind: {:?}. Use: work_item, investigation",
+                    p.kind
+                )
+            })?;
 
         let thread = Thread {
             id: id.clone(),
@@ -289,11 +318,17 @@ impl Threads {
         let thread = if let Some(id) = p.id.as_deref() {
             // Accept bare `<8hex>` as fallback for canonical `thread-<8hex>`
             // — matches the schema regex and the NoteResolveParams policy.
-            self.store.threads.iter().find(|t| t.id == id || t.id.strip_prefix("thread-") == Some(id))
+            self.store
+                .threads
+                .iter()
+                .find(|t| t.id == id || t.id.strip_prefix("thread-") == Some(id))
         } else if let Some(name) = p.name.as_deref() {
             let name_lower = name.to_lowercase();
             self.store.threads.iter().find(|t| {
-                t.name.as_ref().map(|n| n.to_lowercase() == name_lower).unwrap_or(false)
+                t.name
+                    .as_ref()
+                    .map(|n| n.to_lowercase() == name_lower)
+                    .unwrap_or(false)
                     || t.id == name
             })
         } else {
@@ -312,7 +347,14 @@ impl Threads {
         if let Some(k) = thread.kind {
             out.push_str(&format!("Kind: {}\n", k.as_ref()));
         }
-        out.push_str(&format!("Project: {}\n", if thread.project.is_empty() { "-" } else { &thread.project }));
+        out.push_str(&format!(
+            "Project: {}\n",
+            if thread.project.is_empty() {
+                "-"
+            } else {
+                &thread.project
+            }
+        ));
         out.push_str(&format!("Created: {}\n", thread.created_at));
         out.push_str(&format!("Last activity: {}\n", thread.last_activity));
         if let Some(resolved) = &thread.resolved_at {
@@ -332,7 +374,10 @@ impl Threads {
             out.push_str(&format!("\nSessions ({}):\n", thread.sessions.len()));
             for s in &thread.sessions {
                 let display = s.name.as_deref().unwrap_or(&s.session_id);
-                out.push_str(&format!("  - {} ({}) linked {}\n", display, s.provider, s.linked_at));
+                out.push_str(&format!(
+                    "  - {} ({}) linked {}\n",
+                    display, s.provider, s.linked_at
+                ));
             }
         }
 
@@ -342,7 +387,10 @@ impl Threads {
             for e in &thread.edges {
                 let target_label = match e.target_type {
                     EdgeTarget::Thread => {
-                        let name = self.store.threads.iter()
+                        let name = self
+                            .store
+                            .threads
+                            .iter()
                             .find(|t| t.id == e.target)
                             .and_then(|t| t.name.as_deref())
                             .unwrap_or("?");
@@ -350,12 +398,17 @@ impl Threads {
                     }
                     EdgeTarget::Session => {
                         // Check if this session is linked on any thread for a friendly name
-                        let name = self.store.threads.iter()
+                        let name = self
+                            .store
+                            .threads
+                            .iter()
                             .flat_map(|t| t.sessions.iter())
                             .find(|s| s.session_id == e.target)
                             .and_then(|s| s.name.as_deref());
                         match name {
-                            Some(n) => format!("session:{} ({})", &e.target[..e.target.len().min(8)], n),
+                            Some(n) => {
+                                format!("session:{} ({})", &e.target[..e.target.len().min(8)], n)
+                            }
                             None => format!("session:{}", &e.target[..e.target.len().min(8)]),
                         }
                     }
@@ -383,30 +436,43 @@ impl Threads {
 
     fn thread_link(&mut self, p: &ThreadParams) -> Result<String> {
         let id = self.resolve_thread_id(p)?;
-        let target = p.target.as_deref()
+        let target = p
+            .target
+            .as_deref()
             .context("'target' is required (target thread or session ID)")?;
-        let kind_str = p.edge.as_deref()
+        let kind_str = p
+            .edge
+            .as_deref()
             .context("'edge' is required (spawned_from, blocked_by, relates_to, subsumes)")?;
-        let kind = EdgeKind::from_str(kind_str)
-            .map_err(|_| anyhow::anyhow!("Unknown edge kind: {kind_str}. Use: spawned_from, blocked_by, relates_to, subsumes"))?;
+        let kind = EdgeKind::from_str(kind_str).map_err(|_| {
+            anyhow::anyhow!(
+                "Unknown edge kind: {kind_str}. Use: spawned_from, blocked_by, relates_to, subsumes"
+            )
+        })?;
 
         let target_type_str = p.target_type.as_deref().unwrap_or("thread");
-        let target_type = EdgeTarget::from_str(target_type_str)
-            .map_err(|_| anyhow::anyhow!("Unknown target_type: {target_type_str}. Use: thread, session"))?;
+        let target_type = EdgeTarget::from_str(target_type_str).map_err(|_| {
+            anyhow::anyhow!("Unknown target_type: {target_type_str}. Use: thread, session")
+        })?;
 
         // Validate target exists (threads only — sessions are external, trust the caller)
-        if target_type == EdgeTarget::Thread
-            && !self.store.threads.iter().any(|t| t.id == target)
-        {
+        if target_type == EdgeTarget::Thread && !self.store.threads.iter().any(|t| t.id == target) {
             anyhow::bail!("Target thread {target} not found");
         }
 
-        let thread = self.store.threads.iter_mut()
+        let thread = self
+            .store
+            .threads
+            .iter_mut()
             .find(|t| t.id == id)
             .context("Source thread not found")?;
 
         // Check for duplicate edge
-        if thread.edges.iter().any(|e| e.kind == kind && e.target == target && e.target_type == target_type) {
+        if thread
+            .edges
+            .iter()
+            .any(|e| e.kind == kind && e.target == target && e.target_type == target_type)
+        {
             anyhow::bail!("Edge {kind_str} → {target} already exists");
         }
 
@@ -423,7 +489,9 @@ impl Threads {
         let topic = thread.topic.clone();
         self.save()?;
 
-        Ok(format!("Thread {id} ({topic}) — added {kind_str} edge to {target}"))
+        Ok(format!(
+            "Thread {id} ({topic}) — added {kind_str} edge to {target}"
+        ))
     }
 
     /// Resolve a thread by `id` or `name` in the params. Accepts bare
@@ -439,12 +507,17 @@ impl Threads {
             {
                 return Ok(t.id.clone());
             }
-            anyhow::bail!("Thread not found: {id} (expected `thread-<8hex>`, e.g. `thread-7f01324e`)");
+            anyhow::bail!(
+                "Thread not found: {id} (expected `thread-<8hex>`, e.g. `thread-7f01324e`)"
+            );
         }
         if let Some(name) = p.name.as_deref() {
             let name_lower = name.to_lowercase();
             if let Some(t) = self.store.threads.iter().find(|t| {
-                t.name.as_ref().map(|n| n.to_lowercase() == name_lower).unwrap_or(false)
+                t.name
+                    .as_ref()
+                    .map(|n| n.to_lowercase() == name_lower)
+                    .unwrap_or(false)
                     || t.id == name
             }) {
                 return Ok(t.id.clone());
@@ -457,7 +530,10 @@ impl Threads {
     fn thread_continue(&mut self, p: &ThreadParams) -> Result<String> {
         let id = self.resolve_thread_id(p)?;
 
-        let thread = self.store.threads.iter_mut()
+        let thread = self
+            .store
+            .threads
+            .iter_mut()
             .find(|t| t.id == id)
             .context("Thread not found")?;
 
@@ -493,7 +569,10 @@ impl Threads {
     fn thread_resolve(&mut self, p: &ThreadParams) -> Result<String> {
         let id = self.resolve_thread_id(p)?;
 
-        let thread = self.store.threads.iter_mut()
+        let thread = self
+            .store
+            .threads
+            .iter_mut()
             .find(|t| t.id == id)
             .context("Thread not found")?;
 
@@ -515,10 +594,15 @@ impl Threads {
 
     fn thread_promote(&mut self, p: &ThreadParams) -> Result<String> {
         let id = self.resolve_thread_id(p)?;
-        let promoted_to = p.promoted_to.as_deref()
+        let promoted_to = p
+            .promoted_to
+            .as_deref()
             .context("'promoted_to' is required (graph entity reference)")?;
 
-        let thread = self.store.threads.iter_mut()
+        let thread = self
+            .store
+            .threads
+            .iter_mut()
             .find(|t| t.id == id)
             .context("Thread not found")?;
 
@@ -536,7 +620,9 @@ impl Threads {
 
         self.save()?;
 
-        Ok(format!("Thread {id} promoted to {promoted_to} — \"{topic}\""))
+        Ok(format!(
+            "Thread {id} promoted to {promoted_to} — \"{topic}\""
+        ))
     }
 
     fn thread_rename(&mut self, p: &ThreadParams) -> Result<String> {
@@ -545,8 +631,13 @@ impl Threads {
         let new_name = p.name.as_deref().context("'name' is required for rename")?;
 
         // Try to find by id directly, then fall back to id-as-name lookup
-        let thread = self.store.threads.iter_mut()
-            .find(|t| t.id == id || t.name.as_deref().map(|n| n.to_lowercase()) == Some(id.to_lowercase()))
+        let thread = self
+            .store
+            .threads
+            .iter_mut()
+            .find(|t| {
+                t.id == id || t.name.as_deref().map(|n| n.to_lowercase()) == Some(id.to_lowercase())
+            })
             .context("Thread not found")?;
 
         thread.name = Some(new_name.to_string());
@@ -555,7 +646,9 @@ impl Threads {
 
         self.save()?;
 
-        Ok(format!("Thread {id} renamed to \"{new_name}\" (topic: {topic})"))
+        Ok(format!(
+            "Thread {id} renamed to \"{new_name}\" (topic: {topic})"
+        ))
     }
 
     // ── blackbox_thread_list (query) ───────────────────────────────
@@ -564,7 +657,7 @@ impl Threads {
         let status_filter = p.status.as_deref();
         let project_filter = p.project.as_deref();
         let name_filter = p.name.as_deref();
-        let stale_days = p.stale_days;
+        let min_idle_days = p.min_idle_days;
         let include_resolved = p.include_resolved.unwrap_or(false);
         let kind_filter = p
             .kind
@@ -587,10 +680,16 @@ impl Threads {
                     if thread.status != target {
                         continue;
                     }
+                } else {
+                    anyhow::bail!(
+                        "Unknown thread status: {sf}. Use: open, active, resolved, promoted"
+                    );
                 }
             } else if !include_resolved {
                 // Default: exclude resolved and promoted
-                if thread.status == ThreadStatus::Resolved || thread.status == ThreadStatus::Promoted {
+                if thread.status == ThreadStatus::Resolved
+                    || thread.status == ThreadStatus::Promoted
+                {
                     continue;
                 }
             }
@@ -605,7 +704,9 @@ impl Threads {
             // Name filter
             if let Some(nf) = name_filter {
                 let nf_lower = nf.to_lowercase();
-                let name_matches = thread.name.as_ref()
+                let name_matches = thread
+                    .name
+                    .as_ref()
                     .map(|n| n.to_lowercase().contains(&nf_lower))
                     .unwrap_or(false);
                 let topic_matches = thread.topic.to_lowercase().contains(&nf_lower);
@@ -614,8 +715,8 @@ impl Threads {
                 }
             }
 
-            // Staleness filter
-            if let Some(days) = stale_days {
+            // Idle-age filter
+            if let Some(days) = min_idle_days {
                 let age = self.thread_age_days(thread, now_secs);
                 if age < days {
                     continue;
@@ -651,17 +752,21 @@ impl Threads {
             let sessions_str = if t.sessions.is_empty() {
                 "no sessions".to_string()
             } else {
-                let names: Vec<String> = t.sessions.iter().map(|s| {
-                    match s.name.as_deref() {
+                let names: Vec<String> = t
+                    .sessions
+                    .iter()
+                    .map(|s| match s.name.as_deref() {
                         Some(n) => n.to_string(),
                         None => s.session_id.chars().take(8).collect::<String>(),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 names.join(", ")
             };
 
             let handoff = t.handoff_doc.as_deref().unwrap_or("-");
-            let project = if t.project.is_empty() { "-" } else {
+            let project = if t.project.is_empty() {
+                "-"
+            } else {
                 t.project.rsplit('/').next().unwrap_or(&t.project)
             };
 
@@ -670,28 +775,38 @@ impl Threads {
             let edges_str = if t.edges.is_empty() {
                 String::new()
             } else {
-                let edge_parts: Vec<String> = t.edges.iter().map(|e| {
-                    let label = match e.target_type {
-                        EdgeTarget::Thread => {
-                            self.store.threads.iter()
+                let edge_parts: Vec<String> = t
+                    .edges
+                    .iter()
+                    .map(|e| {
+                        let label = match e.target_type {
+                            EdgeTarget::Thread => self
+                                .store
+                                .threads
+                                .iter()
                                 .find(|t2| t2.id == e.target)
                                 .and_then(|t2| t2.name.as_deref())
                                 .unwrap_or("?")
-                                .to_string()
-                        }
-                        EdgeTarget::Session => {
-                            let name = self.store.threads.iter()
-                                .flat_map(|t2| t2.sessions.iter())
-                                .find(|s| s.session_id == e.target)
-                                .and_then(|s| s.name.as_deref());
-                            match name {
-                                Some(n) => format!("session:{}", n),
-                                None => format!("session:{}", &e.target[..e.target.len().min(8)]),
+                                .to_string(),
+                            EdgeTarget::Session => {
+                                let name = self
+                                    .store
+                                    .threads
+                                    .iter()
+                                    .flat_map(|t2| t2.sessions.iter())
+                                    .find(|s| s.session_id == e.target)
+                                    .and_then(|s| s.name.as_deref());
+                                match name {
+                                    Some(n) => format!("session:{}", n),
+                                    None => {
+                                        format!("session:{}", &e.target[..e.target.len().min(8)])
+                                    }
+                                }
                             }
-                        }
-                    };
-                    format!("{}→{}", e.kind.as_ref(), label)
-                }).collect();
+                        };
+                        format!("{}→{}", e.kind.as_ref(), label)
+                    })
+                    .collect();
                 format!(" [{}]", edge_parts.join(", "))
             };
 
@@ -726,10 +841,30 @@ impl Threads {
         // Rough epoch calc
         let mut epoch_days: i64 = 0;
         for yr in 1970..y {
-            epoch_days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) { 366 } else { 365 };
+            epoch_days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) {
+                366
+            } else {
+                365
+            };
         }
-        let months = [31, if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
-                       31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let months = [
+            31,
+            if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+                29
+            } else {
+                28
+            },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
         for days in months.iter().take((m as usize - 1).min(11)) {
             epoch_days += *days as i64;
         }
@@ -737,5 +872,133 @@ impl Threads {
 
         let activity_secs = epoch_days as u64 * 86400;
         now_secs.saturating_sub(activity_secs) / 86400
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn set_last_activity(store_path: &Path, thread_id: &str, last_activity: &str) {
+        let raw = fs::read_to_string(store_path).unwrap();
+        let mut store: ThreadStore = serde_json::from_str(&raw).unwrap();
+        let thread = store
+            .threads
+            .iter_mut()
+            .find(|t| t.id == thread_id)
+            .unwrap();
+        thread.last_activity = last_activity.to_string();
+        fs::write(store_path, serde_json::to_string_pretty(&store).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn thread_list_status_filters_lifecycle_not_idle_age() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("threads.json");
+        let mut threads = Threads::open(&store_path).unwrap();
+        let created = threads
+            .thread(&ThreadParams {
+                action: "open".into(),
+                topic: Some("new work".into()),
+                project: Some("/repo/x".into()),
+                name: Some("fresh".into()),
+                id: None,
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: None,
+            })
+            .unwrap();
+        let thread_id = created
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .to_string();
+        threads
+            .thread(&ThreadParams {
+                action: "continue".into(),
+                id: Some(thread_id),
+                name: None,
+                topic: None,
+                project: None,
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: None,
+            })
+            .unwrap();
+
+        let out = threads
+            .thread_list(&ThreadListParams {
+                status: Some("active".into()),
+                project: None,
+                name: None,
+                min_idle_days: None,
+                include_resolved: None,
+                kind: None,
+            })
+            .unwrap();
+
+        assert!(out.contains("| active |"));
+        assert!(out.contains("new work"));
+    }
+
+    #[test]
+    fn thread_list_min_idle_days_filters_by_age() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("threads.json");
+        let mut threads = Threads::open(&store_path).unwrap();
+        let created = threads
+            .thread(&ThreadParams {
+                action: "open".into(),
+                topic: Some("old work".into()),
+                project: Some("/repo/x".into()),
+                name: Some("aged".into()),
+                id: None,
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: None,
+            })
+            .unwrap();
+        let thread_id = created
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .to_string();
+        set_last_activity(&store_path, &thread_id, "2026-01-01T00:00:00Z");
+        let threads = Threads::open(&store_path).unwrap();
+
+        let out = threads
+            .thread_list(&ThreadListParams {
+                status: None,
+                project: None,
+                name: None,
+                min_idle_days: Some(7),
+                include_resolved: None,
+                kind: None,
+            })
+            .unwrap();
+
+        assert!(out.contains("old work"));
     }
 }

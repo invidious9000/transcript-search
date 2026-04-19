@@ -52,7 +52,12 @@ pub fn compute_inbox(
     if !urgent.is_empty() {
         out.push_str(&format!("## Unresolved ({})\n", urgent.len()));
         for n in &urgent {
-            out.push_str(&format!("  [{}] {} — {}\n", n.kind, n.id, truncate(&n.body, 120)));
+            out.push_str(&format!(
+                "  [{}] {} — {}\n",
+                n.kind,
+                n.id,
+                truncate(&n.body, 120)
+            ));
         }
         out.push('\n');
     }
@@ -75,10 +80,20 @@ pub fn compute_inbox(
     // 3. Stale threads — still open/active past threshold
     let stale = stale_threads(threads, stale_days, project_filter.as_deref(), limit);
     if !stale.is_empty() {
-        out.push_str(&format!("## Stale threads ≥{}d ({})\n", stale_days, stale.len()));
+        out.push_str(&format!(
+            "## Stale threads ≥{}d ({})\n",
+            stale_days,
+            stale.len()
+        ));
         for (t, age) in &stale {
             let name = t.name.as_deref().unwrap_or("-");
-            out.push_str(&format!("  {} ({}) — {}d — {}\n", t.id, name, age, truncate(&t.topic, 100)));
+            out.push_str(&format!(
+                "  {} ({}) — {}d — {}\n",
+                t.id,
+                name,
+                age,
+                truncate(&t.topic, 100)
+            ));
         }
         out.push('\n');
     }
@@ -88,7 +103,12 @@ pub fn compute_inbox(
     if !unverified.is_empty() {
         out.push_str(&format!("## Unverified knowledge ({})\n", unverified.len()));
         for e in &unverified {
-            out.push_str(&format!("  {} [{:?}] — {}\n", e.id, e.approval, truncate(&e.title, 100)));
+            out.push_str(&format!(
+                "  {} [{:?}] — {}\n",
+                e.id,
+                e.approval,
+                truncate(&e.title, 100)
+            ));
         }
         out.push('\n');
     }
@@ -99,7 +119,10 @@ pub fn compute_inbox(
         if !failed.is_empty() {
             out.push_str(&format!("## Failed tasks ({})\n", failed.len()));
             for (id, provider, started_at) in &failed {
-                out.push_str(&format!("  {} ({}) — started {}\n", id, provider, started_at));
+                out.push_str(&format!(
+                    "  {} ({}) — started {}\n",
+                    id, provider, started_at
+                ));
             }
             out.push('\n');
         }
@@ -170,7 +193,7 @@ fn stale_threads<'a>(
         .all()
         .iter()
         .filter(|t| {
-            matches!(t.status, ThreadStatus::Open | ThreadStatus::Active | ThreadStatus::Stale)
+            matches!(t.status, ThreadStatus::Open | ThreadStatus::Active)
         })
         .filter(|t| match project_filter {
             Some(pf) => t.project.to_lowercase().contains(pf),
@@ -329,7 +352,7 @@ mod tests {
                 session_id: None,
                 project: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -341,7 +364,7 @@ mod tests {
                 session_id: None,
                 project: None,
                 task_id: None,
-            thread_id: None,
+                thread_id: None,
                 provider: None,
                 bro: None,
             })
@@ -382,10 +405,30 @@ fn thread_age_days(thread: &Thread, now_secs: u64) -> u64 {
 
     let mut epoch_days: i64 = 0;
     for yr in 1970..y {
-        epoch_days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) { 366 } else { 365 };
+        epoch_days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) {
+            366
+        } else {
+            365
+        };
     }
-    let months = [31, if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 29 } else { 28 },
-                   31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31,
+        if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            29
+        } else {
+            28
+        },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     for days in months.iter().take((m as usize - 1).min(11)) {
         epoch_days += *days as i64;
     }

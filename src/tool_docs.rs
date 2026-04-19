@@ -14,9 +14,7 @@
 
 use anyhow::Result;
 
-use crate::knowledge::{
-    Approval, Category, KnowledgeEntry, Priority, Scope, Status,
-};
+use crate::knowledge::{Approval, Category, KnowledgeEntry, Priority, Scope, Status};
 
 pub const TOOL_DOC_ENTRY_ID: &str = "bb-tool-reference";
 
@@ -44,12 +42,24 @@ impl ToolCategory {
 
     fn intro(&self) -> &'static str {
         match self {
-            Self::Transcripts => "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision.",
-            Self::Knowledge => "Durable memory with three verbs: `bbox_learn` for rendered rules/conventions, `bbox_remember` for indexed-only notes you can grep later, `bbox_decide` for commitments with required rationale. Render pipeline emits provider-specific markdown files (CLAUDE.md / AGENTS.md / GEMINI.md). Prefer `remember` when unsure — it can be promoted to `learn` later.",
-            Self::Threads => "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops.",
-            Self::Notes => "Structured side channel for observations emitted during work. Executors call `bbox_note` throughout a dispatch; orchestrators query `bbox_notes` / `bbox_inbox` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. The *done* kind with a one-line acceptance summary is the single highest-leverage signal — always emit it on completion.",
-            Self::Inbox => "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next.",
-            Self::Orchestration => "Dispatch agents across providers (Claude, Codex, Copilot, Vibe, Gemini). Prefer named `bro` targeting (resolves provider + account + lens + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race).",
+            Self::Transcripts => {
+                "Search and read across every Claude Code / Codex / Gemini session the host has recorded. Reach for these when the user asks about past conversations, when you need to cite the origin of a rule, or when you need context around a prior decision."
+            }
+            Self::Knowledge => {
+                "Durable memory with three verbs: `bbox_learn` for rendered rules/conventions, `bbox_remember` for indexed-only notes you can grep later, `bbox_decide` for commitments with required rationale. Render pipeline emits provider-specific markdown files (CLAUDE.md / AGENTS.md / GEMINI.md). Prefer `remember` when unsure — it can be promoted to `learn` later."
+            }
+            Self::Threads => {
+                "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
+            }
+            Self::Notes => {
+                "Structured side channel for observations emitted during work. Executors call `bbox_note` throughout a dispatch; orchestrators query `bbox_notes` / `bbox_inbox` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. The *done* kind with a one-line acceptance summary is the single highest-leverage signal — always emit it on completion."
+            }
+            Self::Inbox => {
+                "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
+            }
+            Self::Orchestration => {
+                "Dispatch agents across providers (Claude, Codex, Copilot, Vibe, Gemini). Prefer named `bro` targeting (resolves provider + account + lens + session automatically) over raw provider. Core pattern: `bro_exec` to launch, `bro_wait` or `bro_when_all` to block, `bro_resume` for follow-ups (never `bro_exec` again — it starts fresh with no memory). For ensembles: `bro_broadcast` + `bro_when_all` (blind deliberation) or `bro_when_any` (race)."
+            }
         }
     }
 }
@@ -128,28 +138,33 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Sanity-check the index; diagnose 'did my new sessions get indexed?'.",
         example: None,
     },
-
     // ── Knowledge ────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_learn",
         category: ToolCategory::Knowledge,
         summary: "Persist a user-stated rule or convention that should bind future sessions; rendered into provider markdown files.",
         when_to_use: "A standing rule stated by the USER that must outlive the current edit — 'from now on', 'always X', 'never X', 'house rule', 'standing order', 'we (don't) use Y'. Implementation alone (a .gitignore, linter config, deleted code) enforces the rule for *now* but doesn't transmit intent to a future session. Not for one-off task constraints, and not for facts YOU observed — use `bbox_remember` or `bbox_note(kind=learned)` for those. See the 'Persistence hierarchy' in the workflow notes for the full taxonomy. Before calling, `bbox_knowledge(query=<keyword>)` to check for an existing matching entry (see 'Create etiquette').",
-        example: Some(r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#),
+        example: Some(
+            r#"bbox_learn(content="use rustls, not openssl", category="convention", scope="project", project="/repo/x")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_remember",
         category: ToolCategory::Knowledge,
         summary: "Persist a fact for later recall; indexed but NOT rendered.",
         when_to_use: "Observations, decisions, context worth grepping for later but not worth every session loading. Safer default than `learn` when unsure.",
-        example: Some(r#"bbox_remember(content="port 7263 conflicts with helper-daemon on host bravo", title="port clash")"#),
+        example: Some(
+            r#"bbox_remember(content="port 7263 conflicts with helper-daemon on host bravo", title="port clash")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_decide",
         category: ToolCategory::Knowledge,
         summary: "Record a durable commitment with required rationale; supports supersession.",
         when_to_use: "You're locking in a design choice or reversing a prior decision. Rationale is required. Before calling, `bbox_knowledge(query=<keyword>, project=<cwd>)` to find the prior decision this one replaces — pass its ID as `supersedes` to mark it superseded and link the two (see 'Create etiquette'). `id` format for `supersedes` is the bare 8-hex knowledge entry ID (no prefix).",
-        example: Some(r#"bbox_decide(content="use RocksDB for cache", rationale="SQLite locking conflicted with concurrent writers", supersedes="8a3f12cd")"#),
+        example: Some(
+            r#"bbox_decide(content="use RocksDB for cache", rationale="SQLite locking conflicted with concurrent writers", supersedes="8a3f12cd")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_knowledge",
@@ -200,30 +215,32 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "First-time setup for a project — seeds PROJECT.md, scaffolds knowledge structure.",
         example: None,
     },
-
     // ── Threads ──────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_thread",
         category: ToolCategory::Threads,
         summary: "Open / continue / resolve / promote / rename / link a work thread.",
         when_to_use: "Investigation or QC walk that may span sessions; deferred work too informal for a finding. Before `action=open`, call `bbox_thread_list` to check for an existing same-topic thread (see 'Create etiquette' in the workflow notes). Use `kind=work_item` for orchestrator-led dispatch loops.",
-        example: Some(r#"bbox_thread(action="open", topic="audit the dispatch path", project="/repo/x", kind="work_item")"#),
+        example: Some(
+            r#"bbox_thread(action="open", topic="audit the dispatch path", project="/repo/x", kind="work_item")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_thread_list",
         category: ToolCategory::Threads,
-        summary: "Scan open / active / stale threads.",
-        when_to_use: "Before starting work on a topic (continuity check). Use `stale_days` to find abandoned work. Filter by `kind=work_item`.",
+        summary: "Scan threads by lifecycle status and idle age.",
+        when_to_use: "Before starting work on a topic (continuity check). Use `status` for lifecycle (`open`, `active`, `resolved`, `promoted`) and `min_idle_days` to return only threads idle for at least N days. Filter by `kind=work_item`.",
         example: None,
     },
-
     // ── Notes ────────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_note",
         category: ToolCategory::Notes,
         summary: "Record a structured side-channel note while working.",
         when_to_use: "As an executor: emit throughout a dispatch for the 7 kinds below. As an orchestrator: rarely — you're the reader. Genuine signal only, not stylistic preference. The `done` kind with a one-line acceptance summary is the most important: always emit before returning. Kinds: `dispute` (disagree with brief/premise), `assumption` (ambiguity-resolving judgment), `surprise` (expected X, found Y), `followup` (out-of-scope work deferred), `blocked` (subtask blocked, include reason), `learned` (codebase/environment fact YOU discovered mid-work, e.g. 'this repo uses tabs not spaces', 'cargo check works here' — NOT user-stated rules; those go to `bbox_learn`), `done` (completion + summary).",
-        example: Some(r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#),
+        example: Some(
+            r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#,
+        ),
     },
     ToolDoc {
         name: "bbox_notes",
@@ -237,9 +254,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Notes,
         summary: "Mark a note acknowledged or addressed.",
         when_to_use: "Orchestrator's close-the-loop move. Addressed notes drop from the default inbox view. `id` is the full `note-<8hex>` as returned by `bbox_note` and shown in `bbox_notes` / `bbox_inbox` — pass it verbatim, do not strip the `note-` prefix. Resolutions: `acknowledged` (seen, deferred), `addressed` (acted on — removes from default inbox view), `unresolved` (re-open).",
-        example: Some(r#"bbox_note_resolve(id="note-a1b2c3d4", resolution="addressed", note="fixed in commit abc123")"#),
+        example: Some(
+            r#"bbox_note_resolve(id="note-a1b2c3d4", resolution="addressed", note="fixed in commit abc123")"#,
+        ),
     },
-
     // ── Inbox ────────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_inbox",
@@ -248,21 +266,24 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view.",
         example: Some(r#"bbox_inbox(project="/repo/x", stale_days=3)"#),
     },
-
     // ── Orchestration (bro) ──────────────────────────────────────────
     ToolDoc {
         name: "bro_exec",
         category: ToolCategory::Orchestration,
         summary: "Launch an agent task. Returns {taskId, sessionId} immediately.",
         when_to_use: "Dispatching work. Prefer `bro: \"name\"` over `provider: \"...\"` — named bros resolve provider/account/lens/sessionId automatically. Returns immediately; follow with `bro_wait` or `bro_when_all`.",
-        example: Some(r#"bro_exec(bro="executor", prompt="refactor the tail module", project_dir="/repo/x")"#),
+        example: Some(
+            r#"bro_exec(bro="executor", prompt="refactor the tail module", project_dir="/repo/x")"#,
+        ),
     },
     ToolDoc {
         name: "bro_resume",
         category: ToolCategory::Orchestration,
         summary: "Continue an existing session with a follow-up.",
         when_to_use: "Multi-turn conversations with a specific bro. NEVER use `bro_exec` again for follow-ups — it starts fresh. Named bro targeting auto-resolves the sessionId.",
-        example: Some(r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#),
+        example: Some(
+            r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
+        ),
     },
     ToolDoc {
         name: "bro_wait",
@@ -339,14 +360,18 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         category: ToolCategory::Orchestration,
         summary: "Manage teamplates and instantiated teams.",
         when_to_use: "Save / list / delete teamplates; create / list / dissolve teams; show roster. A team = instantiated teamplate with named bro instances tracking their own sessionIds. Before `save_template` run `list_templates`; before `create` run `list`; both are dedupe-sensitive (see 'Create etiquette').",
-        example: Some(r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#),
+        example: Some(
+            r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#,
+        ),
     },
     ToolDoc {
         name: "bro_mcp",
         category: ToolCategory::Orchestration,
         summary: "Manage MCP servers + tool filters for dispatched bros.",
         when_to_use: "Add/remove MCP servers visible to dispatched bros (fans out to Claude/Copilot/Codex/Gemini CLIs on global-scope writes). Allow/disallow tool patterns for mechanical filtering — default disallow `mcp__blackbox__bro_*` replaces the text recursion guard on providers that support dispatch-time filtering (Claude, Copilot). Before `action=add`, call `action=list` to check for an existing entry (see 'Create etiquette'). Actions: list, get, add, remove, allow, disallow, clear_filters, sync.",
-        example: Some(r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#),
+        example: Some(
+            r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#,
+        ),
     },
 ];
 
@@ -443,15 +468,21 @@ pub const BLACKBOX_MCP_PREFIX: &str = "mcp__blackbox__";
 /// followed by per-tool stanzas, then workflow notes.
 pub fn render_markdown() -> String {
     let mut out = String::new();
-    out.push_str("Blackbox tool reference — the MCP tools this daemon exposes and when to reach for them. ");
-    out.push_str("This entry is generated from `src/tool_docs.rs` and refreshed on every daemon restart. ");
+    out.push_str(
+        "Blackbox tool reference — the MCP tools this daemon exposes and when to reach for them. ",
+    );
+    out.push_str(
+        "This entry is generated from `src/tool_docs.rs` and refreshed on every daemon restart. ",
+    );
     out.push_str("Do not hand-edit.\n\n");
 
     out.push_str("## CORE RULE: recall first\n\n");
     out.push_str("**On any substantive task, your FIRST tool call must be `bbox_knowledge(query=<one keyword>)` to check for stored project-specific context.** Not the second call after `ls`. Not after probing the live system. First.\n\n");
     out.push_str("The signature failure mode here: agents confidently produce training-prior answers to questions whose actual answer is stored in bbox. This is not a suggestion.\n\n");
     out.push_str("Use a single distinctive keyword from the task. If empty, try a different word. Do not fall back to filesystem exploration, process probing, or training-prior inference until at least 2 distinct queries have returned empty.\n\n");
-    out.push_str("Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n");
+    out.push_str(
+        "Cost of a wasted query: near zero. Cost of a confident wrong answer: the entire task.\n\n",
+    );
 
     out.push_str("## CORE RULE: capture durable user directives\n\n");
     out.push_str("**When the user states a rule, convention, or preference meant to bind future sessions, your response MUST include a `bbox_learn` (or `bbox_remember` / `bbox_decide`) call BEFORE you wrap up the task.** Mechanical enforcement — a `.gitignore` entry, a linter config, deleted code, a removed dependency — does not replace this. It enforces the rule for the current edit; it does NOT transmit the *intent* to a future session that won't see this turn. Skipping the call means the rule silently rots and a future agent re-derives the wrong answer.\n\n");
@@ -511,7 +542,10 @@ pub fn sync_into_knowledge(kb: &mut crate::knowledge::Knowledge) -> Result<SyncR
 
     if let Some(ref e) = existing {
         if e.content == content {
-            return Ok(SyncResult { wrote: false, bytes });
+            return Ok(SyncResult {
+                wrote: false,
+                bytes,
+            });
         }
     }
 
@@ -536,7 +570,10 @@ pub fn sync_into_knowledge(kb: &mut crate::knowledge::Knowledge) -> Result<SyncR
         rationale: None,
         expires_at: None,
         source: "tool_docs".to_string(),
-        created_at: existing.as_ref().map(|e| e.created_at.clone()).unwrap_or_else(|| now.clone()),
+        created_at: existing
+            .as_ref()
+            .map(|e| e.created_at.clone())
+            .unwrap_or_else(|| now.clone()),
         updated_at: now,
         recall_count: 0,
         last_recalled: None,
@@ -556,7 +593,11 @@ mod tests {
     fn render_contains_every_tool_name() {
         let md = render_markdown();
         for doc in TOOL_DOCS {
-            assert!(md.contains(doc.name), "rendered markdown missing {}", doc.name);
+            assert!(
+                md.contains(doc.name),
+                "rendered markdown missing {}",
+                doc.name
+            );
         }
     }
 
@@ -593,8 +634,13 @@ mod tests {
             while i < bytes.len() && depth > 0 {
                 let c = bytes[i] as char;
                 if in_str {
-                    if c == '\\' { i += 2; continue; }
-                    if c == '"' { in_str = false; }
+                    if c == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c == '"' {
+                        in_str = false;
+                    }
                 } else {
                     match c {
                         '"' => in_str = true,
@@ -605,7 +651,9 @@ mod tests {
                 }
                 i += 1;
             }
-            if depth != 0 { break; }
+            if depth != 0 {
+                break;
+            }
             let body = &src[attr_start..i - 1];
             cursor = i;
 
@@ -632,14 +680,23 @@ mod tests {
             // whitespace, or comma) so `description` doesn't match inside
             // some other identifier.
             let ok_before = abs == 0
-                || matches!(body.as_bytes()[abs - 1] as char, ' ' | '\t' | '\n' | '\r' | ',' | '(');
+                || matches!(
+                    body.as_bytes()[abs - 1] as char,
+                    ' ' | '\t' | '\n' | '\r' | ',' | '('
+                );
             start = abs + needle.len();
-            if !ok_before { continue; }
+            if !ok_before {
+                continue;
+            }
             let after = &body[start..];
             let after = after.trim_start();
-            let Some(after) = after.strip_prefix('=') else { continue };
+            let Some(after) = after.strip_prefix('=') else {
+                continue;
+            };
             let after = after.trim_start();
-            let Some(after) = after.strip_prefix('"') else { continue };
+            let Some(after) = after.strip_prefix('"') else {
+                continue;
+            };
             let end = after.find('"')?;
             return Some(after[..end].to_string());
         }
@@ -653,7 +710,10 @@ mod tests {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        assert!(!registered.is_empty(), "no tools found in main.rs — parse regressed");
+        assert!(
+            !registered.is_empty(),
+            "no tools found in main.rs — parse regressed"
+        );
 
         let documented: std::collections::HashSet<&str> =
             TOOL_DOCS.iter().map(|d| d.name).collect();
@@ -691,14 +751,14 @@ mod tests {
         // contradictory guidance at the two surfaces. See the
         // `bb846aad` decision entry for the four-surface policy.
         let registered = parse_registered_tools();
-        let summaries: std::collections::HashMap<&str, &str> = TOOL_DOCS
-            .iter()
-            .map(|d| (d.name, d.summary))
-            .collect();
+        let summaries: std::collections::HashMap<&str, &str> =
+            TOOL_DOCS.iter().map(|d| (d.name, d.summary)).collect();
 
         let mut mismatches: Vec<String> = Vec::new();
         for (name, desc) in &registered {
-            let Some(summary) = summaries.get(name.as_str()) else { continue };
+            let Some(summary) = summaries.get(name.as_str()) else {
+                continue;
+            };
             if desc != *summary {
                 mismatches.push(format!(
                     "\n  {name}:\n    main.rs    : {desc:?}\n    tool_docs  : {summary:?}",
